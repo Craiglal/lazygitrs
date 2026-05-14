@@ -2534,10 +2534,14 @@ impl Gui {
                         }
                     }
                 }
-                // Shift+Enter (or Ctrl+J, which some terminals emit for Shift+Enter): insert a
-                // newline in the body. Without this branch, Ctrl+J hits tui_textarea's default
-                // binding for `delete_line_by_head`, wiping what the user just typed.
-                else if (key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT))
+                // Insert a newline in the body:
+                //   - Enter while focused on Body (the natural keystroke for a multi-line field).
+                //   - Shift+Enter from Summary jumps focus to Body and inserts a newline.
+                //   - Ctrl+J (some terminals emit this for Shift+Enter) — without this branch it
+                //     would hit tui_textarea's default `delete_line_by_head` binding.
+                else if (key.code == KeyCode::Enter
+                    && (focus == popup::CommitInputFocus::Body
+                        || key.modifiers.contains(KeyModifiers::SHIFT)))
                     || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL))
                 {
                     let wrap_width = self.commit_body_wrap_width();

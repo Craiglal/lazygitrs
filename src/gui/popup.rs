@@ -37,7 +37,8 @@ pub fn unwrap_commit_body(text: &str) -> String {
 
 /// Source-of-truth for the commit body when soft-wrap is in effect. The body
 /// textarea becomes a *display* of this raw text — wrap-induced newlines never
-/// touch the actual commit message, but user-pressed newlines (Shift+Enter) do.
+/// touch the actual commit message, but user-pressed newlines (Enter on Body,
+/// or Shift+Enter from Summary) do.
 ///
 /// Cursor is a char index into `raw` (not bytes) so multi-byte input is safe.
 #[derive(Debug, Default, Clone)]
