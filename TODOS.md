@@ -227,3 +227,7 @@
 - [x] Bug: Big bug with git hunks sometimes being misidentified.
 
 - [ ] Feat: add the author for interactive rebase on the commit we're 'rebasing on top of'. Currently when I try to rebase on top of a commit, the author is not visible in the list.
+
+- [ ] Fix: I can't press `enter` anymore in Commit Message > Description. But I can press `shift+enter`, please fix.
+
+- [x] Weird bug when pressing space for "moved" (via git mv <>) — bulk stage/unstage on a folder passed the literal `"old -> new"` string as a git pathspec for renamed files, crashing `git add`. Also unstaging a rename only reset one half, leaving the other staged.

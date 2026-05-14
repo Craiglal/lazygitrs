@@ -22,6 +22,31 @@ impl File {
     pub fn has_any_changes(&self) -> bool {
         self.has_staged_changes || self.has_unstaged_changes
     }
+
+    /// For renamed files, `name` is stored as "old -> new". This returns
+    /// both halves so callers can pass them to git as separate pathspecs.
+    pub fn rename_paths(&self) -> Option<(&str, &str)> {
+        self.name.split_once(" -> ")
+    }
+
+    /// Pathspec to pass to `git add` for this file. For renames, this is
+    /// the post-rename path (the only one that exists on disk).
+    pub fn git_add_path(&self) -> &str {
+        match self.rename_paths() {
+            Some((_, new)) => new,
+            None => &self.name,
+        }
+    }
+
+    /// Pathspecs to pass to `git reset HEAD --` to fully unstage this file.
+    /// For renames, both old and new paths are needed — resetting only one
+    /// leaves the other half (e.g. the deletion of the old path) staged.
+    pub fn git_reset_paths(&self) -> Vec<&str> {
+        match self.rename_paths() {
+            Some((old, new)) => vec![old, new],
+            None => vec![&self.name],
+        }
+    }
 }
 
 

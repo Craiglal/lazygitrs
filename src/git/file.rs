@@ -99,13 +99,18 @@ impl GitCommands {
     pub fn unstage_all(&self) -> Result<()> {
         // When there are no commits yet, HEAD doesn't exist so `git reset HEAD`
         // fails. Use `git rm --cached -r .` to unstage everything instead.
-        if self.git().args(&["rev-parse", "--verify", "HEAD"]).run().is_err() {
+        let head_exists = self
+            .git()
+            .args(&["rev-parse", "--verify", "HEAD"])
+            .run()?
+            .success;
+        if head_exists {
             self.git()
-                .args(&["rm", "--cached", "-r", "."])
+                .args(&["reset", "HEAD"])
                 .run_expecting_success()?;
         } else {
             self.git()
-                .args(&["reset", "HEAD"])
+                .args(&["rm", "--cached", "-r", "."])
                 .run_expecting_success()?;
         }
         Ok(())

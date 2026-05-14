@@ -123,16 +123,23 @@ fn toggle_stage(gui: &mut Gui) -> Result<()> {
                 let any_unstaged = child_indices.iter().any(|&i| {
                     model.files.get(i).map_or(false, |f| f.has_unstaged_changes || !f.tracked)
                 });
-                let names: Vec<String> = child_indices
+                let paths: Vec<String> = child_indices
                     .iter()
-                    .filter_map(|&i| model.files.get(i).map(|f| f.name.clone()))
+                    .filter_map(|&i| model.files.get(i))
+                    .flat_map(|f| {
+                        if any_unstaged {
+                            vec![f.git_add_path().to_string()]
+                        } else {
+                            f.git_reset_paths().into_iter().map(String::from).collect()
+                        }
+                    })
                     .collect();
                 drop(model);
 
                 if any_unstaged {
-                    gui.git.stage_files(&names)?;
+                    gui.git.stage_files(&paths)?;
                 } else {
-                    gui.git.unstage_files(&names)?;
+                    gui.git.unstage_files(&paths)?;
                 }
                 gui.needs_files_refresh = true;
                 return Ok(());
@@ -145,15 +152,16 @@ fn toggle_stage(gui: &mut Gui) -> Result<()> {
     };
     let model = gui.model.lock().unwrap();
     if let Some(file) = model.files.get(file_idx) {
-        let name = file.name.clone();
+        let add_path = file.git_add_path().to_string();
+        let reset_paths: Vec<String> = file.git_reset_paths().into_iter().map(String::from).collect();
         let has_staged = file.has_staged_changes;
         let has_unstaged = file.has_unstaged_changes;
         drop(model);
 
         if has_unstaged || !has_staged {
-            gui.git.stage_file(&name)?;
+            gui.git.stage_file(&add_path)?;
         } else {
-            gui.git.unstage_file(&name)?;
+            gui.git.unstage_files(&reset_paths)?;
         }
         gui.needs_files_refresh = true;
     }

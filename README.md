@@ -2,16 +2,26 @@
 
 A faster, memory-safe, more ergonomic slopfork of lazygit (🦀 rust btw).
 
+1
+
 This is mostly a "for me" tool — built for my own workflow. Not saying you shouldn't use it, but don't expect it to be a community project. But hey, it works for me!
 
 **Why fork?** PRs were sitting too long, or the upstream direction didn't match how I wanted to work.
+
+2
+2.1
 
 The goal: everything lazygit does, but faster and with opinions I actually agree with. (I can't promise backwards-compat w/ lazygit's config since it'll eventually drift w/ my own opinions, but I made sure to do that)
 
 ![demo1](https://raw.githubusercontent.com/Blankeos/lazygitrs/main/_docs/demo1.webp)
 ![demo2](https://raw.githubusercontent.com/Blankeos/lazygitrs/main/_docs/demo2.webp)
 
+3
+
 ### Install
+
+> Make sure you have:
+> gh
 
 ```sh
 npm install -g lazygitrs  # npm
@@ -117,3 +127,5 @@ Summary
 MIT
 
 Feel free to fork and give it your own spin.
+last
+1
