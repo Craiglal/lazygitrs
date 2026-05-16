@@ -2,6 +2,45 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.20] - 2026-05-16
+
+### Bug Fixes
+
+- Fixed for wrap mode (revert shows). by @Blankeos
+- Inaccurate index-based hunk reverting. by @Blankeos
+- Preserve wrap preference when resetting diff view state. by @Blankeos
+- Pressing enter does shift+enter by @Blankeos
+- Fix `add` for `git mv` (moved) files. by @Blankeos
+- Handle unstage_all when no commits exist. by @carlo-bilby
+- Prevent cross-hunk aliasing in side-by-side diff. by @Blankeos
+
+### Chores
+
+- Cleanup before merge. by @Blankeos
+
+### Features
+
+- Replace dedicated revert keybindings with {/} hunk cycling and context menu. by @Blankeos
+- Added a local undo state stack. by @Blankeos
+- Bind <c-r> to revert selected hunk by @Blankeos
+- Hover tooltip on revert-hunk marker by @Blankeos
+- Revert individual hunks from the diff view by @fcmiranda
+- Better graph nodes. by @Blankeos
+- Display author name for rebase onto commit. by @Blankeos
+- Route s/f/d/e through Interactive Rebase planner by @Blankeos
+
+### Refactor
+
+- Rebind revert-hunk from ctrl+r to enter. by @Blankeos
+
+### Doc
+
+- Minor typo fix. by @Blankeos
+
+
+### New Contributors
+
+- @carlo-bilby made their first contribution
 ## [0.0.19] - 2026-04-29
 
 ### Bug Fixes
