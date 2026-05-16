@@ -13,6 +13,11 @@ The goal: everything lazygit does, but faster and with opinions I actually agree
 
 ### Install
 
+> Make sure you have:
+>
+> - [git](https://git-scm.com)
+> - [gh](https://cli.github.com)
+
 ```sh
 npm install -g lazygitrs  # npm
 bun install -g lazygitrs  # or bun
