@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git format-patch *)",
-      "Read(//tmp/**)"
-    ]
-  }
-}

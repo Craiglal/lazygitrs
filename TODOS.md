@@ -232,4 +232,8 @@
 
 - [x] Weird bug when pressing space for "moved" (via git mv <>) — bulk stage/unstage on a folder passed the literal `"old -> new"` string as a git pathspec for renamed files, crashing `git add`. Also unstaging a rename only reset one half, leaving the other staged.
 
-- [ ] persist wrap in state.
+- [x] persist wrap in state.
+
+- [ ] While 'generating commit messages' or 'pushing' the UI is blocked. Let's not block it. Let us move around a bit. The question is.. where to put this indicator.
+
+- [ ] Use 'check' and 'checkmark' for staged and unstaged (not like lazygit), more like zed.

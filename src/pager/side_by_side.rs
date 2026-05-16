@@ -276,6 +276,16 @@ impl DiffViewState {
         }
     }
 
+    /// Reset to a fresh state while keeping user preferences (`wrap`) that
+    /// should survive file/commit navigation. Without this, every reassignment
+    /// of `diff_view = DiffViewState::new()` would clobber the wrap setting
+    /// loaded from `state.yml`.
+    pub fn reset_keep_prefs(&mut self) {
+        let wrap = self.wrap;
+        *self = Self::new();
+        self.wrap = wrap;
+    }
+
     /// Get the actual file line number for a DiffLine, applying hunk offsets.
     /// Returns the display/file line number (e.g. for gutter or editAtLine).
     pub fn file_line_number(&self, line_idx: usize, panel: DiffPanel) -> Option<usize> {

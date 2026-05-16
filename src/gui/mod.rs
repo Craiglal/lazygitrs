@@ -707,7 +707,7 @@ impl Gui {
                     self.diff_view.apply_parsed(parsed);
                 }
                 DiffPayload::Empty => {
-                    self.diff_view = DiffViewState::new();
+                    self.diff_view.reset_keep_prefs();
                 }
             }
         }
@@ -1058,7 +1058,7 @@ impl Gui {
 
             // Clear stale diff when selection changes
             if selection_changed {
-                self.diff_view = DiffViewState::new();
+                self.diff_view.reset_keep_prefs();
             }
 
             self.diff_loading = true;
@@ -1084,7 +1084,7 @@ impl Gui {
 
         // Clear stale diff when selection changes so user sees "Loading..." instead of old content
         if selection_changed {
-            self.diff_view = DiffViewState::new();
+            self.diff_view.reset_keep_prefs();
         }
 
         let model = self.model.lock().unwrap();
@@ -1211,15 +1211,15 @@ impl Gui {
                             });
                         } else {
                             drop(model);
-                            self.diff_view = DiffViewState::new();
+                            self.diff_view.reset_keep_prefs();
                         }
                     } else {
                         drop(model);
-                        self.diff_view = DiffViewState::new();
+                        self.diff_view.reset_keep_prefs();
                     }
                 } else {
                     drop(model);
-                    self.diff_view = DiffViewState::new();
+                    self.diff_view.reset_keep_prefs();
                 }
             }
             ContextId::Commits => {
@@ -1452,16 +1452,16 @@ impl Gui {
                             });
                         } else {
                             drop(model);
-                            self.diff_view = DiffViewState::new();
+                            self.diff_view.reset_keep_prefs();
                         }
                     } else {
                         drop(model);
-                        self.diff_view = DiffViewState::new();
+                        self.diff_view.reset_keep_prefs();
                     }
                 } else {
                     // No file selected — clear diff
                     drop(model);
-                    self.diff_view = DiffViewState::new();
+                    self.diff_view.reset_keep_prefs();
                 }
             }
             _ => {
@@ -1707,7 +1707,7 @@ impl Gui {
         // Diff/Compare mode (W)
         if key.code == KeyCode::Char('W') {
             self.diff_mode.enter();
-            self.diff_view = DiffViewState::new();
+            self.diff_view.reset_keep_prefs();
             return Ok(());
         }
 
@@ -3717,7 +3717,7 @@ impl Gui {
                         gui.needs_refresh = false;
                         gui.needs_diff_refresh = true;
                         gui.context_mgr = context::ContextManager::new();
-                        gui.diff_view = DiffViewState::new();
+                        gui.diff_view.reset_keep_prefs();
                         if gui.show_file_tree {
                             gui.update_file_tree_state();
                         }
