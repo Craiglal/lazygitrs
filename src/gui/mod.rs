@@ -1982,20 +1982,6 @@ impl Gui {
             }
         }
 
-        if matches_key(key, &keybindings.universal.next_revert_block) {
-            if self.context_mgr.active() == ContextId::Files {
-                self.diff_view.select_next_revert_hunk();
-                self.center_selected_revert_block();
-            }
-            return Ok(());
-        }
-        if matches_key(key, &keybindings.universal.prev_revert_block) {
-            if self.context_mgr.active() == ContextId::Files {
-                self.diff_view.select_prev_revert_hunk();
-                self.center_selected_revert_block();
-            }
-            return Ok(());
-        }
         if matches_key(key, &keybindings.universal.revert_block) {
             if self.context_mgr.active() == ContextId::Files {
                 let hunk_idx = self
@@ -2004,13 +1990,7 @@ impl Gui {
                     .or(self.diff_view.hovered_revert_hunk);
                 if let Some(hunk_idx) = hunk_idx {
                     self.diff_view.selected_revert_hunk = Some(hunk_idx);
-                    if let Err(err) = self.revert_selected_file_hunk(hunk_idx) {
-                        self.popup = PopupState::Message {
-                            title: "Revert block failed".to_string(),
-                            message: format!("{}", err),
-                            kind: MessageKind::Error,
-                        };
-                    }
+                    self.show_hunk_context_menu(hunk_idx);
                 }
             }
             return Ok(());
@@ -2094,12 +2074,23 @@ impl Gui {
             KeyCode::Char('l') | KeyCode::Right => {
                 self.diff_view.scroll_right(4);
             }
-            // { and } jump between hunks
+            // { and } jump between hunks. In Files context they also select
+            // the hunk as the revert target so the marker glyph turns
+            // accent-coloured; the scroll motion stays the same as plain
+            // hunk navigation (always jumps, even if already in viewport).
             KeyCode::Char('}') => {
-                self.diff_view.next_hunk();
+                if self.context_mgr.active() == ContextId::Files {
+                    self.diff_view.cycle_next_revert_hunk();
+                } else {
+                    self.diff_view.next_hunk();
+                }
             }
             KeyCode::Char('{') => {
-                self.diff_view.prev_hunk();
+                if self.context_mgr.active() == ContextId::Files {
+                    self.diff_view.cycle_prev_revert_hunk();
+                } else {
+                    self.diff_view.prev_hunk();
+                }
             }
             // [ and ] toggle old-only / new-only view
             KeyCode::Char(']') => {
@@ -3317,9 +3308,8 @@ impl Gui {
                     HelpEntry { key: kb.universal.edit.clone(), description: "Open in editor".into() },
                     HelpEntry { key: kb.universal.open_file.clone(), description: "Open in default program".into() },
                     HelpEntry { key: "y".into(), description: "Copy to clipboard menu".into() },
-                    HelpEntry { key: kb.universal.next_revert_block.clone(), description: "Next revert block in diff".into() },
-                    HelpEntry { key: kb.universal.prev_revert_block.clone(), description: "Previous revert block in diff".into() },
-                    HelpEntry { key: kb.universal.revert_block.clone(), description: "Revert selected block".into() },
+                    HelpEntry { key: "{/}".into(), description: "Cycle prev/next revert block in diff".into() },
+                    HelpEntry { key: kb.universal.revert_block.clone(), description: "Open hunk menu (revert selected block)".into() },
                     HelpEntry { key: kb.universal.undo_revert_block.clone(), description: "Undo last revert (session)".into() },
                 ],
             },
@@ -3501,7 +3491,7 @@ impl Gui {
             entries: vec![
                 HelpEntry { key: "j/k".into(), description: "Scroll down / up".into() },
                 HelpEntry { key: "h/l".into(), description: "Scroll left / right".into() },
-                HelpEntry { key: "{/}".into(), description: "Previous / next hunk".into() },
+                HelpEntry { key: "{/}".into(), description: "Cycle prev / next hunk (selects revert block in Files)".into() },
                 HelpEntry { key: "[".into(), description: "Toggle old-only view".into() },
                 HelpEntry { key: "]".into(), description: "Toggle new-only view".into() },
                 HelpEntry { key: "z".into(), description: "Toggle line wrap".into() },
@@ -3509,8 +3499,7 @@ impl Gui {
                 HelpEntry { key: "PgUp/PgDn".into(), description: "Page up / down".into() },
                 HelpEntry { key: "/".into(), description: "Search in diff".into() },
                 HelpEntry { key: "n/N".into(), description: "Next / previous search match".into() },
-                HelpEntry { key: "<c-j>/<c-k>".into(), description: "Cycle next / previous revert block (Files)".into() },
-                HelpEntry { key: "<enter>".into(), description: "Revert selected block (Files)".into() },
+                HelpEntry { key: "<enter>".into(), description: "Open hunk menu on selected block (Files)".into() },
                 HelpEntry { key: "click 󰧛".into(), description: "Click revert icon to revert that block".into() },
                 HelpEntry {
                     key: "u".into(),
@@ -5087,6 +5076,46 @@ impl Gui {
         true
     }
 
+    /// Open the hunk action menu (shown when Enter is pressed on a selected
+    /// or hovered revert hunk). Cancel is focused first so an accidental
+    /// Enter doesn't revert anything.
+    fn show_hunk_context_menu(&mut self, hunk_idx: usize) {
+        let items = vec![
+            popup::MenuItem {
+                label: "Cancel".to_string(),
+                description: String::new(),
+                key: None,
+                // No-op: execute_menu_action already drops the menu popup
+                // before invoking the action, so returning Ok leaves the
+                // menu closed. Esc also closes the menu via the universal
+                // menu Esc handler.
+                action: Some(Box::new(|_gui| Ok(()))),
+            },
+            popup::MenuItem {
+                label: "Revert hunk".to_string(),
+                description: String::new(),
+                key: None,
+                action: Some(Box::new(move |gui| {
+                    if let Err(err) = gui.revert_selected_file_hunk(hunk_idx) {
+                        gui.popup = PopupState::Message {
+                            title: "Revert block failed".to_string(),
+                            message: format!("{}", err),
+                            kind: MessageKind::Error,
+                        };
+                    }
+                    Ok(())
+                })),
+            },
+        ];
+
+        self.popup = PopupState::Menu {
+            title: "Hunk".to_string(),
+            items,
+            selected: 0,
+            loading_index: None,
+        };
+    }
+
     fn revert_selected_file_hunk(&mut self, hunk_idx: usize) -> Result<()> {
         let Some(file_idx) = self.selected_file_index() else {
             return Ok(());
@@ -5164,36 +5193,6 @@ impl Gui {
         self.needs_files_refresh = true;
         self.needs_diff_refresh = true;
         Ok(())
-    }
-
-    /// Keep the selected revert marker around the vertical middle of the visible diff area.
-    fn center_selected_revert_block(&mut self) {
-        let Some(sel) = self.diff_view.selected_revert_hunk else {
-            return;
-        };
-        let Some(&line_idx) = self.diff_view.hunk_starts.get(sel) else {
-            return;
-        };
-
-        let main_panel = self.compute_main_panel_rect();
-        let pl = DiffPanelLayout::compute(main_panel, &self.diff_view);
-        let visible_rows = (pl.inner_end_y.saturating_sub(pl.inner_y)) as usize;
-        if visible_rows == 0 {
-            return;
-        }
-
-        // Already in viewport? Don't scroll. The marker glyph sits on the
-        // hunk's first wrapped chunk, so only that visual row needs to be visible.
-        if self
-            .diff_view
-            .visual_offset_of_line(line_idx, &pl)
-            .is_some()
-        {
-            return;
-        }
-
-        self.diff_view.scroll_offset =
-            self.diff_view.scroll_offset_to_center_line(line_idx, &pl);
     }
 
     /// Approximate visible height of the active sidebar panel (inner area minus borders).

@@ -866,72 +866,6 @@ impl DiffViewState {
         None
     }
 
-    /// Visual row offset (from `layout.inner_y`) of `target_line`'s first wrapped
-    /// chunk. Returns `None` if the target is above `scroll_offset` or past the
-    /// visible window.
-    pub fn visual_offset_of_line(
-        &self,
-        target_line: usize,
-        layout: &DiffPanelLayout,
-    ) -> Option<usize> {
-        if target_line < self.scroll_offset || target_line >= self.lines.len() {
-            return None;
-        }
-        let visible = layout.inner_end_y.saturating_sub(layout.inner_y) as usize;
-        if !self.wrap {
-            let off = target_line - self.scroll_offset;
-            return if off < visible { Some(off) } else { None };
-        }
-        let panel_width = layout
-            .old_content_end_x
-            .saturating_sub(layout.old_content_x) as usize;
-        let right_content_width = layout
-            .new_content_end_x
-            .saturating_sub(layout.new_content_x) as usize;
-        let mut acc = 0usize;
-        for line_idx in self.scroll_offset..target_line {
-            acc += line_visual_height(&self.lines[line_idx], panel_width, right_content_width);
-            if acc >= visible {
-                return None;
-            }
-        }
-        Some(acc)
-    }
-
-    /// Pick a `scroll_offset` that places `target_line` roughly at the visual
-    /// middle of the diff panel. Walks back from the target accumulating
-    /// per-line wrap heights so wrap mode lands the target in view.
-    pub fn scroll_offset_to_center_line(
-        &self,
-        target_line: usize,
-        layout: &DiffPanelLayout,
-    ) -> usize {
-        let visible = layout.inner_end_y.saturating_sub(layout.inner_y) as usize;
-        let max_start = self.lines.len().saturating_sub(visible.max(1));
-        if !self.wrap {
-            return target_line.saturating_sub(visible / 2).min(max_start);
-        }
-        let panel_width = layout
-            .old_content_end_x
-            .saturating_sub(layout.old_content_x) as usize;
-        let right_content_width = layout
-            .new_content_end_x
-            .saturating_sub(layout.new_content_x) as usize;
-        let half = visible / 2;
-        let mut scroll = target_line.min(self.lines.len());
-        let mut acc = 0usize;
-        while scroll > 0 {
-            let prev = scroll - 1;
-            let h = line_visual_height(&self.lines[prev], panel_width, right_content_width);
-            if acc + h > half {
-                break;
-            }
-            acc += h;
-            scroll = prev;
-        }
-        scroll.min(max_start)
-    }
-
     /// Return true when the given line index is the first line of a diff hunk.
     pub fn is_hunk_start_line(&self, line_idx: usize) -> bool {
         self.hunk_starts.binary_search(&line_idx).is_ok()
@@ -1004,30 +938,45 @@ impl DiffViewState {
         offsets
     }
 
-    /// Cycle to the next revertable hunk marker.
-    pub fn select_next_revert_hunk(&mut self) {
+    /// Jump to the next hunk and select it as the revert target. Always
+    /// scrolls to the hunk's start line — same motion as `next_hunk` —
+    /// even if it's already in the viewport. Wraps to the first hunk
+    /// after the last.
+    pub fn cycle_next_revert_hunk(&mut self) {
         if self.hunk_starts.is_empty() {
             self.selected_revert_hunk = None;
             return;
         }
         let next = match self.selected_revert_hunk {
             Some(i) => (i + 1) % self.hunk_starts.len(),
-            None => 0,
+            None => self
+                .hunk_starts
+                .iter()
+                .position(|&h| h > self.scroll_offset)
+                .unwrap_or(0),
         };
         self.selected_revert_hunk = Some(next);
+        self.scroll_offset = self.hunk_starts[next];
     }
 
-    /// Cycle to the previous revertable hunk marker.
-    pub fn select_prev_revert_hunk(&mut self) {
+    /// Jump to the previous hunk and select it as the revert target.
+    /// Wraps to the last hunk before the first.
+    pub fn cycle_prev_revert_hunk(&mut self) {
         if self.hunk_starts.is_empty() {
             self.selected_revert_hunk = None;
             return;
         }
         let prev = match self.selected_revert_hunk {
-            Some(0) | None => self.hunk_starts.len() - 1,
-            Some(i) => i.saturating_sub(1),
+            Some(0) => self.hunk_starts.len() - 1,
+            Some(i) => i - 1,
+            None => self
+                .hunk_starts
+                .iter()
+                .rposition(|&h| h < self.scroll_offset)
+                .unwrap_or(self.hunk_starts.len() - 1),
         };
         self.selected_revert_hunk = Some(prev);
+        self.scroll_offset = self.hunk_starts[prev];
     }
 
     /// Get the highlighters for a given section index.

@@ -1373,17 +1373,18 @@ fn render_status_bar(
             let has_undo = !diff_view.revert_undo_stack.is_empty();
             let mut idx = 0;
             if has_selection {
-                hints.insert(idx, ("enter", "revert hunk"));
+                hints.insert(idx, ("enter", "hunk menu"));
                 emphasized.push("enter");
                 idx += 1;
             }
-            hints.insert(idx, ("c-j/c-k", "cycle revert"));
+            hints.insert(idx, ("{/}", "cycle hunks"));
             idx += 1;
             if has_undo {
                 hints.insert(idx, ("u", "undo revert"));
             }
+        } else {
+            hints.push(("{/}", "prev/next hunk"));
         }
-        hints.push(("{/}", "prev/next hunk"));
         hints.push(("[/]", "side view"));
     } else {
         // Sidebar-focused: context-specific hints.
