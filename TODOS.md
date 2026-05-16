@@ -237,5 +237,3 @@
 - [ ] While 'generating commit messages' or 'pushing' the UI is blocked. Let's not block it. Let us move around a bit. The question is.. where to put this indicator.
 
 - [ ] Use 'check' and 'checkmark' for staged and unstaged (not like lazygit), more like zed.
-
-- [ ] 123
