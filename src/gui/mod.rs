@@ -5046,7 +5046,7 @@ impl Gui {
         if self.context_mgr.active() != ContextId::Files {
             return None;
         }
-        if self.diff_view.wrap || self.diff_view.is_empty() {
+        if self.diff_view.is_empty() {
             return None;
         }
         if !rect_contains(panel_rect, col, row) {
@@ -5056,7 +5056,10 @@ impl Gui {
         if col != divider_x {
             return None;
         }
-        let line_idx = self.diff_view.line_index_at_row(row, layout)?;
+        let (line_idx, chunk_idx) = self.diff_view.line_chunk_at_row(row, layout)?;
+        if chunk_idx != 0 {
+            return None;
+        }
         self.diff_view.hunk_index_for_start_line(line_idx)
     }
 
@@ -5179,16 +5182,18 @@ impl Gui {
             return;
         }
 
-        let scroll = self.diff_view.scroll_offset;
         // Already in viewport? Don't scroll. The marker glyph sits on the
-        // hunk's first row, so only that row needs to be visible.
-        if line_idx >= scroll && line_idx < scroll + visible_rows {
+        // hunk's first wrapped chunk, so only that visual row needs to be visible.
+        if self
+            .diff_view
+            .visual_offset_of_line(line_idx, &pl)
+            .is_some()
+        {
             return;
         }
 
-        let desired = line_idx.saturating_sub(visible_rows / 2);
-        let max_start = self.diff_view.lines.len().saturating_sub(visible_rows);
-        self.diff_view.scroll_offset = desired.min(max_start);
+        self.diff_view.scroll_offset =
+            self.diff_view.scroll_offset_to_center_line(line_idx, &pl);
     }
 
     /// Approximate visible height of the active sidebar panel (inner area minus borders).

@@ -825,18 +825,111 @@ impl DiffViewState {
         self.lines.is_empty()
     }
 
-    /// Map a terminal row within the diff panel inner area to the visible diff line index.
-    /// This is exact when wrapping is disabled.
-    pub fn line_index_at_row(&self, row: u16, layout: &DiffPanelLayout) -> Option<usize> {
+    /// Map a terminal row within the diff panel inner area to `(line_idx, chunk_idx)`.
+    /// `chunk_idx` is the wrapped-chunk position within the line (0 = first visual
+    /// row). Always 0 when wrapping is off.
+    pub fn line_chunk_at_row(
+        &self,
+        row: u16,
+        layout: &DiffPanelLayout,
+    ) -> Option<(usize, usize)> {
         if row < layout.inner_y || row >= layout.inner_end_y {
             return None;
         }
-        let idx = self.scroll_offset + (row - layout.inner_y) as usize;
-        if idx < self.lines.len() {
-            Some(idx)
-        } else {
-            None
+        let target_off = (row - layout.inner_y) as usize;
+
+        if !self.wrap {
+            let idx = self.scroll_offset + target_off;
+            return if idx < self.lines.len() {
+                Some((idx, 0))
+            } else {
+                None
+            };
         }
+
+        let panel_width = layout
+            .old_content_end_x
+            .saturating_sub(layout.old_content_x) as usize;
+        let right_content_width = layout
+            .new_content_end_x
+            .saturating_sub(layout.new_content_x) as usize;
+
+        let mut acc = 0usize;
+        for (offset, diff_line) in self.lines[self.scroll_offset..].iter().enumerate() {
+            let line_idx = self.scroll_offset + offset;
+            let num_rows = line_visual_height(diff_line, panel_width, right_content_width);
+            if target_off < acc + num_rows {
+                return Some((line_idx, target_off - acc));
+            }
+            acc += num_rows;
+        }
+        None
+    }
+
+    /// Visual row offset (from `layout.inner_y`) of `target_line`'s first wrapped
+    /// chunk. Returns `None` if the target is above `scroll_offset` or past the
+    /// visible window.
+    pub fn visual_offset_of_line(
+        &self,
+        target_line: usize,
+        layout: &DiffPanelLayout,
+    ) -> Option<usize> {
+        if target_line < self.scroll_offset || target_line >= self.lines.len() {
+            return None;
+        }
+        let visible = layout.inner_end_y.saturating_sub(layout.inner_y) as usize;
+        if !self.wrap {
+            let off = target_line - self.scroll_offset;
+            return if off < visible { Some(off) } else { None };
+        }
+        let panel_width = layout
+            .old_content_end_x
+            .saturating_sub(layout.old_content_x) as usize;
+        let right_content_width = layout
+            .new_content_end_x
+            .saturating_sub(layout.new_content_x) as usize;
+        let mut acc = 0usize;
+        for line_idx in self.scroll_offset..target_line {
+            acc += line_visual_height(&self.lines[line_idx], panel_width, right_content_width);
+            if acc >= visible {
+                return None;
+            }
+        }
+        Some(acc)
+    }
+
+    /// Pick a `scroll_offset` that places `target_line` roughly at the visual
+    /// middle of the diff panel. Walks back from the target accumulating
+    /// per-line wrap heights so wrap mode lands the target in view.
+    pub fn scroll_offset_to_center_line(
+        &self,
+        target_line: usize,
+        layout: &DiffPanelLayout,
+    ) -> usize {
+        let visible = layout.inner_end_y.saturating_sub(layout.inner_y) as usize;
+        let max_start = self.lines.len().saturating_sub(visible.max(1));
+        if !self.wrap {
+            return target_line.saturating_sub(visible / 2).min(max_start);
+        }
+        let panel_width = layout
+            .old_content_end_x
+            .saturating_sub(layout.old_content_x) as usize;
+        let right_content_width = layout
+            .new_content_end_x
+            .saturating_sub(layout.new_content_x) as usize;
+        let half = visible / 2;
+        let mut scroll = target_line.min(self.lines.len());
+        let mut acc = 0usize;
+        while scroll > 0 {
+            let prev = scroll - 1;
+            let h = line_visual_height(&self.lines[prev], panel_width, right_content_width);
+            if acc + h > half {
+                break;
+            }
+            acc += h;
+            scroll = prev;
+        }
+        scroll.min(max_start)
     }
 
     /// Return true when the given line index is the first line of a diff hunk.
@@ -1341,7 +1434,6 @@ pub fn render_diff(
 
                     // Divider or revert marker (first visual row of a hunk only).
                     let show_marker = show_revert_markers
-                        && !state.wrap
                         && chunk_idx == 0
                         && state.is_hunk_start_line(line_idx);
                     let marker_hunk_idx = if show_marker {
@@ -1684,6 +1776,74 @@ fn unicode_display_width(ch: char) -> usize {
 
 /// Split a list of styled spans into visual rows of at most `width` display columns each.
 /// Used by wrap mode to soft-wrap long diff lines.
+/// Count how many visual rows a single line of `text` would occupy when wrapped
+/// at `width` display columns. Mirrors the row count produced by `wrap_spans`,
+/// without building styled spans.
+fn wrap_row_count(text: &str, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let widths: Vec<usize> = text
+        .chars()
+        .filter_map(|ch| {
+            let w = unicode_display_width(ch);
+            if w > 0 { Some(w) } else { None }
+        })
+        .collect();
+    if widths.is_empty() {
+        return 1;
+    }
+    let mut rows = 0usize;
+    let mut i = 0usize;
+    while i < widths.len() {
+        let mut col_w = 0usize;
+        let mut end = i;
+        while end < widths.len() {
+            let w = widths[end];
+            if col_w + w > width {
+                break;
+            }
+            col_w += w;
+            end += 1;
+        }
+        if end == i {
+            end = i + 1;
+        }
+        i = end;
+        rows += 1;
+    }
+    rows
+}
+
+/// Visual height (in panel rows) of a diff line, matching the renderer's
+/// `num_rows` calculation in side-by-side wrap mode.
+fn line_visual_height(diff_line: &DiffLine, panel_width: usize, right_content_width: usize) -> usize {
+    if diff_line.file_header.is_some() {
+        return 1;
+    }
+    let is_insert = diff_line.change_type == ChangeType::Insert;
+    let is_delete = diff_line.change_type == ChangeType::Delete;
+    let left_rows = if is_insert {
+        0
+    } else {
+        diff_line
+            .old_line
+            .as_ref()
+            .map(|(_, t)| wrap_row_count(t, panel_width))
+            .unwrap_or(1)
+    };
+    let right_rows = if is_delete {
+        0
+    } else {
+        diff_line
+            .new_line
+            .as_ref()
+            .map(|(_, t)| wrap_row_count(t, right_content_width))
+            .unwrap_or(1)
+    };
+    left_rows.max(right_rows).max(1)
+}
+
 fn wrap_spans<'a>(spans: &[Span<'a>], width: usize) -> Vec<Vec<Span<'a>>> {
     if width == 0 {
         return vec![vec![]];
