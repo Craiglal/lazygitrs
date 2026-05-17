@@ -3538,7 +3538,7 @@ impl Gui {
         &mut self,
         is_rebasing: bool,
         is_merging: bool,
-        _is_cherry_picking: bool,
+        is_cherry_picking: bool,
     ) -> Result<()> {
         let mut items = Vec::new();
 
@@ -3588,8 +3588,42 @@ impl Gui {
             });
         }
 
+        if is_cherry_picking {
+            items.push(popup::MenuItem {
+                label: "Continue cherry-pick".to_string(),
+                description: "git cherry-pick --continue".to_string(),
+                key: Some("c".to_string()),
+                action: Some(Box::new(|gui| {
+                    gui.git.continue_cherry_pick()?;
+                    gui.needs_refresh = true;
+                    Ok(())
+                })),
+            });
+            items.push(popup::MenuItem {
+                label: "Abort cherry-pick".to_string(),
+                description: "git cherry-pick --abort".to_string(),
+                key: Some("a".to_string()),
+                action: Some(Box::new(|gui| {
+                    gui.git.abort_cherry_pick()?;
+                    gui.cherry_pick_clipboard.clear();
+                    gui.needs_refresh = true;
+                    Ok(())
+                })),
+            });
+            items.push(popup::MenuItem {
+                label: "Skip this commit".to_string(),
+                description: "git cherry-pick --skip".to_string(),
+                key: Some("s".to_string()),
+                action: Some(Box::new(|gui| {
+                    gui.git.skip_cherry_pick()?;
+                    gui.needs_refresh = true;
+                    Ok(())
+                })),
+            });
+        }
+
         self.popup = PopupState::Menu {
-            title: "Rebase/Merge options".to_string(),
+            title: "Rebase/Merge/Cherry-pick options".to_string(),
             items,
             selected: 0,
             loading_index: None,

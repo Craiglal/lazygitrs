@@ -48,6 +48,11 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
         return paste_commits(gui);
     }
 
+    if matches_key(key, &keybindings.commits.reset_cherry_pick) {
+        gui.cherry_pick_clipboard.clear();
+        return Ok(());
+    }
+
     if matches_key(key, &keybindings.commits.squash_above_commits) {
         return squash_above_commits_menu(gui);
     }
@@ -300,7 +305,11 @@ fn paste_commits(gui: &mut Gui) -> Result<()> {
     }
 
     let n = gui.cherry_pick_clipboard.len();
-    let hashes = gui.cherry_pick_clipboard.clone();
+    let mut hashes = gui.cherry_pick_clipboard.clone();
+    // The clipboard stores commits newest-first (matching the visual list order).
+    // git cherry-pick applies commits in argument order, so we must reverse to
+    // apply oldest-first and preserve the intended history.
+    hashes.reverse();
 
     gui.popup = PopupState::Confirm {
         title: "Cherry-pick".to_string(),
