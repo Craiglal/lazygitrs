@@ -33,7 +33,7 @@ use self::layout::LayoutState;
 use self::popup::{HelpEntry, HelpSection};
 use self::modes::diff_mode::DiffModeState;
 use self::modes::patch_building::PatchBuildingState;
-use self::modes::rebase_mode::RebaseModeState;
+use self::modes::rebase_mode::{EntryStatus, RebaseModeState, RebasePhase};
 use self::popup::{ListPickerItem, MessageKind, PopupState};
 
 /// Compute the display row index for a given item selection,
@@ -459,10 +459,7 @@ impl Gui {
                     && !self.rebase_mode.active
                     && !self.rebase_mode.in_progress_dismissed
                 {
-                    if let Some(mut progress) = self.git.parse_rebase_progress() {
-                        self.git.hydrate_progress(&mut progress);
-                        self.rebase_mode.enter_in_progress(&progress);
-                    }
+                    self.sync_rebase_progress_view();
                 }
                 // Rebuild file tree if files arrived this frame.
                 if got_files && self.show_file_tree {
@@ -1674,11 +1671,8 @@ impl Gui {
             // If rebasing, re-enter the interactive rebase view
             if is_rebasing {
                 if !self.rebase_mode.active {
-                    if let Some(mut progress) = self.git.parse_rebase_progress() {
-                        self.git.hydrate_progress(&mut progress);
-                        self.rebase_mode.in_progress_dismissed = false;
-                        self.rebase_mode.enter_in_progress(&progress);
-                    }
+                    self.rebase_mode.in_progress_dismissed = false;
+                    self.sync_rebase_progress_view();
                 }
                 return Ok(());
             }
@@ -5277,6 +5271,64 @@ impl Gui {
         panel_rect.height.saturating_sub(2) as usize
     }
 
+    pub(crate) fn sync_rebase_progress_view(&mut self) -> bool {
+        let was_active_in_progress =
+            self.rebase_mode.active && self.rebase_mode.phase == RebasePhase::InProgress;
+        let previous_current_hash = if was_active_in_progress {
+            self.rebase_mode
+                .entries
+                .iter()
+                .find(|entry| entry.status == EntryStatus::Current)
+                .map(|entry| entry.hash.clone())
+        } else {
+            None
+        };
+        let previous_selected_hash = if was_active_in_progress {
+            self.rebase_mode
+                .entries
+                .get(self.rebase_mode.selected)
+                .map(|entry| entry.hash.clone())
+        } else {
+            None
+        };
+        let previous_scroll = self.rebase_mode.scroll;
+
+        let Some(mut progress) = self.git.parse_rebase_progress() else {
+            return false;
+        };
+        self.git.hydrate_progress(&mut progress);
+        self.rebase_mode.enter_in_progress(&progress);
+
+        let current_hash = self
+            .rebase_mode
+            .entries
+            .iter()
+            .find(|entry| entry.status == EntryStatus::Current)
+            .map(|entry| entry.hash.clone());
+
+        if was_active_in_progress
+            && previous_current_hash.is_some()
+            && previous_current_hash == current_hash
+        {
+            if let Some(selected_hash) = previous_selected_hash {
+                if let Some(selected) = self
+                    .rebase_mode
+                    .entries
+                    .iter()
+                    .position(|entry| entry.hash == selected_hash)
+                {
+                    self.rebase_mode.selected = selected;
+                    let list_len = self.rebase_mode.entries.len() + 1;
+                    let max_scroll = list_len.saturating_sub(self.rebase_mode.visible_height);
+                    self.rebase_mode.scroll = previous_scroll.min(max_scroll);
+                    self.rebase_mode.ensure_visible(self.rebase_mode.visible_height);
+                }
+            }
+        }
+
+        true
+    }
+
     fn refresh(&mut self) -> Result<()> {
         let new_model = self.git.load_model()?;
         let mut model = self.model.lock().unwrap();
@@ -5342,19 +5394,21 @@ impl Gui {
         let is_rebasing = model.is_rebasing;
         drop(model);
 
-        // Auto-enter rebase InProgress mode when a rebase is detected on disk
-        // and we're not already in rebase mode. Skip if the user dismissed the
-        // view with `q` — they can re-open it explicitly via the rebase
-        // options menu key.
-        if is_rebasing && !self.rebase_mode.active && !self.rebase_mode.in_progress_dismissed {
-            if let Some(mut progress) = self.git.parse_rebase_progress() {
-                self.git.hydrate_progress(&mut progress);
-                self.rebase_mode.enter_in_progress(&progress);
+        // Auto-enter or resync rebase InProgress mode when a rebase is
+        // detected on disk. If the view is already open, keep its todo status
+        // in step with Git so `rebase --continue` can advance to the next
+        // paused commit without leaving the old entry marked current.
+        if is_rebasing {
+            let should_open =
+                !self.rebase_mode.active && !self.rebase_mode.in_progress_dismissed;
+            let should_resync =
+                self.rebase_mode.active && self.rebase_mode.phase == RebasePhase::InProgress;
+            if should_open || should_resync {
+                self.sync_rebase_progress_view();
             }
         }
         // If rebase mode was active but the rebase completed, exit and show success.
         if !is_rebasing && self.rebase_mode.active {
-            use crate::gui::modes::rebase_mode::RebasePhase;
             if self.rebase_mode.phase == RebasePhase::InProgress {
                 let branch = self.rebase_mode.branch_name.clone();
                 let count = self.rebase_mode.total_count;

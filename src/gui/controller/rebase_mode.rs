@@ -227,12 +227,14 @@ fn handle_in_progress_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
 fn continue_rebase(gui: &mut Gui) -> Result<()> {
     match gui.git.continue_rebase() {
         Ok(()) => {
-            // Don't exit rebase mode here — let refresh() detect whether the
-            // rebase completed or paused again. If completed, refresh() will
-            // show the success popup and exit the mode.
+            // Don't exit rebase mode here. Resync immediately if Git paused
+            // again, then let refresh() update the rest of the model and
+            // detect completion.
+            gui.sync_rebase_progress_view();
             gui.needs_refresh = true;
         }
         Err(e) => {
+            gui.needs_refresh = true;
             let msg = format!("{}", e);
             if msg.contains("CONFLICT") || msg.contains("conflict") {
                 gui.popup = PopupState::Message {
@@ -329,7 +331,10 @@ fn execute_rebase(gui: &mut Gui) -> Result<()> {
 
     match gui.git.rebase_interactive_batch(&base_hash, &actions) {
         Ok(()) => {
-            // Rebase completed or paused — let refresh() handle the outcome.
+            // Rebase completed or paused. Resync immediately when paused so
+            // the first conflict shows the real progress state before the
+            // next model refresh lands.
+            gui.sync_rebase_progress_view();
             gui.needs_refresh = true;
         }
         Err(e) => {

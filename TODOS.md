@@ -240,4 +240,4 @@
 
 - [x] Allow me to scroll using mouse the 'Commit Messages' dialog.
 
-- [ ] During interactive rebase UI, merge conflicts, I see a good UI for continuing and stuff. But I think when I press continue and the next commit on the list has a conflict. It just shows me the error dialog that there's a new conflict but does not update the new interactive rebase UI with the new progress on the next commit.
+- [x] During interactive rebase UI, merge conflicts, I see a good UI for continuing and stuff. But I think when I press continue and the next commit on the list has a conflict. It just shows me the error dialog that there's a new conflict but does not update the new interactive rebase UI with the new progress on the next commit.

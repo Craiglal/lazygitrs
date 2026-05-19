@@ -168,10 +168,11 @@ impl GitCommands {
 
     /// Skip during a rebase (when there's a conflict).
     pub fn rebase_skip(&self) -> Result<()> {
-        self.git()
+        let result = self
+            .git()
             .args(&["rebase", "--skip"])
-            .run_expecting_success()?;
-        Ok(())
+            .run()?;
+        self.handle_rebase_step_result("--skip", result)
     }
 
     /// Interactive rebase with a full todo list: apply multiple actions in one shot.
