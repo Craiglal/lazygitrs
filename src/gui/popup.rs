@@ -141,6 +141,15 @@ impl WrapLayout {
         (last, cursor.saturating_sub(line.raw_start).min(line.char_len))
     }
 
+    fn visual_to_cursor(&self, row: usize, col: usize) -> usize {
+        let line = self
+            .lines
+            .get(row)
+            .or_else(|| self.lines.last())
+            .expect("wrap layout always has at least one line");
+        line.raw_start + col.min(line.char_len)
+    }
+
     pub fn as_textarea_text(&self) -> String {
         self.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
     }
@@ -361,6 +370,11 @@ impl BodySoftWrap {
         }
         let target = &layout.lines[row + 1];
         self.cursor = target.raw_start + col.min(target.char_len);
+    }
+
+    pub fn set_cursor_from_visual(&mut self, row: usize, col: usize, wrap_width: usize) {
+        let layout = WrapLayout::build(&self.raw, wrap_width.max(1));
+        self.cursor = layout.visual_to_cursor(row, col);
     }
 
     /// Re-render `textarea` to display the current raw text soft-wrapped at

@@ -1694,6 +1694,38 @@ pub fn commit_ai_button_geometry(popup: &PopupState, area: Rect) -> Option<Rect>
     Some(Rect::new(btn_x, btn_y, btn_w, 1))
 }
 
+/// Geometry of the Description textarea inside the two-field commit popup.
+pub fn commit_description_textarea_geometry(popup: &PopupState, area: Rect) -> Option<Rect> {
+    if area.width < 4 || area.height < 4 {
+        return None;
+    }
+
+    let PopupState::CommitInput { .. } = popup else {
+        return None;
+    };
+
+    let popup_width = (area.width * 60 / 100).min(60).max(30).min(area.width);
+    let ta_height = 16u16.min(area.height);
+    let ta_y = (area.height.saturating_sub(ta_height)) / 2;
+    let ta_rect = Rect::new(
+        (area.width.saturating_sub(popup_width)) / 2,
+        ta_y,
+        popup_width,
+        ta_height,
+    );
+    let inner = ta_rect.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+
+    if inner.height <= 6 {
+        return None;
+    }
+
+    let body_height = inner.height.saturating_sub(6);
+    (body_height > 0).then(|| Rect::new(inner.x, inner.y + 4, inner.width, body_height))
+}
+
 /// Tooltip rect placed one row above the popup, right-aligned with the button.
 fn commit_ai_tooltip_rect(area: Rect, btn_rect: Rect, tip_w: u16) -> Rect {
     let popup_width = (area.width * 60 / 100).min(60).max(30).min(area.width);

@@ -4137,6 +4137,36 @@ impl Gui {
             self.commit_ai_button_hovered = false;
         }
 
+        if matches!(self.popup, PopupState::CommitInput { .. }) {
+            let area = ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
+            if let Some(body_rect) = views::commit_description_textarea_geometry(&self.popup, area)
+                && rect_contains(body_rect, mouse.column, mouse.row)
+            {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let rows: i16 = if matches!(mouse.kind, MouseEventKind::ScrollDown) {
+                            3
+                        } else {
+                            -3
+                        };
+                        let wrap_width = self.commit_body_wrap_width();
+                        if let PopupState::CommitInput {
+                            body_textarea,
+                            body_state,
+                            ..
+                        } = &mut self.popup
+                        {
+                            body_textarea.scroll((rows, 0));
+                            let (row, col) = body_textarea.cursor();
+                            body_state.set_cursor_from_visual(row, col, wrap_width);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Rebase mode: scroll and click support
         if self.rebase_mode.active {
             match mouse.kind {
