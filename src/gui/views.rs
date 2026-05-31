@@ -1794,6 +1794,67 @@ fn commit_ai_tooltip_rect(area: Rect, btn_rect: Rect, tip_w: u16) -> Rect {
     Rect::new(tip_x, tip_y, tip_w, 1)
 }
 
+pub fn render_loading_overlay(
+    frame: &mut Frame,
+    area: Rect,
+    spinner_frame: usize,
+    theme: &Theme,
+    title: &str,
+    message: &str,
+    hint: Option<(&str, &str)>,
+) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+
+    let popup_width = (area.width * 60 / 100).min(60).max(30).min(area.width);
+    let x = (area.width.saturating_sub(popup_width)) / 2;
+    let spinner = SPINNER_CHARS[(spinner_frame / 8) % SPINNER_CHARS.len()];
+    let height = 8u16;
+    let ly = (area.height.saturating_sub(height)) / 2;
+    let popup_rect = Rect::new(x, ly, popup_width, height);
+    frame.render_widget(Clear, popup_rect);
+
+    let block = Block::default()
+        .title(format!(" {} ", title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent_secondary));
+
+    let mut text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                format!(" {} ", spinner),
+                Style::default().fg(theme.accent_secondary),
+            ),
+            Span::styled(
+                message.to_string(),
+                Style::default()
+                    .fg(theme.accent_secondary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+    ];
+    if let Some((key, desc)) = hint {
+        text.push(Line::from(vec![
+            Span::styled(
+                format!(" {}", key),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {}", desc), Style::default().fg(theme.text_dimmed)),
+        ]));
+    } else {
+        text.push(Line::from(Span::styled(
+            format!(" {} Please wait...", spinner),
+            Style::default().fg(theme.text_dimmed),
+        )));
+    }
+
+    let widget = Paragraph::new(text).block(block);
+    frame.render_widget(widget, popup_rect);
+}
+
 pub fn render_popup(frame: &mut Frame, popup: &PopupState, area: Rect, spinner_frame: usize, theme: &Theme, ai_button_hovered: bool, ai_configured: bool) {
     // Bail out early on terminals too small to host any popup — better than
     // panicking inside a render with an out-of-bounds rect.
@@ -2143,36 +2204,7 @@ pub fn render_popup(frame: &mut Frame, popup: &PopupState, area: Rect, spinner_f
             }
         }
         PopupState::Loading { title, message } => {
-            // Change symbol every ~8 frames (~128ms at 60fps)
-            let spinner = SPINNER_CHARS[(spinner_frame / 8) % SPINNER_CHARS.len()];
-
-            let height = 8u16;
-            let ly = (area.height.saturating_sub(height)) / 2;
-            let popup_rect = Rect::new(x, ly, popup_width, height);
-            frame.render_widget(Clear, popup_rect);
-
-            let block = Block::default()
-                .title(format!(" {} ", title))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.accent_secondary));
-
-            let text = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!(" {} ", message),
-                    Style::default()
-                        .fg(theme.accent_secondary)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    format!(" {} Please wait...", spinner),
-                    Style::default().fg(theme.text_dimmed),
-                )),
-            ];
-
-            let widget = Paragraph::new(text).block(block);
-            frame.render_widget(widget, popup_rect);
+            render_loading_overlay(frame, area, spinner_frame, theme, title, message, None);
         }
         PopupState::Checklist {
             title,

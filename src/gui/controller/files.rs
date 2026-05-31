@@ -103,8 +103,10 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
 
     // Fetch
     if matches_key(key, &keybindings.files.fetch) {
-        gui.git.fetch_all()?;
-        gui.needs_refresh = true;
+        gui.start_remote_op("Fetch", "Fetching from all remotes...", |git| {
+            git.fetch_all()?;
+            Ok(())
+        });
         return Ok(());
     }
 
@@ -183,6 +185,10 @@ fn toggle_stage_all(gui: &mut Gui) -> Result<()> {
 }
 
 fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
+    if gui.ai_commit_generation_active() {
+        return Ok(());
+    }
+
     let model = gui.model.lock().unwrap();
     let any_staged = model.files.iter().any(|f| f.has_staged_changes);
     let no_files = model.files.is_empty();
@@ -268,6 +274,10 @@ fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
 }
 
 fn open_ai_commit_prompt(gui: &mut Gui) -> Result<()> {
+    if gui.ai_commit_generation_active() {
+        return Ok(());
+    }
+
     let model = gui.model.lock().unwrap();
     let any_staged = model.files.iter().any(|f| f.has_staged_changes);
     let no_files = model.files.is_empty();

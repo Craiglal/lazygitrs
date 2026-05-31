@@ -478,6 +478,7 @@ pub enum PopupState {
         kind: MessageKind,
     },
     /// Shown while a background operation (like AI commit generation) is running.
+    #[allow(dead_code)]
     Loading {
         title: String,
         message: String,

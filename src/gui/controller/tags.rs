@@ -158,8 +158,11 @@ fn push_tag(gui: &mut Gui) -> Result<()> {
             title: "Push tag".to_string(),
             message: format!("Push tag '{}' to origin?", name),
             on_confirm: Box::new(move |gui| {
-                gui.git.push_tag(&name)?;
-                gui.needs_refresh = true;
+                let tag = name.clone();
+                gui.start_remote_op("Push", &format!("Pushing tag {} to origin...", tag), move |git| {
+                    git.push_tag(&tag)?;
+                    Ok(())
+                });
                 Ok(())
             }),
         };

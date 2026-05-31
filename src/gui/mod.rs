@@ -9,9 +9,9 @@ pub mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseEvent};
@@ -84,6 +84,17 @@ pub(crate) enum DiffPayload {
     Empty,
 }
 
+struct AiCommitJob {
+    generation: u64,
+    cancel: Arc<AtomicBool>,
+    cancel_armed_at: Option<Instant>,
+}
+
+struct AiCommitResult {
+    generation: u64,
+    result: Result<Option<String>>,
+}
+
 pub struct Gui {
     pub config: Arc<AppConfig>,
     pub git: Arc<GitCommands>,
@@ -126,9 +137,13 @@ pub struct Gui {
     /// Keep sender around so we can clone it for background threads.
     pub(crate) diff_tx: mpsc::Sender<DiffResult>,
     /// Receiver for AI commit message generation results.
-    ai_commit_rx: mpsc::Receiver<Result<String>>,
+    ai_commit_rx: mpsc::Receiver<AiCommitResult>,
     /// Sender cloned into background threads for AI commit generation.
-    ai_commit_tx: mpsc::Sender<Result<String>>,
+    ai_commit_tx: mpsc::Sender<AiCommitResult>,
+    /// Active AI commit generation job, if one is running.
+    ai_commit_job: Option<AiCommitJob>,
+    /// Generation counter used to discard stale AI results after cancellation.
+    ai_commit_generation: u64,
     /// Receiver for background remote operations (push, pull, fetch).
     remote_op_rx: mpsc::Receiver<Result<()>>,
     /// Sender cloned into background threads for remote operations.
@@ -345,6 +360,8 @@ impl Gui {
             diff_tx,
             ai_commit_rx,
             ai_commit_tx,
+            ai_commit_job: None,
+            ai_commit_generation: 0,
             remote_op_rx,
             remote_op_tx,
             auto_fetch_rx,
@@ -513,6 +530,16 @@ impl Gui {
                     // Render popup overlay on top of rebase mode
                     if self.popup != PopupState::None {
                         views::render_popup(frame, &self.popup, frame.area(), self.spinner_frame, &theme, self.commit_ai_button_hovered, !self.config.user_config.git.commit.generate_command.trim().is_empty());
+                    } else if self.ai_commit_generation_active() {
+                        views::render_loading_overlay(
+                            frame,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            "AI Commit",
+                            "Generating commit message...",
+                            Some(("Esc esc", "cancel")),
+                        );
                     }
                 } else if self.diff_mode.active {
                     let diff_loading_show = self.diff_loading && self.diff_loading_since
@@ -529,6 +556,16 @@ impl Gui {
                     // Render popup overlay on top of diff mode (for ? help, errors, etc.)
                     if self.popup != PopupState::None {
                         views::render_popup(frame, &self.popup, frame.area(), self.spinner_frame, &theme, self.commit_ai_button_hovered, !self.config.user_config.git.commit.generate_command.trim().is_empty());
+                    } else if self.ai_commit_generation_active() {
+                        views::render_loading_overlay(
+                            frame,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            "AI Commit",
+                            "Generating commit message...",
+                            Some(("Esc esc", "cancel")),
+                        );
                     }
                 } else {
                     let model = self.model.lock().unwrap();
@@ -592,6 +629,17 @@ impl Gui {
                         self.commit_ai_button_hovered,
                         !self.config.user_config.git.commit.generate_command.trim().is_empty(),
                     );
+                    if self.popup == PopupState::None && self.ai_commit_generation_active() {
+                        views::render_loading_overlay(
+                            frame,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            "AI Commit",
+                            "Generating commit message...",
+                            Some(("Esc esc", "cancel")),
+                        );
+                    }
                 }
             })?;
 
@@ -712,9 +760,15 @@ impl Gui {
 
     /// Check for completed AI commit message generation results.
     fn receive_ai_commit_results(&mut self) {
-        if let Ok(result) = self.ai_commit_rx.try_recv() {
-            match result {
-                Ok(message) => {
+        while let Ok(result) = self.ai_commit_rx.try_recv() {
+            let active_generation = self.ai_commit_job.as_ref().map(|job| job.generation);
+            if active_generation != Some(result.generation) {
+                continue;
+            }
+            self.ai_commit_job = None;
+
+            match result.result {
+                Ok(Some(message)) => {
                     let popup_width = (self.layout.width * 60 / 100).min(60).max(30);
                     let popup_inner = popup_width.saturating_sub(4) as usize;
                     let config_width = self.config.user_config.git.commit.auto_wrap_width;
@@ -744,7 +798,8 @@ impl Gui {
                         }
                     };
 
-                    // Restore the stashed commit editor, replacing its textarea content
+                    // Restore the stashed commit editor, replacing its textarea content.
+                    // This intentionally steals focus when generation completes.
                     if let Some(mut stashed) = self.pending_commit_popup.take() {
                         fill_commit(&mut stashed);
                         self.popup = stashed;
@@ -752,7 +807,7 @@ impl Gui {
                         let mut summary_ta = popup::make_commit_summary_textarea();
                         summary_ta.insert_str(&summary);
                         let mut body_ta = popup::make_commit_body_textarea();
-                        let mut body_state = popup::BodySoftWrap::from_text(body.clone());
+                        let body_state = popup::BodySoftWrap::from_text(body.clone());
                         if !body.is_empty() {
                             body_state.render_into(&mut body_ta, wrap);
                         }
@@ -769,6 +824,11 @@ impl Gui {
                                 Ok(())
                             }),
                         };
+                    }
+                }
+                Ok(None) => {
+                    if let Some(stashed) = self.pending_commit_popup.take() {
+                        self.saved_commit_popup = Some(stashed);
                     }
                 }
                 Err(e) => {
@@ -839,7 +899,6 @@ impl Gui {
             self.remote_op_label = None;
             match result {
                 Ok(()) => {
-                    self.popup = PopupState::None;
                     self.needs_refresh = true;
                     self.remote_op_success_at = Some(Instant::now());
                 }
@@ -946,15 +1005,15 @@ impl Gui {
         }
     }
 
-    /// Run a remote operation (push/pull/fetch) on a background thread with a loading popup.
-    pub fn start_remote_op<F>(&mut self, title: &str, message: &str, op: F)
+    /// Run a remote operation (push/pull/fetch) on a background thread.
+    pub fn start_remote_op<F>(&mut self, title: &str, _message: &str, op: F)
     where
         F: FnOnce(&GitCommands) -> Result<()> + Send + 'static,
     {
-        self.popup = PopupState::Loading {
-            title: title.to_string(),
-            message: message.to_string(),
-        };
+        if self.remote_op_label.is_some() {
+            return;
+        }
+
         // Show operation label on the head branch in the sidebar (e.g. "Pushing", "Pulling").
         let label = match title {
             "Push" => "Pushing",
@@ -997,28 +1056,51 @@ impl Gui {
         });
     }
 
+    pub(crate) fn ai_commit_generation_active(&self) -> bool {
+        self.ai_commit_job.is_some()
+    }
+
     /// Start AI commit message generation on a background thread.
-    pub fn start_ai_commit_generation(&self) {
+    pub fn start_ai_commit_generation(&mut self) {
+        if self.ai_commit_generation_active() {
+            return;
+        }
+
         let git = Arc::clone(&self.git);
         let tx = self.ai_commit_tx.clone();
         let cmd = self.config.user_config.git.commit.generate_command.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        self.ai_commit_generation = self.ai_commit_generation.wrapping_add(1);
+        let generation = self.ai_commit_generation;
+        self.ai_commit_job = Some(AiCommitJob {
+            generation,
+            cancel,
+            cancel_armed_at: None,
+        });
 
         std::thread::spawn(move || {
-            let result = crate::git::ai_commit::generate_commit_message(git.repo_path(), &cmd);
-            let _ = tx.send(result);
+            let result = crate::git::ai_commit::generate_commit_message_cancellable(
+                git.repo_path(),
+                &cmd,
+                worker_cancel,
+            );
+            let _ = tx.send(AiCommitResult { generation, result });
         });
     }
 
     fn begin_ai_commit_generation_ui(&mut self) {
-        self.popup = PopupState::Loading {
-            title: "AI Commit".to_string(),
-            message: "Generating commit message...".to_string(),
-        };
+        if self.ai_commit_generation_active() {
+            return;
+        }
         self.start_ai_commit_generation();
     }
 
     pub fn trigger_ai_commit_generation_from_editor(&mut self) {
         let generate_cmd = self.config.user_config.git.commit.generate_command.trim();
+        if self.ai_commit_generation_active() {
+            return;
+        }
         if generate_cmd.is_empty() {
             self.popup = PopupState::Message {
                 title: "AI generation unavailable".to_string(),
@@ -1031,6 +1113,34 @@ impl Gui {
         let stashed = std::mem::replace(&mut self.popup, PopupState::None);
         self.pending_commit_popup = Some(stashed);
         self.begin_ai_commit_generation_ui();
+    }
+
+    fn handle_ai_commit_cancel_key(&mut self, key: KeyEvent) -> bool {
+        if key.code != KeyCode::Esc {
+            return false;
+        }
+
+        let Some(job) = &mut self.ai_commit_job else {
+            return false;
+        };
+
+        let now = Instant::now();
+        let armed = job
+            .cancel_armed_at
+            .map(|armed_at| now.duration_since(armed_at) <= Duration::from_millis(900))
+            .unwrap_or(false);
+
+        if armed {
+            job.cancel.store(true, Ordering::Relaxed);
+            self.ai_commit_job = None;
+            if let Some(stashed) = self.pending_commit_popup.take() {
+                self.saved_commit_popup = Some(stashed);
+            }
+            true
+        } else {
+            job.cancel_armed_at = Some(now);
+            false
+        }
     }
 
     /// Request diff loading on a background thread if selection changed.
@@ -1481,6 +1591,10 @@ impl Gui {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if self.handle_ai_commit_cancel_key(key) {
+            return Ok(());
+        }
+
         // Popup takes priority
         if self.popup != PopupState::None {
             return self.handle_popup_key(key);

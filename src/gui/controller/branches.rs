@@ -530,10 +530,12 @@ fn fast_forward(gui: &mut Gui) -> Result<()> {
     let model = gui.model.lock().unwrap();
     if let Some(branch) = model.branches.get(selected) {
         if branch.upstream.is_some() {
-            let _name = branch.name.clone();
+            let name = branch.name.clone();
             drop(model);
-            gui.git.fetch("origin")?;
-            gui.needs_refresh = true;
+            gui.start_remote_op("Fetch", &format!("Fetching origin for {}...", name), |git| {
+                git.fetch("origin")?;
+                Ok(())
+            });
         }
     }
     Ok(())
@@ -550,8 +552,11 @@ fn set_upstream(gui: &mut Gui) -> Result<()> {
             title: "Set upstream".to_string(),
             message: format!("Set upstream of '{}' to origin/{}?", name, name),
             on_confirm: Box::new(move |gui| {
-                gui.git.push_with_upstream("origin", &name)?;
-                gui.needs_refresh = true;
+                let branch = name.clone();
+                gui.start_remote_op("Push", &format!("Pushing -u origin {}...", branch), move |git| {
+                    git.push_with_upstream("origin", &branch)?;
+                    Ok(())
+                });
                 Ok(())
             }),
         };
