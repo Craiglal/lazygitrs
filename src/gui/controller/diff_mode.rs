@@ -494,7 +494,12 @@ fn handle_diff_exploration_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
                 };
                 // Resolve the actual filename for multi-file diffs
                 let line_idx = if top_row >= pl.inner_y {
-                    gui.diff_view.scroll_offset + (top_row - pl.inner_y) as usize
+                    gui.diff_view
+                        .line_chunk_at_row(top_row, &pl)
+                        .map(|(line_idx, _)| line_idx)
+                        .unwrap_or_else(|| {
+                            gui.diff_view.scroll_offset + (top_row - pl.inner_y) as usize
+                        })
                 } else {
                     0
                 };
@@ -586,6 +591,10 @@ fn handle_diff_exploration_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
         }
         KeyCode::Char('{') => {
             gui.diff_view.prev_hunk();
+        }
+        KeyCode::Char('v') => {
+            gui.diff_view.toggle_view_layout();
+            gui.persist_diff_view_layout();
         }
         KeyCode::Char(']') => {
             use crate::pager::side_by_side::DiffSideView;
@@ -820,6 +829,10 @@ fn show_diff_mode_help(gui: &mut Gui) {
             HelpEntry {
                 key: "[/]".into(),
                 description: "Toggle old / new only view".into(),
+            },
+            HelpEntry {
+                key: "v".into(),
+                description: "Toggle unified / side-by-side view".into(),
             },
             HelpEntry {
                 key: "z".into(),

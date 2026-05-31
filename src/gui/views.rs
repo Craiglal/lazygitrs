@@ -15,7 +15,7 @@ use crate::git::GitCommands;
 use crate::model::Model;
 use crate::model::commit::{Commit, CommitStat};
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode};
-use crate::pager::side_by_side::{self, DiffPanel, DiffPanelLayout, DiffViewState};
+use crate::pager::side_by_side::{self, DiffPanel, DiffPanelLayout, DiffViewLayout, DiffViewState};
 
 use super::ScreenMode;
 use super::context::{ContextId, ContextManager, SideWindow};
@@ -1834,6 +1834,7 @@ fn render_status_bar(
             hints.push(("{/}", "prev/next hunk"));
         }
         hints.push(("[/]", "side view"));
+        hints.push(("v", "diff view"));
     } else {
         // Sidebar-focused: context-specific hints.
         match ctx_mgr.active() {
@@ -1965,7 +1966,10 @@ pub fn render_selection_overlay(
 
     // Compute the actual file line number at the top of the selection/click for editAtLine.
     let edit_line_number: Option<usize> = if top_row >= pl.inner_y {
-        let line_idx = diff_view.scroll_offset + (top_row - pl.inner_y) as usize;
+        let line_idx = diff_view
+            .line_chunk_at_row(top_row, &pl)
+            .map(|(line_idx, _)| line_idx)
+            .unwrap_or_else(|| diff_view.scroll_offset + (top_row - pl.inner_y) as usize);
         diff_view.file_line_number(line_idx, selection.panel)
     } else {
         None
@@ -2051,17 +2055,21 @@ pub fn render_selection_overlay(
         }
 
         // Map terminal row to diff line index.
-        let line_idx = diff_view.scroll_offset + (row - pl.inner_y) as usize;
+        let line_idx = diff_view
+            .line_chunk_at_row(row, &pl)
+            .map(|(line_idx, _)| line_idx)
+            .unwrap_or_else(|| diff_view.scroll_offset + (row - pl.inner_y) as usize);
         if let Some(diff_line) = diff_view.lines.get(line_idx) {
             // Skip file header separator lines.
             if diff_line.file_header.is_some() {
                 continue;
             }
             // Skip slash-fill rows (the empty side for Insert/Delete lines).
-            let is_slash_fill = match selection.panel {
-                DiffPanel::Old => diff_line.change_type == ChangeType::Insert,
-                DiffPanel::New => diff_line.change_type == ChangeType::Delete,
-            };
+            let is_slash_fill = diff_view.view_layout == DiffViewLayout::SideBySide
+                && match selection.panel {
+                    DiffPanel::Old => diff_line.change_type == ChangeType::Insert,
+                    DiffPanel::New => diff_line.change_type == ChangeType::Delete,
+                };
             if is_slash_fill {
                 continue;
             }

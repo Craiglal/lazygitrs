@@ -2,6 +2,14 @@ use anyhow::Result;
 
 use super::GitCommands;
 use crate::model::{Remote, RemoteBranch};
+use crate::os::cmd::{CmdBuilder, CmdResult};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GithubRemoteRepo {
+    remote_name: String,
+    repo: String,
+    owner: String,
+}
 
 impl GitCommands {
     pub fn load_remotes(&self) -> Result<Vec<Remote>> {
@@ -210,15 +218,81 @@ impl GitCommands {
 
     /// Get the PR URL for a branch using `gh pr view`.
     pub fn get_pr_url(&self, branch: &str) -> Result<String> {
-        let result = crate::os::cmd::CmdBuilder::new("gh")
+        if let Some(url) = self.gh_pr_view_url(branch, None)? {
+            return Ok(url);
+        }
+
+        let preferred_remote = self.branch_upstream_remote(branch);
+        let repos = order_github_remote_repos(
+            self.load_github_remote_repos()?,
+            preferred_remote.as_deref(),
+        );
+        let head_selectors = github_pr_head_selectors(branch, &repos);
+
+        for repo in &repos {
+            if let Some(url) = self.gh_pr_view_url(branch, Some(&repo.repo))? {
+                return Ok(url);
+            }
+
+            for head in &head_selectors {
+                if let Some(url) = self.gh_pr_list_url(&repo.repo, head)? {
+                    return Ok(url);
+                }
+            }
+        }
+
+        anyhow::bail!("No PR found for branch '{}'", branch)
+    }
+
+    fn gh_pr_view_url(&self, branch: &str, repo: Option<&str>) -> Result<Option<String>> {
+        let mut cmd = CmdBuilder::new("gh")
             .args(&["pr", "view", branch, "--json", "url", "-q", ".url"])
+            .cwd_path(self.repo_path());
+        if let Some(repo) = repo {
+            cmd = cmd.args(&["--repo", repo]);
+        }
+
+        Ok(gh_url_from_result(&cmd.run()?))
+    }
+
+    fn gh_pr_list_url(&self, repo: &str, head: &str) -> Result<Option<String>> {
+        let result = CmdBuilder::new("gh")
+            .args(&[
+                "pr", "list", "--repo", repo, "--head", head, "--json", "url", "--limit", "1",
+                "-q", ".[0].url",
+            ])
             .cwd_path(self.repo_path())
             .run()?;
-        if result.success && !result.stdout.trim().is_empty() {
-            Ok(result.stdout.trim().to_string())
-        } else {
-            anyhow::bail!("No PR found for branch '{}'", branch)
+
+        Ok(gh_url_from_result(&result))
+    }
+
+    fn load_github_remote_repos(&self) -> Result<Vec<GithubRemoteRepo>> {
+        let result = self.git().args(&["remote", "-v"]).run()?;
+        if !result.success {
+            return Ok(Vec::new());
         }
+
+        Ok(github_remote_repos_from_remote_v_output(&result.stdout))
+    }
+
+    fn branch_upstream_remote(&self, branch: &str) -> Option<String> {
+        let ref_name = format!("refs/heads/{}", branch);
+        let result = self
+            .git()
+            .args(&["for-each-ref", "--format=%(upstream:short)", &ref_name])
+            .run()
+            .ok()?;
+        if !result.success {
+            return None;
+        }
+
+        result
+            .stdout
+            .trim()
+            .split_once('/')
+            .map(|(remote, _)| remote.to_string())
+            .filter(|remote| !remote.is_empty())
     }
 }
 
@@ -283,4 +357,240 @@ fn remote_url_to_https(url: &str) -> String {
         u.truncate(u.len() - 4);
     }
     u.trim_end_matches('/').to_string()
+}
+
+fn gh_url_from_result(result: &CmdResult) -> Option<String> {
+    let url = result.stdout.trim();
+    if result.success && !url.is_empty() && url != "null" {
+        Some(url.to_string())
+    } else {
+        None
+    }
+}
+
+fn github_remote_repos_from_remote_v_output(output: &str) -> Vec<GithubRemoteRepo> {
+    let mut repos = Vec::new();
+
+    for line in output.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(remote_name) = parts.next() else {
+            continue;
+        };
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        let Some(repo) = github_repo_slug_from_remote_url(url) else {
+            continue;
+        };
+        let Some(owner) = repo.split('/').next().map(|owner| owner.to_string()) else {
+            continue;
+        };
+
+        if repos
+            .iter()
+            .any(|existing: &GithubRemoteRepo| existing.repo == repo)
+        {
+            continue;
+        }
+
+        repos.push(GithubRemoteRepo {
+            remote_name: remote_name.to_string(),
+            repo,
+            owner,
+        });
+    }
+
+    repos
+}
+
+fn github_repo_slug_from_remote_url(url: &str) -> Option<String> {
+    let path = github_path_from_remote_url(url)?;
+    let mut parts = path.trim_matches('/').split('/');
+    let owner = parts.next()?.trim();
+    let repo = parts.next()?.trim().trim_end_matches(".git");
+
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    Some(format!("{}/{}", owner, repo))
+}
+
+fn github_path_from_remote_url(url: &str) -> Option<&str> {
+    let url = url.trim().trim_end_matches('/');
+
+    if let Some(path) = url.strip_prefix("git@github.com:") {
+        return Some(path);
+    }
+
+    for scheme in ["https://", "http://", "ssh://"] {
+        let Some(rest) = url.strip_prefix(scheme) else {
+            continue;
+        };
+        let Some((authority, path)) = rest.split_once('/') else {
+            continue;
+        };
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        if host == "github.com" {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn order_github_remote_repos(
+    mut repos: Vec<GithubRemoteRepo>,
+    preferred_remote: Option<&str>,
+) -> Vec<GithubRemoteRepo> {
+    let mut ordered = Vec::new();
+
+    if let Some(preferred_remote) = preferred_remote {
+        move_repos_for_remote(&mut repos, &mut ordered, preferred_remote);
+    }
+    move_repos_for_remote(&mut repos, &mut ordered, "upstream");
+    move_repos_for_remote(&mut repos, &mut ordered, "origin");
+    ordered.extend(repos);
+
+    ordered
+}
+
+fn move_repos_for_remote(
+    repos: &mut Vec<GithubRemoteRepo>,
+    ordered: &mut Vec<GithubRemoteRepo>,
+    remote_name: &str,
+) {
+    let mut i = 0;
+    while i < repos.len() {
+        if repos[i].remote_name == remote_name {
+            ordered.push(repos.remove(i));
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn github_pr_head_selectors(branch: &str, repos: &[GithubRemoteRepo]) -> Vec<String> {
+    let mut selectors = Vec::from([branch.to_string()]);
+
+    for repo in repos {
+        let selector = format!("{}:{}", repo.owner, branch);
+        if !selectors.contains(&selector) {
+            selectors.push(selector);
+        }
+    }
+
+    selectors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_github_repo_slugs_from_common_remote_urls() {
+        assert_eq!(
+            github_repo_slug_from_remote_url("https://github.com/Blankeos/zed.git"),
+            Some("Blankeos/zed".to_string())
+        );
+        assert_eq!(
+            github_repo_slug_from_remote_url("git@github.com:zed-industries/zed.git"),
+            Some("zed-industries/zed".to_string())
+        );
+        assert_eq!(
+            github_repo_slug_from_remote_url("ssh://git@github.com/zed-industries/zed.git"),
+            Some("zed-industries/zed".to_string())
+        );
+        assert_eq!(
+            github_repo_slug_from_remote_url("https://token@github.com/owner/repo.git"),
+            Some("owner/repo".to_string())
+        );
+        assert_eq!(
+            github_repo_slug_from_remote_url("https://gitlab.com/owner/repo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn loads_unique_github_remote_repos_from_remote_v_output() {
+        let output = "\
+origin\thttps://github.com/Blankeos/zed.git (fetch)
+origin\thttps://github.com/Blankeos/zed.git (push)
+upstream\thttps://github.com/zed-industries/zed.git (fetch)
+upstream\thttps://github.com/zed-industries/zed.git (push)
+gitlab\thttps://gitlab.com/example/zed.git (fetch)
+";
+
+        let repos = github_remote_repos_from_remote_v_output(output);
+
+        assert_eq!(
+            repos,
+            vec![
+                GithubRemoteRepo {
+                    remote_name: "origin".to_string(),
+                    repo: "Blankeos/zed".to_string(),
+                    owner: "Blankeos".to_string(),
+                },
+                GithubRemoteRepo {
+                    remote_name: "upstream".to_string(),
+                    repo: "zed-industries/zed".to_string(),
+                    owner: "zed-industries".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn orders_repos_by_preferred_remote_then_common_fallbacks() {
+        let repos = vec![
+            GithubRemoteRepo {
+                remote_name: "origin".to_string(),
+                repo: "me/project".to_string(),
+                owner: "me".to_string(),
+            },
+            GithubRemoteRepo {
+                remote_name: "mirror".to_string(),
+                repo: "mirror/project".to_string(),
+                owner: "mirror".to_string(),
+            },
+            GithubRemoteRepo {
+                remote_name: "upstream".to_string(),
+                repo: "org/project".to_string(),
+                owner: "org".to_string(),
+            },
+        ];
+
+        let ordered = order_github_remote_repos(repos, Some("origin"));
+        let names: Vec<_> = ordered
+            .iter()
+            .map(|repo| repo.remote_name.as_str())
+            .collect();
+
+        assert_eq!(names, vec!["origin", "upstream", "mirror"]);
+    }
+
+    #[test]
+    fn builds_head_selectors_from_remote_owners() {
+        let repos = vec![
+            GithubRemoteRepo {
+                remote_name: "upstream".to_string(),
+                repo: "zed-industries/zed".to_string(),
+                owner: "zed-industries".to_string(),
+            },
+            GithubRemoteRepo {
+                remote_name: "origin".to_string(),
+                repo: "Blankeos/zed".to_string(),
+                owner: "Blankeos".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            github_pr_head_selectors("feature/foo", &repos),
+            vec![
+                "feature/foo".to_string(),
+                "zed-industries:feature/foo".to_string(),
+                "Blankeos:feature/foo".to_string(),
+            ]
+        );
+    }
 }

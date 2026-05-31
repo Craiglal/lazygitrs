@@ -26,7 +26,9 @@ use crate::git::{DEFAULT_COMMIT_LIMIT, GitCommands, MODEL_PART_COUNT, ModelPart}
 use crate::model::Model;
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode, build_file_tree};
 use crate::os::platform::Platform;
-use crate::pager::side_by_side::{DiffPanel, DiffPanelLayout, DiffViewState, TextSelection};
+use crate::pager::side_by_side::{
+    DiffPanel, DiffPanelLayout, DiffViewLayout, DiffViewState, TextSelection,
+};
 
 use self::context::{ContextId, ContextManager, SideWindow};
 use self::layout::LayoutState;
@@ -321,6 +323,12 @@ impl Gui {
             .show_command_log
             .unwrap_or(config.user_config.gui.show_command_log);
         let diff_line_wrap = config.app_state.diff_line_wrap.unwrap_or(false);
+        let diff_view_layout = config
+            .app_state
+            .diff_view
+            .as_deref()
+            .and_then(DiffViewLayout::from_state_value)
+            .unwrap_or_default();
         let show_commit_details = config.app_state.show_commit_details.unwrap_or(true);
         let command_log = crate::os::cmd::new_command_log();
         crate::os::cmd::set_thread_command_log(command_log.clone());
@@ -359,6 +367,7 @@ impl Gui {
             diff_view: {
                 let mut dv = DiffViewState::new();
                 dv.wrap = diff_line_wrap;
+                dv.view_layout = diff_view_layout;
                 dv
             },
             command_log,
@@ -2255,7 +2264,12 @@ impl Gui {
                     };
                     // Resolve the actual filename for multi-file diffs
                     let line_idx = if top_row >= pl.inner_y {
-                        self.diff_view.scroll_offset + (top_row - pl.inner_y) as usize
+                        self.diff_view
+                            .line_chunk_at_row(top_row, &pl)
+                            .map(|(line_idx, _)| line_idx)
+                            .unwrap_or_else(|| {
+                                self.diff_view.scroll_offset + (top_row - pl.inner_y) as usize
+                            })
                     } else {
                         0
                     };
@@ -2460,6 +2474,11 @@ impl Gui {
                 } else {
                     self.diff_view.prev_hunk();
                 }
+            }
+            // v toggles unified / side-by-side diff layout
+            KeyCode::Char('v') => {
+                self.diff_view.toggle_view_layout();
+                self.persist_diff_view_layout();
             }
             // [ and ] toggle old-only / new-only view
             KeyCode::Char(']') => {
@@ -4494,6 +4513,10 @@ impl Gui {
                 HelpEntry {
                     key: "]".into(),
                     description: "Toggle new-only view".into(),
+                },
+                HelpEntry {
+                    key: "v".into(),
+                    description: "Toggle unified / side-by-side view".into(),
                 },
                 HelpEntry {
                     key: "z".into(),
@@ -6690,6 +6713,13 @@ impl Gui {
     pub fn persist_diff_line_wrap(&self) {
         if let Ok(mut state) = AppState::load(&self.config.state_path) {
             state.diff_line_wrap = Some(self.diff_view.wrap);
+            let _ = state.save(&self.config.state_path);
+        }
+    }
+
+    pub fn persist_diff_view_layout(&self) {
+        if let Ok(mut state) = AppState::load(&self.config.state_path) {
+            state.diff_view = Some(self.diff_view.view_layout.as_state_value().to_string());
             let _ = state.save(&self.config.state_path);
         }
     }

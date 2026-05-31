@@ -234,9 +234,9 @@
 
 - [x] persist wrap in state.
 
-- [ ] While 'generating commit messages' or 'pushing' the UI is blocked. Let's not block it. Let us move around a bit. The question is.. where to put this indicator.
+- [x] While 'generating commit messages' or 'pushing' the UI is blocked. Let's not block it. Let us move around a bit. The question is.. where to put this indicator.
 
-- [ ] Use 'check' and 'checkmark' for staged and unstaged (not like lazygit), more like zed.
+- [x] ~Use 'check' and 'checkmark' for staged and unstaged (not like lazygit), more like zed.~ (not planned)
 
 - [x] Allow me to scroll using mouse the 'Commit Messages' dialog.
 
@@ -244,6 +244,6 @@
 
 - [x] Performance optimizations for large repos, noticed, the performance sucked for Zed. Diff viewer was not the issue, i think it's just loading a lot in one go. Maybe paginate it.
 
-- [ ] Add a "unified diff" view and a "side-by-side (split) diff view". Currently we only have split diff view by default. Let's give it a hotkey
+- [x] Add a "unified diff" view and a "side-by-side (split) diff view". Currently we only have split diff view by default. Let's give it a hotkey
 
-- [ ] See the other "remotes" added in 'status'. So that when 'Copy PR URL' is used, it can copy the PR Url on the "upstream" if the PR is actually there. Just fallback. For instance, I made a PR on /Users/carlo/Desktop/Projects/zed, I tried 'copy pr url' or 'open pr url' and just get empty, but in fact, I do have a PR in https://github.com/zed-industries/zed/pull/58041. Idk if this needs some good proper configurators for `gh repo set-default` and stuff like that.
+- [x] See the other "remotes" added in 'status'. So that when 'Copy PR URL' is used, it can copy the PR Url on the "upstream" if the PR is actually there. Just fallback. For instance, I made a PR on /Users/carlo/Desktop/Projects/zed, I tried 'copy pr url' or 'open pr url' and just get empty, but in fact, I do have a PR in https://github.com/zed-industries/zed/pull/58041. Idk if this needs some good proper configurators for `gh repo set-default` and stuff like that.
