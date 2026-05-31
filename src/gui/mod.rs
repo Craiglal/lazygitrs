@@ -2263,15 +2263,18 @@ impl Gui {
                         1
                     };
                     // Resolve the actual filename for multi-file diffs
-                    let line_idx = if top_row >= pl.inner_y {
+                    let (line_idx, line_panel) = if top_row >= pl.inner_y {
                         self.diff_view
-                            .line_chunk_at_row(top_row, &pl)
-                            .map(|(line_idx, _)| line_idx)
+                            .line_chunk_panel_at_row(top_row, &pl, sel_ref.panel)
+                            .map(|(line_idx, _, panel)| (line_idx, panel))
                             .unwrap_or_else(|| {
-                                self.diff_view.scroll_offset + (top_row - pl.inner_y) as usize
+                                (
+                                    self.diff_view.scroll_offset + (top_row - pl.inner_y) as usize,
+                                    sel_ref.panel,
+                                )
                             })
                     } else {
-                        0
+                        (0, sel_ref.panel)
                     };
                     let filename = self.diff_view.file_at_line(line_idx).to_string();
                     self.diff_view.selection = None;
@@ -2279,7 +2282,9 @@ impl Gui {
                     if !filename.is_empty() && abs_path.exists() {
                         let abs_path = abs_path.to_string_lossy().to_string();
                         let os = &self.config.user_config.os;
-                        if let Some(ln) = line {
+                        if let Some(ln) =
+                            line.or_else(|| self.diff_view.file_line_number(line_idx, line_panel))
+                        {
                             let tpl = if !os.edit_at_line.is_empty() {
                                 &os.edit_at_line
                             } else {

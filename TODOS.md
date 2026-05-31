@@ -242,7 +242,8 @@
 
 - [x] During interactive rebase UI, merge conflicts, I see a good UI for continuing and stuff. But I think when I press continue and the next commit on the list has a conflict. It just shows me the error dialog that there's a new conflict but does not update the new interactive rebase UI with the new progress on the next commit.
 
-- [x] Performance optimizations for large repos, noticed, the performance sucked for Zed. Diff viewer was not the issue, i think it's just loading a lot in one go. Maybe paginate it.
+- [x] Performance optimizations for large repos, noticed, the performance sucked for Zed. Diff viewer was not the issue, i think it's just loading a lot in one go. Maybe paginate it. Partially fixed now, less laggy.
+  - [ ] But The issue now is that the graph is rendering too much because too many branches. but still usable, we just need to compact the graph or something
 
 - [x] Add a "unified diff" view and a "side-by-side (split) diff view". Currently we only have split diff view by default. Let's give it a hotkey
 

@@ -1966,11 +1966,16 @@ pub fn render_selection_overlay(
 
     // Compute the actual file line number at the top of the selection/click for editAtLine.
     let edit_line_number: Option<usize> = if top_row >= pl.inner_y {
-        let line_idx = diff_view
-            .line_chunk_at_row(top_row, &pl)
-            .map(|(line_idx, _)| line_idx)
-            .unwrap_or_else(|| diff_view.scroll_offset + (top_row - pl.inner_y) as usize);
-        diff_view.file_line_number(line_idx, selection.panel)
+        let (line_idx, panel) = diff_view
+            .line_chunk_panel_at_row(top_row, &pl, selection.panel)
+            .map(|(line_idx, _, panel)| (line_idx, panel))
+            .unwrap_or_else(|| {
+                (
+                    diff_view.scroll_offset + (top_row - pl.inner_y) as usize,
+                    selection.panel,
+                )
+            });
+        diff_view.file_line_number(line_idx, panel)
     } else {
         None
     };

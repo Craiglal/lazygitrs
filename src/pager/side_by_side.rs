@@ -954,6 +954,67 @@ impl DiffViewState {
         None
     }
 
+    /// Map a terminal row to a diff line and the side whose content is rendered
+    /// on that visual row. In unified mode, modified lines render old chunks
+    /// followed by new chunks, so the panel cannot be inferred from X alone.
+    pub fn line_chunk_panel_at_row(
+        &self,
+        row: u16,
+        layout: &DiffPanelLayout,
+        fallback_panel: DiffPanel,
+    ) -> Option<(usize, usize, DiffPanel)> {
+        let (line_idx, chunk_idx) = self.line_chunk_at_row(row, layout)?;
+        if self.view_layout != DiffViewLayout::Unified {
+            return Some((line_idx, chunk_idx, fallback_panel));
+        }
+
+        let content_width = layout
+            .new_content_end_x
+            .saturating_sub(layout.new_content_x) as usize;
+        let panel = self.unified_panel_for_chunk(line_idx, chunk_idx, content_width)?;
+        Some((line_idx, chunk_idx, panel))
+    }
+
+    fn unified_panel_for_chunk(
+        &self,
+        line_idx: usize,
+        chunk_idx: usize,
+        content_width: usize,
+    ) -> Option<DiffPanel> {
+        let diff_line = self.lines.get(line_idx)?;
+        match diff_line.change_type {
+            ChangeType::Equal => Some(DiffPanel::New),
+            ChangeType::Delete => {
+                if self.side_view == DiffSideView::NewOnly {
+                    None
+                } else {
+                    Some(DiffPanel::Old)
+                }
+            }
+            ChangeType::Insert => {
+                if self.side_view == DiffSideView::OldOnly {
+                    None
+                } else {
+                    Some(DiffPanel::New)
+                }
+            }
+            ChangeType::Modified => {
+                let old_rows = if self.side_view == DiffSideView::NewOnly {
+                    0
+                } else {
+                    unified_line_row_count(&diff_line.old_line, content_width, self)
+                };
+                if chunk_idx < old_rows {
+                    Some(DiffPanel::Old)
+                } else if self.side_view == DiffSideView::OldOnly {
+                    None
+                } else {
+                    Some(DiffPanel::New)
+                }
+            }
+        }
+    }
+
     /// Return true when the given line index is the first line of a diff hunk.
     pub fn is_hunk_start_line(&self, line_idx: usize) -> bool {
         self.hunk_starts.binary_search(&line_idx).is_ok()
@@ -2219,45 +2280,49 @@ fn unified_line_visual_height(
         return 1;
     }
 
-    let row_count = |line: &Option<(usize, String)>| {
-        if state.wrap {
-            line.as_ref()
-                .map(|(_, text)| wrap_row_count(text, content_width))
-                .unwrap_or(1)
-        } else {
-            1
-        }
-    };
-
     match diff_line.change_type {
-        ChangeType::Equal => row_count(&diff_line.new_line),
+        ChangeType::Equal => unified_line_row_count(&diff_line.new_line, content_width, state),
         ChangeType::Delete => {
             if state.side_view == DiffSideView::NewOnly {
                 0
             } else {
-                row_count(&diff_line.old_line)
+                unified_line_row_count(&diff_line.old_line, content_width, state)
             }
         }
         ChangeType::Insert => {
             if state.side_view == DiffSideView::OldOnly {
                 0
             } else {
-                row_count(&diff_line.new_line)
+                unified_line_row_count(&diff_line.new_line, content_width, state)
             }
         }
         ChangeType::Modified => {
             let old_rows = if state.side_view == DiffSideView::NewOnly {
                 0
             } else {
-                row_count(&diff_line.old_line)
+                unified_line_row_count(&diff_line.old_line, content_width, state)
             };
             let new_rows = if state.side_view == DiffSideView::OldOnly {
                 0
             } else {
-                row_count(&diff_line.new_line)
+                unified_line_row_count(&diff_line.new_line, content_width, state)
             };
             old_rows + new_rows
         }
+    }
+}
+
+fn unified_line_row_count(
+    line: &Option<(usize, String)>,
+    content_width: usize,
+    state: &DiffViewState,
+) -> usize {
+    if state.wrap {
+        line.as_ref()
+            .map(|(_, text)| wrap_row_count(text, content_width))
+            .unwrap_or(1)
+    } else {
+        1
     }
 }
 
@@ -2796,4 +2861,58 @@ fn build_hunk_line_offsets(
     }
 
     offsets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diff_line(change_type: ChangeType) -> DiffLine {
+        DiffLine {
+            old_line: None,
+            new_line: None,
+            change_type,
+            old_segments: None,
+            new_segments: None,
+            file_header: None,
+            section_index: 0,
+        }
+    }
+
+    #[test]
+    fn unified_deleted_row_maps_to_old_panel() {
+        let mut state = DiffViewState::new();
+        state.view_layout = DiffViewLayout::Unified;
+        let mut line = diff_line(ChangeType::Delete);
+        line.old_line = Some((7, "removed".to_string()));
+        state.lines = vec![line];
+
+        let layout = DiffPanelLayout::compute(Rect::new(0, 0, 80, 6), &state);
+
+        assert_eq!(
+            state.line_chunk_panel_at_row(layout.inner_y, &layout, DiffPanel::New),
+            Some((0, 0, DiffPanel::Old))
+        );
+    }
+
+    #[test]
+    fn unified_modified_rows_map_old_then_new() {
+        let mut state = DiffViewState::new();
+        state.view_layout = DiffViewLayout::Unified;
+        let mut line = diff_line(ChangeType::Modified);
+        line.old_line = Some((7, "old".to_string()));
+        line.new_line = Some((8, "new".to_string()));
+        state.lines = vec![line];
+
+        let layout = DiffPanelLayout::compute(Rect::new(0, 0, 80, 6), &state);
+
+        assert_eq!(
+            state.line_chunk_panel_at_row(layout.inner_y, &layout, DiffPanel::New),
+            Some((0, 0, DiffPanel::Old))
+        );
+        assert_eq!(
+            state.line_chunk_panel_at_row(layout.inner_y + 1, &layout, DiffPanel::New),
+            Some((0, 1, DiffPanel::New))
+        );
+    }
 }
