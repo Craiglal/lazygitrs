@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.21] - 2026-05-31
+
+### Bug Fixes
+
+- Fix unified diff line-to-side mapping for edit actions by @Blankeos
+- Guard command log layout against tiny terminal panels. by @Blankeos
+- Treat conflict pauses as success and keep progress view in sync. by @Blankeos
+- Make mouse scroll work during description focus in commit message modal. by @Blankeos
+
+### Features
+
+- Add toggleable unified diff mode and improve PR URL fallback resolution by @Blankeos
+- Paginate commit history loading for large repos. by @Blankeos
+- Add cancellable AI commit generation and async remote ops by @Blankeos
+- Resize side/diff panel width (#18) by @fcmiranda in [#18](https://github.com/Blankeos/lazygitrs/pull/18)
+- Add cherry-pick functionality with keybindings and handling options by @fcmiranda
+
+### Refactor
+
+- Rustfmt, and always rustfmt (big diff, warning!). by @Blankeos
+
 ## [0.0.20] - 2026-05-16
 
 ### Bug Fixes
