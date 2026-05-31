@@ -93,12 +93,7 @@ impl RebaseModeState {
     /// Enter interactive rebase mode (Planning phase).
     /// `commits` should be in newest-first order (as displayed in the commits panel).
     /// The base commit is the "onto" target (not included in the todo list).
-    pub fn enter(
-        &mut self,
-        branch_name: String,
-        base_commit: &Commit,
-        commits: &[Commit],
-    ) {
+    pub fn enter(&mut self, branch_name: String, base_commit: &Commit, commits: &[Commit]) {
         self.active = true;
         self.phase = RebasePhase::Planning;
         self.branch_name = branch_name;
@@ -170,7 +165,9 @@ impl RebaseModeState {
         entries.reverse();
 
         // Select the current (paused) entry
-        let current_idx = entries.iter().position(|e| e.status == EntryStatus::Current);
+        let current_idx = entries
+            .iter()
+            .position(|e| e.status == EntryStatus::Current);
         self.selected = current_idx.unwrap_or(0);
 
         self.entries = entries;
@@ -264,7 +261,11 @@ impl RebaseModeState {
         // Treat the row below the selected entry as also-needed-visible when
         // selected is the last entry, so the base commit doesn't get clipped.
         let on_last = !self.entries.is_empty() && self.selected + 1 == self.entries.len();
-        let bottom_target = if on_last { self.selected + 1 } else { self.selected };
+        let bottom_target = if on_last {
+            self.selected + 1
+        } else {
+            self.selected
+        };
         if self.selected < self.scroll {
             self.scroll = self.selected;
         } else if bottom_target >= self.scroll + visible_height {

@@ -5,7 +5,6 @@
 /// lines renders correctly. This lets a continuing pipe coexist with a merge
 /// connector in the same cell (`up+down+right` → `│─`) without breaking the
 /// vertical line.
-
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
@@ -38,7 +37,11 @@ pub struct Cell {
 
 impl Cell {
     fn is_empty(&self) -> bool {
-        !self.up && !self.down && !self.left && !self.right && self.cell_type == CellType::Connection
+        !self.up
+            && !self.down
+            && !self.left
+            && !self.right
+            && self.cell_type == CellType::Connection
     }
 }
 
@@ -67,22 +70,19 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
     let mut rows = Vec::with_capacity(commits.len());
 
     for (hash, parents) in commits {
-        let lanes_before: Vec<Option<String>> =
-            lanes.iter().map(|l| l.target.clone()).collect();
+        let lanes_before: Vec<Option<String>> = lanes.iter().map(|l| l.target.clone()).collect();
 
         // Pick the column this commit lives in: an existing lane waiting for it,
         // else the first empty slot, else a fresh lane on the right.
-        let commit_col = if let Some(col) = lanes
-            .iter()
-            .position(|l| l.target.as_deref() == Some(hash))
-        {
-            col
-        } else if let Some(empty) = lanes.iter().position(|l| l.target.is_none()) {
-            empty
-        } else {
-            lanes.push(LaneInfo::default());
-            lanes.len() - 1
-        };
+        let commit_col =
+            if let Some(col) = lanes.iter().position(|l| l.target.as_deref() == Some(hash)) {
+                col
+            } else if let Some(empty) = lanes.iter().position(|l| l.target.is_none()) {
+                empty
+            } else {
+                lanes.push(LaneInfo::default());
+                lanes.len() - 1
+            };
 
         // All lanes that were tracking this commit terminate here. Collect any
         // deferred-merge cols they were holding so we can draw those connectors
@@ -114,7 +114,11 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
         // Additional parents: if a lane is already tracking the parent, defer
         // the horizontal connector to that lane's eventual termination row.
         // Otherwise allocate a new lane and draw the connector at THIS row.
-        let merge_parents: &[String] = if parents.len() > 1 { &parents[1..] } else { &[] };
+        let merge_parents: &[String] = if parents.len() > 1 {
+            &parents[1..]
+        } else {
+            &[]
+        };
         let mut new_merge_cols: Vec<usize> = Vec::new();
         for mp in merge_parents {
             if let Some(existing) = lanes
@@ -146,7 +150,11 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
         let is_merge = !merge_parents.is_empty();
 
         // Commit cell.
-        cells[commit_col].cell_type = if is_merge { CellType::Merge } else { CellType::Commit };
+        cells[commit_col].cell_type = if is_merge {
+            CellType::Merge
+        } else {
+            CellType::Commit
+        };
         cells[commit_col].up = closing.contains(&commit_col);
         cells[commit_col].down = first_parent.is_some();
         cells[commit_col].style_col = commit_col;
@@ -157,10 +165,7 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
                 continue;
             }
             let was = lanes_before.get(i).and_then(|o| o.as_ref()).is_some();
-            let now = lanes
-                .get(i)
-                .and_then(|l| l.target.as_ref())
-                .is_some();
+            let now = lanes.get(i).and_then(|l| l.target.as_ref()).is_some();
             let is_new_merge_lane = !was && now && new_merge_cols.contains(&i);
 
             if was && now {
@@ -207,10 +212,9 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
 
         rows.push(GraphRow { commit_col, cells });
 
-        while lanes
-            .last()
-            .map_or(false, |l| l.target.is_none() && l.deferred_merges.is_empty())
-        {
+        while lanes.last().map_or(false, |l| {
+            l.target.is_none() && l.deferred_merges.is_empty()
+        }) {
             lanes.pop();
         }
     }
@@ -273,7 +277,12 @@ fn box_drawing(up: bool, down: bool, left: bool, right: bool) -> (&'static str, 
 /// (first glyph + right extension).
 ///
 /// `is_head` swaps the commit glyph to a filled circle for HEAD.
-pub fn render_graph_spans(row: &GraphRow, max_width: usize, is_head: bool, theme: &Theme) -> Vec<Span<'static>> {
+pub fn render_graph_spans(
+    row: &GraphRow,
+    max_width: usize,
+    is_head: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(row.cells.len() * 2 + 1);
 
     for cell in &row.cells {
@@ -292,9 +301,7 @@ pub fn render_graph_spans(row: &GraphRow, max_width: usize, is_head: bool, theme
         };
 
         let first_style = Style::default().fg(col_color(cell.style_col, theme));
-        let right_color = cell
-            .right_style_col
-            .unwrap_or(cell.style_col);
+        let right_color = cell.right_style_col.unwrap_or(cell.style_col);
         let second_style = if second == " " {
             Style::default()
         } else {
@@ -355,12 +362,12 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "◯",     // 6975eec: main lane only
-                "│ ⏣",   // 0d129e4: main pipe continues, merge symbol on feature lane
-                "◯─│",   // 1b91554: merge stroke drawn HERE (parent's row), into col 1
-                "│ ⏣",   // 9902457: main pipe continues, merge symbol on feature lane
-                "◯─│",   // f6ecf6f: merge stroke drawn HERE, into col 1
-                "│ ◯",   // 22d0113: feature tip
+                "◯",   // 6975eec: main lane only
+                "│ ⏣", // 0d129e4: main pipe continues, merge symbol on feature lane
+                "◯─│", // 1b91554: merge stroke drawn HERE (parent's row), into col 1
+                "│ ⏣", // 9902457: main pipe continues, merge symbol on feature lane
+                "◯─│", // f6ecf6f: merge stroke drawn HERE, into col 1
+                "│ ◯", // 22d0113: feature tip
             ]
         );
     }

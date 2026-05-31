@@ -71,7 +71,11 @@ impl WrapLayout {
         for (p_idx, para) in paragraphs.iter().enumerate() {
             let chars: Vec<char> = para.chars().collect();
             if chars.is_empty() {
-                lines.push(WrapLine { text: String::new(), raw_start: para_start, char_len: 0 });
+                lines.push(WrapLine {
+                    text: String::new(),
+                    raw_start: para_start,
+                    char_len: 0,
+                });
             } else if wrap_width == 0 {
                 lines.push(WrapLine {
                     text: para.to_string(),
@@ -115,7 +119,11 @@ impl WrapLayout {
             }
         }
         if lines.is_empty() {
-            lines.push(WrapLine { text: String::new(), raw_start: 0, char_len: 0 });
+            lines.push(WrapLine {
+                text: String::new(),
+                raw_start: 0,
+                char_len: 0,
+            });
         }
         WrapLayout { lines }
     }
@@ -138,7 +146,10 @@ impl WrapLayout {
         }
         let last = self.lines.len() - 1;
         let line = &self.lines[last];
-        (last, cursor.saturating_sub(line.raw_start).min(line.char_len))
+        (
+            last,
+            cursor.saturating_sub(line.raw_start).min(line.char_len),
+        )
     }
 
     fn visual_to_cursor(&self, row: usize, col: usize) -> usize {
@@ -151,7 +162,11 @@ impl WrapLayout {
     }
 
     pub fn as_textarea_text(&self) -> String {
-        self.lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join("\n")
+        self.lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     pub fn line_count(&self) -> usize {
@@ -217,7 +232,12 @@ impl BodySoftWrap {
         if self.cursor == 0 {
             return;
         }
-        let prev = self.raw.char_indices().nth(self.cursor - 1).map(|(b, _)| b).unwrap();
+        let prev = self
+            .raw
+            .char_indices()
+            .nth(self.cursor - 1)
+            .map(|(b, _)| b)
+            .unwrap();
         self.raw.remove(prev);
         self.cursor -= 1;
     }
@@ -422,7 +442,6 @@ pub enum MenuAsyncResult {
     OpenUrl(String),
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
     Error,
@@ -521,10 +540,7 @@ pub struct ChecklistItem {
 
 impl PartialEq for PopupState {
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (PopupState::None, PopupState::None)
-        )
+        matches!((self, other), (PopupState::None, PopupState::None))
     }
 }
 
@@ -554,7 +570,11 @@ pub fn make_help_search_textarea() -> TextArea<'static> {
 
     let mut ta = make_textarea("Type to filter...");
     ta.set_style(Style::default().fg(Color::Yellow));
-    ta.set_cursor_style(Style::default().fg(Color::Yellow).add_modifier(ratatui::style::Modifier::REVERSED));
+    ta.set_cursor_style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(ratatui::style::Modifier::REVERSED),
+    );
     ta
 }
 

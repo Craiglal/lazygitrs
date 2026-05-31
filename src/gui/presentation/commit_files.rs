@@ -59,10 +59,7 @@ pub fn render_commit_file_tree<'a>(
                 let dir_style = Style::default().fg(theme.text_dimmed);
 
                 let line = if is_root {
-                    Line::from(Span::styled(
-                        format!("{} /", icon.trim_end()),
-                        dir_style,
-                    ))
+                    Line::from(Span::styled(format!("{} /", icon.trim_end()), dir_style))
                 } else {
                     Line::from(vec![
                         Span::styled(format!("{}{}", indent, icon), dir_style),

@@ -160,8 +160,7 @@ fn build_visual_block_patch(
             continue;
         }
         if line.starts_with('-') {
-            let in_range =
-                want_old.is_some_and(|(lo, hi)| old_counter >= lo && old_counter <= hi);
+            let in_range = want_old.is_some_and(|(lo, hi)| old_counter >= lo && old_counter <= hi);
             if in_range {
                 if anchor_old.is_none() {
                     anchor_old = Some(old_counter);
@@ -177,8 +176,7 @@ fn build_visual_block_patch(
             }
             old_counter += 1;
         } else if line.starts_with('+') {
-            let in_range =
-                want_new.is_some_and(|(lo, hi)| new_counter >= lo && new_counter <= hi);
+            let in_range = want_new.is_some_and(|(lo, hi)| new_counter >= lo && new_counter <= hi);
             if in_range {
                 if anchor_old.is_none() {
                     anchor_old = Some(old_counter);
@@ -228,10 +226,7 @@ fn parse_hunk_header(header: &str) -> (usize, usize, usize, usize) {
     let parse_range = |s: &str| -> (usize, usize) {
         let s = s.trim_start_matches(['-', '+']);
         if let Some((start, count)) = s.split_once(',') {
-            (
-                start.parse().unwrap_or(1),
-                count.parse().unwrap_or(1),
-            )
+            (start.parse().unwrap_or(1), count.parse().unwrap_or(1))
         } else {
             (s.parse().unwrap_or(1), 1)
         }

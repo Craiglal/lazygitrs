@@ -53,11 +53,7 @@ impl RebaseAction {
 impl GitCommands {
     /// Interactive rebase: apply a single action to a specific commit.
     /// Uses GIT_SEQUENCE_EDITOR to non-interactively modify the todo list.
-    pub fn rebase_interactive_action(
-        &self,
-        commit_hash: &str,
-        action: RebaseAction,
-    ) -> Result<()> {
+    pub fn rebase_interactive_action(&self, commit_hash: &str, action: RebaseAction) -> Result<()> {
         // Find the parent of the target commit for the rebase base
         let parent = self.commit_parent(commit_hash)?;
 
@@ -168,10 +164,7 @@ impl GitCommands {
 
     /// Skip during a rebase (when there's a conflict).
     pub fn rebase_skip(&self) -> Result<()> {
-        let result = self
-            .git()
-            .args(&["rebase", "--skip"])
-            .run()?;
+        let result = self.git().args(&["rebase", "--skip"]).run()?;
         self.handle_rebase_step_result("--skip", result)
     }
 
@@ -200,7 +193,8 @@ impl GitCommands {
             todo_content.replace('\'', "'\\''")
         );
 
-        let result = self.git()
+        let result = self
+            .git()
             .args(&["rebase", "-i", "--autostash", base_hash])
             .env("GIT_SEQUENCE_EDITOR", &editor_script)
             // Prevent git from opening an interactive editor for reword/edit
@@ -262,7 +256,12 @@ impl GitCommands {
         // Read head-name (branch being rebased)
         let head_name = std::fs::read_to_string(rebase_dir.join("head-name"))
             .ok()
-            .map(|s| s.trim().strip_prefix("refs/heads/").unwrap_or(s.trim()).to_string())
+            .map(|s| {
+                s.trim()
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(s.trim())
+                    .to_string()
+            })
             .unwrap_or_default();
 
         // Read onto hash
@@ -314,15 +313,15 @@ impl GitCommands {
     pub fn hydrate_progress(&self, progress: &mut RebaseProgress) {
         let need_onto = (progress.onto_message.is_empty() || progress.onto_author_name.is_empty())
             && !progress.onto_hash.is_empty();
-        if progress.done_entries.is_empty()
-            && progress.todo_entries.is_empty()
-            && !need_onto
-        {
+        if progress.done_entries.is_empty() && progress.todo_entries.is_empty() && !need_onto {
             return;
         }
 
         let mut cmd = self.git();
-        cmd = cmd.arg("log").arg("--no-walk").arg("--format=%H|%s|%an|%at");
+        cmd = cmd
+            .arg("log")
+            .arg("--no-walk")
+            .arg("--format=%H|%s|%an|%at");
         for e in &progress.done_entries {
             cmd = cmd.arg(&e.hash);
         }
@@ -350,15 +349,17 @@ impl GitCommands {
             }
         }
 
-        let apply = |entry: &mut TodoEntry, info: &std::collections::HashMap<String, (String, String, i64)>| {
-            if let Some((subject, author, ts)) = info.get(&entry.hash) {
-                if !subject.is_empty() {
-                    entry.message = subject.clone();
+        let apply =
+            |entry: &mut TodoEntry,
+             info: &std::collections::HashMap<String, (String, String, i64)>| {
+                if let Some((subject, author, ts)) = info.get(&entry.hash) {
+                    if !subject.is_empty() {
+                        entry.message = subject.clone();
+                    }
+                    entry.author_name = author.clone();
+                    entry.unix_timestamp = *ts;
                 }
-                entry.author_name = author.clone();
-                entry.unix_timestamp = *ts;
-            }
-        };
+            };
         for e in progress.done_entries.iter_mut() {
             apply(e, &info);
         }

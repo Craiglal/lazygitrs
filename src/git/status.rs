@@ -18,7 +18,9 @@ pub struct RepoStatus {
 
 impl GitCommands {
     pub fn repo_status(&self) -> Result<RepoStatus> {
-        let branch = self.current_branch_name().unwrap_or_else(|_| "HEAD".to_string());
+        let branch = self
+            .current_branch_name()
+            .unwrap_or_else(|_| "HEAD".to_string());
 
         let (ahead, behind) = self.ahead_behind().unwrap_or((0, 0));
 

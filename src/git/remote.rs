@@ -237,7 +237,9 @@ impl GitCommands {
             .args(&["shortlog", "-sn", "-e", "HEAD", &max_arg])
             .env("GIT_PAGER", "cat")
             .run();
-        let Ok(result) = result else { return Vec::new() };
+        let Ok(result) = result else {
+            return Vec::new();
+        };
         if !result.success {
             return Vec::new();
         }

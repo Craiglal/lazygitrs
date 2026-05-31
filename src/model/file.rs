@@ -49,7 +49,6 @@ impl File {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Untracked,

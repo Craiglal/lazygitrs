@@ -828,11 +828,7 @@ impl DiffViewState {
     /// Map a terminal row within the diff panel inner area to `(line_idx, chunk_idx)`.
     /// `chunk_idx` is the wrapped-chunk position within the line (0 = first visual
     /// row). Always 0 when wrapping is off.
-    pub fn line_chunk_at_row(
-        &self,
-        row: u16,
-        layout: &DiffPanelLayout,
-    ) -> Option<(usize, usize)> {
+    pub fn line_chunk_at_row(&self, row: u16, layout: &DiffPanelLayout) -> Option<(usize, usize)> {
         if row < layout.inner_y || row >= layout.inner_end_y {
             return None;
         }
@@ -1382,9 +1378,8 @@ pub fn render_diff(
                     }
 
                     // Divider or revert marker (first visual row of a hunk only).
-                    let show_marker = show_revert_markers
-                        && chunk_idx == 0
-                        && state.is_hunk_start_line(line_idx);
+                    let show_marker =
+                        show_revert_markers && chunk_idx == 0 && state.is_hunk_start_line(line_idx);
                     let marker_hunk_idx = if show_marker {
                         state.hunk_index_for_start_line(line_idx)
                     } else {
@@ -1766,7 +1761,11 @@ fn wrap_row_count(text: &str, width: usize) -> usize {
 
 /// Visual height (in panel rows) of a diff line, matching the renderer's
 /// `num_rows` calculation in side-by-side wrap mode.
-fn line_visual_height(diff_line: &DiffLine, panel_width: usize, right_content_width: usize) -> usize {
+fn line_visual_height(
+    diff_line: &DiffLine,
+    panel_width: usize,
+    right_content_width: usize,
+) -> usize {
     if diff_line.file_header.is_some() {
         return 1;
     }

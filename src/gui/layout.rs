@@ -85,10 +85,7 @@ pub fn compute_layout_with_details(
         if sidebar_focused_full && show_details && main_area.width >= 20 && main_area.height >= 10 {
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(7),
-                    Constraint::Min(1),
-                ])
+                .constraints([Constraint::Length(7), Constraint::Min(1)])
                 .split(main_area);
             return FrameLayout {
                 side_panels: Vec::new(),
@@ -150,10 +147,7 @@ pub fn compute_layout_with_details(
 
         let vertical = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(side_height),
-                Constraint::Min(1),
-            ])
+            .constraints([Constraint::Length(side_height), Constraint::Min(1)])
             .split(main_area);
 
         let side_area = vertical[0];
@@ -162,7 +156,11 @@ pub fn compute_layout_with_details(
         // Side panels laid out vertically (same as landscape), active expands.
         // When Status (index 0) is focused it stays compact, so expand Files
         // (index 1) instead — otherwise the sidebar leaves a large empty gap.
-        let expand_index = if active_panel_index == 0 { 1 } else { active_panel_index };
+        let expand_index = if active_panel_index == 0 {
+            1
+        } else {
+            active_panel_index
+        };
         let collapsed: u16 = 1;
         let panel_constraints: Vec<Constraint> = (0..panel_count)
             .map(|i| {
@@ -228,10 +226,7 @@ pub fn compute_layout_with_details(
 
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(side_width),
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Length(side_width), Constraint::Min(0)])
         .split(main_area);
 
     let side_area = horizontal[0];
@@ -252,10 +247,7 @@ pub fn compute_layout_with_details(
             let details_height = DETAILS_TARGET_HEIGHT.min(available).max(MIN_DETAILS_HEIGHT);
             let parts = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(details_height),
-                    Constraint::Min(1),
-                ])
+                .constraints([Constraint::Length(details_height), Constraint::Min(1)])
                 .split(main_panel);
             Some((parts[0], parts[1]))
         } else {
@@ -287,7 +279,11 @@ pub fn compute_layout_with_details(
 /// The active panel expands; the status panel (index 0) is fixed height.
 fn split_side_panels(area: Rect, panel_count: usize, active_panel_index: usize) -> Vec<Rect> {
     let collapsed: u16 = if area.height < 21 { 1 } else { 3 };
-    let expand_index = if active_panel_index == 0 { 1 } else { active_panel_index };
+    let expand_index = if active_panel_index == 0 {
+        1
+    } else {
+        active_panel_index
+    };
     let constraints: Vec<Constraint> = (0..panel_count)
         .map(|i| {
             if i == 0 {

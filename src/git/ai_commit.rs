@@ -8,7 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 /// Generate a commit message by piping `git diff --cached` via stdin to the configured command.
 #[allow(dead_code)]
@@ -85,22 +85,18 @@ pub fn generate_commit_message_cancellable(
         thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = stdout_handle
-        .join()
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "stdout reader panicked",
-            ))
-        })?;
-    let stderr = stderr_handle
-        .join()
-        .unwrap_or_else(|_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "stderr reader panicked",
-            ))
-        })?;
+    let stdout = stdout_handle.join().unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "stdout reader panicked",
+        ))
+    })?;
+    let stderr = stderr_handle.join().unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "stderr reader panicked",
+        ))
+    })?;
 
     if !status.success() {
         bail!("Generate command failed: {}", stderr.trim());
@@ -178,7 +174,8 @@ mod tests {
 
     #[test]
     fn test_strip_single_backticks_first_line_only() {
-        let input = "`feat: something something`\n\nother content of the commit here stuff\nblah blah blah";
+        let input =
+            "`feat: something something`\n\nother content of the commit here stuff\nblah blah blah";
         assert_eq!(
             strip_markdown_fences(input),
             "feat: something something\n\nother content of the commit here stuff\nblah blah blah"
