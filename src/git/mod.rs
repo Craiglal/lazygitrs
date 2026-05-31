@@ -49,6 +49,12 @@ pub enum ModelPart {
     Contributors(Vec<(String, usize)>),
 }
 
+/// Number of commits to load in the normal commits panel.
+///
+/// This mirrors lazygit's first-load guardrail: large repositories can have
+/// tens of thousands of commits, but the sidebar only needs a recent window.
+pub const DEFAULT_COMMIT_LIMIT: usize = 300;
+
 /// Total number of `ModelPart` variants that `load_model_streaming` sends.
 pub const MODEL_PART_COUNT: usize = 13;
 
@@ -91,7 +97,7 @@ impl GitCommands {
         std::thread::scope(|s| {
             let h_files = s.spawn(|| self.load_files());
             let h_branches = s.spawn(|| self.load_branches());
-            let h_commits = s.spawn(|| self.load_commits(0));
+            let h_commits = s.spawn(|| self.load_commits(DEFAULT_COMMIT_LIMIT));
             let h_stash = s.spawn(|| self.load_stash());
             let h_remotes = s.spawn(|| self.load_remotes());
             let h_tags = s.spawn(|| self.load_tags());
@@ -154,7 +160,8 @@ impl GitCommands {
 
         spawn_part!(tx, self, Files, |g: &GitCommands| g.load_files());
         spawn_part!(tx, self, Branches, |g: &GitCommands| g.load_branches());
-        spawn_part!(tx, self, Commits, |g: &GitCommands| g.load_commits(0));
+        spawn_part!(tx, self, Commits, |g: &GitCommands| g
+            .load_commits(DEFAULT_COMMIT_LIMIT));
         spawn_part!(tx, self, Stash, |g: &GitCommands| g.load_stash());
         spawn_part!(tx, self, Remotes, |g: &GitCommands| g.load_remotes());
         spawn_part!(tx, self, Tags, |g: &GitCommands| g.load_tags());

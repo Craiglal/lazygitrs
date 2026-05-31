@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::config::keybindings::parse_key;
 use crate::config::{AppConfig, AppState};
-use crate::git::{GitCommands, MODEL_PART_COUNT, ModelPart};
+use crate::git::{DEFAULT_COMMIT_LIMIT, GitCommands, MODEL_PART_COUNT, ModelPart};
 use crate::model::Model;
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode, build_file_tree};
 use crate::os::platform::Platform;
@@ -104,6 +104,13 @@ struct AiCommitResult {
     result: Result<Option<String>>,
 }
 
+struct CommitPageResult {
+    generation: u64,
+    result: Result<Vec<crate::model::Commit>>,
+}
+
+const COMMIT_PAGE_PREFETCH_THRESHOLD: usize = 100;
+
 pub struct Gui {
     pub config: Arc<AppConfig>,
     pub git: Arc<GitCommands>,
@@ -149,6 +156,16 @@ pub struct Gui {
     ai_commit_rx: mpsc::Receiver<AiCommitResult>,
     /// Sender cloned into background threads for AI commit generation.
     ai_commit_tx: mpsc::Sender<AiCommitResult>,
+    /// Receiver for incremental commit pages loaded after the first capped page.
+    commit_page_rx: mpsc::Receiver<CommitPageResult>,
+    /// Sender cloned into background threads for incremental commit loading.
+    commit_page_tx: mpsc::Sender<CommitPageResult>,
+    /// True while a background commit page is in flight.
+    commit_page_loading: bool,
+    /// True when the last commit page was shorter than the requested page size.
+    commit_history_complete: bool,
+    /// Generation counter used to discard stale commit-page results after refresh.
+    commit_page_generation: u64,
     /// Active AI commit generation job, if one is running.
     ai_commit_job: Option<AiCommitJob>,
     /// Generation counter used to discard stale AI results after cancellation.
@@ -291,6 +308,7 @@ impl Gui {
     pub fn new(config: AppConfig, git: GitCommands) -> Result<Self> {
         let (diff_tx, diff_rx) = mpsc::channel();
         let (ai_commit_tx, ai_commit_rx) = mpsc::channel();
+        let (commit_page_tx, commit_page_rx) = mpsc::channel();
         let (remote_op_tx, remote_op_rx) = mpsc::channel();
         let (auto_fetch_tx, auto_fetch_rx) = mpsc::channel();
         let (menu_async_tx, menu_async_rx) = mpsc::channel();
@@ -366,6 +384,11 @@ impl Gui {
             diff_tx,
             ai_commit_rx,
             ai_commit_tx,
+            commit_page_rx,
+            commit_page_tx,
+            commit_page_loading: false,
+            commit_history_complete: false,
+            commit_page_generation: 0,
             ai_commit_job: None,
             ai_commit_generation: 0,
             remote_op_rx,
@@ -451,7 +474,10 @@ impl Gui {
                             got_files = true;
                         }
                         ModelPart::Branches(v) => model.branches = v,
-                        ModelPart::Commits(v) => model.commits = v,
+                        ModelPart::Commits(v) => {
+                            self.commit_history_complete = v.len() < DEFAULT_COMMIT_LIMIT;
+                            model.commits = v;
+                        }
                         ModelPart::Stash(v) => model.stash_entries = v,
                         ModelPart::Remotes(v) => model.remotes = v,
                         ModelPart::Tags(v) => model.tags = v,
@@ -517,6 +543,10 @@ impl Gui {
 
             // Check for AI commit message generation results
             self.receive_ai_commit_results();
+
+            // Check for completed incremental commit page loads
+            self.receive_commit_page_results();
+            self.maybe_request_more_commits();
 
             // Check for completed background remote operations
             self.receive_remote_op_results();
@@ -921,6 +951,89 @@ impl Gui {
                 }
             }
         }
+    }
+
+    fn receive_commit_page_results(&mut self) {
+        while let Ok(result) = self.commit_page_rx.try_recv() {
+            if result.generation != self.commit_page_generation {
+                continue;
+            }
+
+            self.commit_page_loading = false;
+            match result.result {
+                Ok(commits) => {
+                    let page_len = commits.len();
+                    let mut model = self.model.lock().unwrap();
+                    let mut seen: HashSet<String> =
+                        model.commits.iter().map(|c| c.hash.clone()).collect();
+                    model
+                        .commits
+                        .extend(commits.into_iter().filter(|c| seen.insert(c.hash.clone())));
+                    self.commit_history_complete = page_len < DEFAULT_COMMIT_LIMIT;
+                    self.context_mgr.clamp_selections(&model);
+                }
+                Err(e) => {
+                    self.commit_history_complete = true;
+                    if self.popup == PopupState::None {
+                        self.popup = PopupState::Message {
+                            title: "Commits".to_string(),
+                            message: format!("Could not load more commits: {}", e),
+                            kind: MessageKind::Error,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fn maybe_request_more_commits(&mut self) {
+        if self.context_mgr.active() != ContextId::Commits
+            || self.commit_page_loading
+            || self.commit_history_complete
+        {
+            return;
+        }
+
+        let len = {
+            let model = self.model.lock().unwrap();
+            model.commits.len()
+        };
+        if len < DEFAULT_COMMIT_LIMIT {
+            self.commit_history_complete = true;
+            return;
+        }
+
+        let selected = self.context_mgr.selected(ContextId::Commits);
+        let viewport_end = self
+            .context_mgr
+            .scroll_offset(ContextId::Commits)
+            .saturating_add(self.sidebar_visible_height());
+        let near_loaded_tail = selected.saturating_add(COMMIT_PAGE_PREFETCH_THRESHOLD) >= len
+            || viewport_end.saturating_add(COMMIT_PAGE_PREFETCH_THRESHOLD) >= len;
+        if !near_loaded_tail {
+            return;
+        }
+
+        self.commit_page_loading = true;
+        let generation = self.commit_page_generation;
+        let git = Arc::clone(&self.git);
+        let tx = self.commit_page_tx.clone();
+        let branches = self.commit_branch_filter.clone();
+
+        std::thread::spawn(move || {
+            let result = if branches.is_empty() {
+                git.load_commits_page(DEFAULT_COMMIT_LIMIT, len)
+            } else {
+                git.load_commits_for_branches_page(&branches, DEFAULT_COMMIT_LIMIT, len)
+            };
+            let _ = tx.send(CommitPageResult { generation, result });
+        });
+    }
+
+    fn reset_commit_pagination(&mut self) {
+        self.commit_page_generation = self.commit_page_generation.wrapping_add(1);
+        self.commit_page_loading = false;
+        self.commit_history_complete = false;
     }
 
     /// Kick off a silent background `git fetch --all` if auto-fetch is enabled
@@ -6390,6 +6503,7 @@ impl Gui {
     }
 
     fn refresh(&mut self) -> Result<()> {
+        self.reset_commit_pagination();
         let new_model = self.git.load_model()?;
         let mut model = self.model.lock().unwrap();
         model.replace_keeping_file_order(new_model);
@@ -6398,11 +6512,12 @@ impl Gui {
         if !self.commit_branch_filter.is_empty() {
             if let Ok(filtered) = self
                 .git
-                .load_commits_for_branches(&self.commit_branch_filter, 300)
+                .load_commits_for_branches(&self.commit_branch_filter, DEFAULT_COMMIT_LIMIT)
             {
                 model.commits = filtered;
             }
         }
+        self.commit_history_complete = model.commits.len() < DEFAULT_COMMIT_LIMIT;
 
         // Rebuild file tree inline to avoid borrow issues
         if self.show_file_tree {

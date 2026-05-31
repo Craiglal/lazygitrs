@@ -7,9 +7,14 @@ use crate::model::{
 };
 
 impl GitCommands {
-    /// Load commits from all branches (--all) so the graph shows the full topology.
+    /// Load recent commits reachable from the current HEAD.
     pub fn load_commits(&self, limit: usize) -> Result<Vec<Commit>> {
-        self.load_commits_inner(limit, true, None)
+        self.load_commits_page(limit, 0)
+    }
+
+    /// Load a page of commits reachable from the current HEAD.
+    pub fn load_commits_page(&self, limit: usize, skip: usize) -> Result<Vec<Commit>> {
+        self.load_commits_inner(limit, skip, false)
     }
 
     /// Load commits reachable from a specific branch only.
@@ -23,6 +28,16 @@ impl GitCommands {
         branches: &[String],
         limit: usize,
     ) -> Result<Vec<Commit>> {
+        self.load_commits_for_branches_page(branches, limit, 0)
+    }
+
+    /// Load a page of commits reachable from any of the given branches.
+    pub fn load_commits_for_branches_page(
+        &self,
+        branches: &[String],
+        limit: usize,
+        skip: usize,
+    ) -> Result<Vec<Commit>> {
         let format = "%H|%s|%an|%ae|%at|%P|%D";
         let mut cmd = self.git();
         cmd = cmd.arg("log");
@@ -31,6 +46,9 @@ impl GitCommands {
         }
         if limit > 0 {
             cmd = cmd.arg(&format!("--max-count={}", limit));
+        }
+        if skip > 0 {
+            cmd = cmd.arg(&format!("--skip={}", skip));
         }
         cmd = cmd
             .arg(&format!("--format={}", format))
@@ -89,12 +107,7 @@ impl GitCommands {
         Ok(commits)
     }
 
-    fn load_commits_inner(
-        &self,
-        limit: usize,
-        all: bool,
-        _branch: Option<&str>,
-    ) -> Result<Vec<Commit>> {
+    fn load_commits_inner(&self, limit: usize, skip: usize, all: bool) -> Result<Vec<Commit>> {
         let format = "%H|%s|%an|%ae|%at|%P|%D";
         let mut cmd = self.git();
         cmd = cmd.arg("log");
@@ -103,6 +116,9 @@ impl GitCommands {
         }
         if limit > 0 {
             cmd = cmd.arg(&format!("--max-count={}", limit));
+        }
+        if skip > 0 {
+            cmd = cmd.arg(&format!("--skip={}", skip));
         }
         cmd = cmd
             .arg(&format!("--format={}", format))
