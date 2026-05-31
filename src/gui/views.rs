@@ -715,11 +715,9 @@ fn render_command_log(
         return;
     }
 
-    let log_height = command_log.len().min(5) as u16;
-    let log_width = fl.main_panel.width.min(50);
-    let log_x = fl.main_panel.x + fl.main_panel.width - log_width;
-    let log_y = fl.main_panel.y + fl.main_panel.height - log_height - 1;
-    let log_rect = Rect::new(log_x, log_y, log_width, log_height + 2);
+    let Some((log_rect, log_height)) = command_log_geometry(fl.main_panel, command_log.len()) else {
+        return;
+    };
 
     let border_color = theme.cmd_log_border;
     let title_color = theme.cmd_log_title;
@@ -776,6 +774,48 @@ fn render_command_log(
     frame.render_widget(Clear, log_rect);
     let log_widget = Paragraph::new(log_lines).block(log_block);
     frame.render_widget(log_widget, log_rect);
+}
+
+fn command_log_geometry(main_panel: Rect, command_count: usize) -> Option<(Rect, u16)> {
+    if main_panel.width == 0 {
+        return None;
+    }
+
+    let log_height = command_count
+        .min(5)
+        .min(main_panel.height.saturating_sub(1) as usize) as u16;
+    if log_height == 0 {
+        return None;
+    }
+
+    let log_width = main_panel.width.min(50);
+    let log_x = main_panel
+        .x
+        .saturating_add(main_panel.width.saturating_sub(log_width));
+    let log_y = main_panel
+        .y
+        .saturating_add(main_panel.height - log_height - 1);
+    Some((Rect::new(log_x, log_y, log_width, log_height + 2), log_height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_log_geometry;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn command_log_is_hidden_when_main_panel_is_absent() {
+        assert_eq!(command_log_geometry(Rect::default(), 1), None);
+    }
+
+    #[test]
+    fn command_log_visible_lines_are_clamped_to_short_main_panel() {
+        let (rect, visible_lines) =
+            command_log_geometry(Rect::new(10, 4, 80, 2), 5).expect("log should fit");
+
+        assert_eq!(visible_lines, 1);
+        assert_eq!(rect, Rect::new(40, 4, 50, 3));
+    }
 }
 
 /// Build a window title like " 4 Commit Files (abc1234 feat: some change) ".
