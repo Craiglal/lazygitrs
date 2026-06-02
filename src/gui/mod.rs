@@ -947,16 +947,17 @@ impl Gui {
                     }
                 }
                 Err(e) => {
-                    // On failure, restore the stashed editor so user can type manually
                     if let Some(stashed) = self.pending_commit_popup.take() {
-                        self.popup = stashed;
-                    } else {
-                        self.popup = PopupState::Message {
-                            title: "AI generation failed".to_string(),
-                            message: format!("{}", e),
-                            kind: MessageKind::Error,
-                        };
+                        self.saved_commit_popup = Some(stashed);
                     }
+                    self.popup = PopupState::Message {
+                        title: "AI generation failed".to_string(),
+                        message: format!(
+                            "{}\n\nYour commit draft was saved. Open the commit prompt again to restore it.",
+                            e
+                        ),
+                        kind: MessageKind::Error,
+                    };
                 }
             }
         }
