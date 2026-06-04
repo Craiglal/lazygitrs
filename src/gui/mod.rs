@@ -1974,6 +1974,18 @@ impl Gui {
             return Ok(());
         }
 
+        // [ and ] cycle root tabs within the current side window.
+        if key.code == KeyCode::Char('[') {
+            self.exit_sub_contexts();
+            self.context_mgr.prev_tab();
+            return Ok(());
+        }
+        if key.code == KeyCode::Char(']') {
+            self.exit_sub_contexts();
+            self.context_mgr.next_tab();
+            return Ok(());
+        }
+
         // Navigation within current panel
         if matches_key(key, &keybindings.universal.prev_item)
             || matches_key(key, &keybindings.universal.prev_item_alt)

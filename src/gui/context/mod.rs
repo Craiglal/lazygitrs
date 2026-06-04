@@ -278,8 +278,7 @@ impl ContextManager {
         }
         let current_idx = self.window_tabs.get(&window).copied().unwrap_or(0);
         let next_idx = (current_idx + 1) % tabs.len();
-        self.window_tabs.insert(window, next_idx);
-        self.active = tabs[next_idx];
+        self.set_active(tabs[next_idx]);
     }
 
     /// Cycle to previous tab within the current window.
@@ -291,8 +290,7 @@ impl ContextManager {
         }
         let current_idx = self.window_tabs.get(&window).copied().unwrap_or(0);
         let prev_idx = (current_idx + tabs.len() - 1) % tabs.len();
-        self.window_tabs.insert(window, prev_idx);
-        self.active = tabs[prev_idx];
+        self.set_active(tabs[prev_idx]);
     }
 
     pub fn selected(&self, ctx: ContextId) -> usize {
@@ -386,5 +384,44 @@ impl ContextManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ContextId, ContextManager, SideWindow};
+
+    #[test]
+    fn next_and_prev_tab_cycle_within_active_window() {
+        let mut mgr = ContextManager::new();
+        assert_eq!(mgr.active(), ContextId::Files);
+
+        mgr.next_tab();
+        assert_eq!(mgr.active(), ContextId::Worktrees);
+        assert_eq!(
+            mgr.last_context_for_window(SideWindow::Files),
+            ContextId::Worktrees
+        );
+
+        mgr.next_tab();
+        assert_eq!(mgr.active(), ContextId::Submodules);
+        assert_eq!(
+            mgr.last_context_for_window(SideWindow::Files),
+            ContextId::Submodules
+        );
+
+        mgr.next_tab();
+        assert_eq!(mgr.active(), ContextId::Files);
+        assert_eq!(
+            mgr.last_context_for_window(SideWindow::Files),
+            ContextId::Files
+        );
+
+        mgr.prev_tab();
+        assert_eq!(mgr.active(), ContextId::Submodules);
+        assert_eq!(
+            mgr.last_context_for_window(SideWindow::Files),
+            ContextId::Submodules
+        );
     }
 }
