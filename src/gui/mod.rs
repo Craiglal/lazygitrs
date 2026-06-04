@@ -9,6 +9,7 @@ pub mod views;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -124,6 +125,7 @@ pub struct Gui {
     pub command_log: crate::os::cmd::CommandLog,
     pub show_command_log: bool,
     pub should_quit: bool,
+    pub pending_repo_open: Option<PathBuf>,
     pub needs_refresh: bool,
     pub needs_files_refresh: bool,
     pub needs_diff_refresh: bool,
@@ -373,6 +375,7 @@ impl Gui {
             command_log,
             show_command_log: show_command_log_default,
             should_quit: false,
+            pending_repo_open: None,
             needs_refresh: false,
             needs_files_refresh: false,
             needs_diff_refresh: true,
@@ -453,6 +456,15 @@ impl Gui {
             .get(self.current_theme_index)
             .map(|ct| ct.to_theme())
             .unwrap_or_default()
+    }
+
+    pub fn request_repo_open(&mut self, path: impl Into<PathBuf>) {
+        self.pending_repo_open = Some(path.into());
+        self.should_quit = true;
+    }
+
+    pub fn take_pending_repo_open(&mut self) -> Option<PathBuf> {
+        self.pending_repo_open.take()
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -797,6 +809,10 @@ impl Gui {
                 }
             }
 
+            if self.should_quit {
+                break;
+            }
+
             // Background auto-refresh on refresher.refreshInterval (0 = disabled).
             let refresh_interval = self.config.user_config.refresher.refresh_interval;
             if self.config.user_config.git.auto_refresh
@@ -817,10 +833,6 @@ impl Gui {
                 self.refresh_files_only()?;
                 self.needs_files_refresh = false;
                 self.needs_diff_refresh = true;
-            }
-
-            if self.should_quit {
-                break;
             }
         }
 
