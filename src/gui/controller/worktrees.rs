@@ -5,6 +5,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::KeybindingConfig;
 use crate::gui::Gui;
+use crate::gui::controller::input_normalization::replace_spaces_with_dashes;
 use crate::gui::popup::{
     ListPickerCore, ListPickerItem, MenuItem, PopupState, make_help_search_textarea, make_textarea,
 };
@@ -64,7 +65,7 @@ fn prompt_worktree_path(gui: &mut Gui) {
         title: "New worktree path".to_string(),
         textarea: make_textarea("Path"),
         on_confirm: Box::new(|gui, input| {
-            let path = input.trim().to_string();
+            let path = replace_spaces_with_dashes(input);
             if path.is_empty() {
                 prompt_worktree_path(gui);
                 return Ok(());
@@ -145,7 +146,7 @@ fn prompt_worktree_branch(gui: &mut Gui, path: String) {
         title: "New worktree branch".to_string(),
         textarea,
         on_confirm: Box::new(move |gui, input| {
-            let branch = input.trim().to_string();
+            let branch = replace_spaces_with_dashes(input);
             if branch.is_empty() {
                 prompt_worktree_branch(gui, path);
                 return Ok(());
