@@ -521,6 +521,8 @@ pub enum PopupState {
     RefPicker {
         title: String,
         core: ListPickerCore,
+        /// When true, typed search text can be confirmed as an arbitrary ref.
+        allow_freeform: bool,
         on_confirm: ListPickerAction,
     },
     /// Color theme picker with live preview and search.

@@ -122,6 +122,7 @@ fn prompt_worktree_existing_branch(gui: &mut Gui, path: String) {
             search_textarea: make_help_search_textarea(),
             scroll_offset: 0,
         },
+        allow_freeform: false,
         on_confirm: Box::new(move |gui, branch| {
             if !is_allowed_existing_local_branch(branch, &worktree_existing_local_branch_items(gui))
             {
@@ -166,6 +167,7 @@ fn prompt_worktree_base_ref(gui: &mut Gui, path: String, branch: String) {
             search_textarea: make_help_search_textarea(),
             scroll_offset: 0,
         },
+        allow_freeform: true,
         on_confirm: Box::new(move |gui, base_ref| {
             gui.git
                 .create_worktree_new_branch(&path, &branch, Some(base_ref))?;

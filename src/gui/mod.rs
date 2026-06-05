@@ -66,6 +66,122 @@ fn list_picker_visible_height(terminal_height: usize) -> usize {
     popup_h.saturating_sub(2).saturating_sub(3)
 }
 
+fn ref_picker_confirm_value(
+    core: &self::popup::ListPickerCore,
+    search: &str,
+    allow_freeform: bool,
+) -> Option<String> {
+    if let Some(item) = core.items.get(core.selected) {
+        Some(item.value.clone())
+    } else if allow_freeform && !search.trim().is_empty() {
+        Some(search.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn update_ref_picker_search(
+    core: &mut self::popup::ListPickerCore,
+    new_search: &str,
+    allow_freeform: bool,
+    list_height: usize,
+) {
+    if !core.items.is_empty() && core.items[0].category == "[ref]" {
+        core.items.remove(0);
+    }
+
+    let new_lower = new_search.to_lowercase();
+    if !new_lower.is_empty() {
+        let list_start = if allow_freeform {
+            core.items.insert(
+                0,
+                ListPickerItem {
+                    value: new_search.trim().to_string(),
+                    label: new_search.trim().to_string(),
+                    category: "[ref]".to_string(),
+                },
+            );
+            1
+        } else {
+            0
+        };
+
+        if let Some(idx) = core.items.iter().skip(list_start).position(|i| {
+            i.label.to_lowercase().contains(&new_lower)
+                || i.value.to_lowercase().contains(&new_lower)
+        }) {
+            core.selected = idx + list_start;
+            if list_height == 0 {
+                core.scroll_offset = 0;
+            } else {
+                let sdi = list_picker_display_idx(&core.items, core.selected);
+                core.scroll_offset = sdi.saturating_sub(list_height / 2);
+            }
+        } else {
+            core.selected = if allow_freeform { 0 } else { core.items.len() };
+            core.scroll_offset = 0;
+        }
+    } else {
+        core.selected = 0;
+        core.scroll_offset = 0;
+    }
+}
+
+#[cfg(test)]
+mod ref_picker_tests {
+    use super::*;
+    use crate::gui::popup::{ListPickerCore, make_help_search_textarea};
+
+    fn picker_core() -> ListPickerCore {
+        ListPickerCore {
+            items: vec![ListPickerItem {
+                value: "feature".to_string(),
+                label: "feature".to_string(),
+                category: "Local Branches".to_string(),
+            }],
+            selected: 0,
+            search_textarea: make_help_search_textarea(),
+            scroll_offset: 0,
+        }
+    }
+
+    #[test]
+    fn freeform_ref_picker_search_injects_raw_ref_item() {
+        let mut core = picker_core();
+
+        update_ref_picker_search(&mut core, "deadbeef", true, 10);
+
+        assert_eq!(core.items[0].category, "[ref]");
+        assert_eq!(core.items[0].value, "deadbeef");
+        assert_eq!(core.selected, 0);
+        assert_eq!(
+            ref_picker_confirm_value(&core, "deadbeef", true),
+            Some("deadbeef".to_string())
+        );
+    }
+
+    #[test]
+    fn selection_only_ref_picker_search_does_not_inject_raw_ref_item() {
+        let mut core = picker_core();
+
+        update_ref_picker_search(&mut core, "deadbeef", false, 10);
+
+        assert_eq!(core.items.len(), 1);
+        assert_eq!(core.items[0].category, "Local Branches");
+        assert_eq!(core.items[0].value, "feature");
+        assert_eq!(core.selected, core.items.len());
+    }
+
+    #[test]
+    fn selection_only_ref_picker_does_not_confirm_unmatched_search_text() {
+        let mut core = picker_core();
+
+        update_ref_picker_search(&mut core, "deadbeef", false, 10);
+
+        assert_eq!(ref_picker_confirm_value(&core, "deadbeef", false), None);
+    }
+}
+
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// A completed diff result from the background thread.
@@ -2700,36 +2816,15 @@ impl Gui {
                 *selected = 0;
                 *scroll_offset = 0;
             }
-            PopupState::RefPicker { core, .. } => {
-                use crate::gui::popup::ListPickerItem;
+            PopupState::RefPicker {
+                core,
+                allow_freeform,
+                ..
+            } => {
                 let cleaned: String = data.replace('\r', "").replace('\n', " ");
                 core.search_textarea.insert_str(&cleaned);
                 let new_search = core.search_textarea.lines().join("");
-                if !core.items.is_empty() && core.items[0].category == "[ref]" {
-                    core.items.remove(0);
-                }
-                let new_lower = new_search.to_lowercase();
-                if !new_lower.is_empty() {
-                    core.items.insert(
-                        0,
-                        ListPickerItem {
-                            value: new_search.trim().to_string(),
-                            label: new_search.trim().to_string(),
-                            category: "[ref]".to_string(),
-                        },
-                    );
-                    if let Some(idx) = core.items.iter().skip(1).position(|i| {
-                        i.label.to_lowercase().contains(&new_lower)
-                            || i.value.to_lowercase().contains(&new_lower)
-                    }) {
-                        core.selected = idx + 1;
-                    } else {
-                        core.selected = 0;
-                    }
-                } else {
-                    core.selected = 0;
-                }
-                core.scroll_offset = 0;
+                update_ref_picker_search(core, &new_search, *allow_freeform, 0);
             }
             PopupState::ThemePicker { core, .. } => {
                 let cleaned: String = data.replace('\r', "").replace('\n', " ");
@@ -3574,9 +3669,12 @@ impl Gui {
     }
 
     fn handle_ref_picker_key(&mut self, key: KeyEvent) -> Result<()> {
-        use crate::gui::popup::ListPickerItem;
-
-        if let PopupState::RefPicker { core, .. } = &mut self.popup {
+        if let PopupState::RefPicker {
+            core,
+            allow_freeform,
+            ..
+        } = &mut self.popup
+        {
             let search = core.search_textarea.lines().join("");
             let total = core.items.len();
 
@@ -3589,11 +3687,8 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    let value = if let Some(item) = core.items.get(core.selected) {
-                        item.value.clone()
-                    } else if !search.trim().is_empty() {
-                        search.trim().to_string()
-                    } else {
+                    let Some(value) = ref_picker_confirm_value(core, &search, *allow_freeform)
+                    else {
                         return Ok(());
                     };
                     let popup = std::mem::replace(&mut self.popup, PopupState::None);
@@ -3632,36 +3727,7 @@ impl Gui {
                     core.search_textarea.input(key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
-                        // Remove any previous raw-ref item at index 0
-                        if !core.items.is_empty() && core.items[0].category == "[ref]" {
-                            core.items.remove(0);
-                        }
-
-                        let new_lower = new_search.to_lowercase();
-                        if !new_lower.is_empty() {
-                            core.items.insert(
-                                0,
-                                ListPickerItem {
-                                    value: new_search.trim().to_string(),
-                                    label: new_search.trim().to_string(),
-                                    category: "[ref]".to_string(),
-                                },
-                            );
-
-                            if let Some(idx) = core.items.iter().skip(1).position(|i| {
-                                i.label.to_lowercase().contains(&new_lower)
-                                    || i.value.to_lowercase().contains(&new_lower)
-                            }) {
-                                core.selected = idx + 1;
-                            } else {
-                                core.selected = 0;
-                            }
-                            let sdi = list_picker_display_idx(&core.items, core.selected);
-                            core.scroll_offset = sdi.saturating_sub(list_height / 2);
-                        } else {
-                            core.selected = 0;
-                            core.scroll_offset = 0;
-                        }
+                        update_ref_picker_search(core, &new_search, *allow_freeform, list_height);
                     }
                 }
             }
@@ -3833,6 +3899,7 @@ impl Gui {
                 search_textarea: make_help_search_textarea(),
                 scroll_offset: 0,
             },
+            allow_freeform: true,
             on_confirm: Box::new(|gui, ref_name| {
                 controller::branches::enter_interactive_rebase_onto(gui, ref_name)
             }),

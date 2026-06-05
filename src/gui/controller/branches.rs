@@ -176,6 +176,7 @@ fn checkout_picker(gui: &mut Gui) -> Result<()> {
             search_textarea: make_help_search_textarea(),
             scroll_offset: 0,
         },
+        allow_freeform: true,
         on_confirm: Box::new(|gui, ref_name| {
             show_checkout_error_or_refresh(gui, ref_name)?;
             Ok(())
