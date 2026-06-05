@@ -8,7 +8,7 @@ pub mod scroll;
 pub mod views;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -66,6 +66,20 @@ fn list_picker_visible_height(terminal_height: usize) -> usize {
 }
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
+const EVENT_DRAIN_LIMIT: usize = 256;
+
+fn drain_pending_terminal_events(idle_timeout: Duration) {
+    for _ in 0..EVENT_DRAIN_LIMIT {
+        match event::poll(idle_timeout) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            Ok(false) | Err(_) => break,
+        }
+    }
+}
 
 /// A completed diff result from the background thread.
 pub(crate) struct DiffResult {
@@ -7039,20 +7053,32 @@ fn setup_terminal() -> Result<(Term, bool)> {
 }
 
 fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
-    terminal::disable_raw_mode()?;
+    drain_pending_terminal_events(Duration::from_millis(0));
+
     if keyboard_enhanced {
         execute!(
             terminal.backend_mut(),
-            crossterm::event::PopKeyboardEnhancementFlags
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableBracketedPaste,
+            cursor::Show,
+            LeaveAlternateScreen
+        )?;
+    } else {
+        execute!(
+            terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableBracketedPaste,
+            cursor::Show,
+            LeaveAlternateScreen
         )?;
     }
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableFocusChange,
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-        cursor::Show
-    )?;
+    terminal.backend_mut().flush()?;
+
+    drain_pending_terminal_events(Duration::from_millis(25));
+    terminal::disable_raw_mode()?;
+
     Ok(())
 }
