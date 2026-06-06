@@ -251,7 +251,7 @@
 
 - [x] I'm in a repo. I `cd` to a subfolder in the repo. I get `<foldername> -> <branch>` which is not normal. the <foldername> should be the repository name.
 
-- [ ] On Wezterm, I did `config.enable_kitty_keyboard = true`, now cmd+left or cmd+right doesn't work anymore (for skipping to the first/last character on the current line). Idk if this is a wezterm problem I need to patch or just on the wezterm lua side. Currently still works on the Zed Terminal btw.
+- [x] On Wezterm, I did `config.enable_kitty_keyboard = true`, now cmd+left or cmd+right doesn't work anymore (for skipping to the first/last character on the current line). Idk if this is a wezterm problem I need to patch or just on the wezterm lua side. Currently still works on the Zed Terminal btw.
 
 Also another thing I noticed, a missed keyboard behavior we didn't do yet... Doing cmd+backspace to clear from the current cursor. Not observed yet, even on the zed terminal. This is a mustfix.
 

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
@@ -67,6 +67,32 @@ fn list_picker_visible_height(terminal_height: usize) -> usize {
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 const EVENT_DRAIN_LIMIT: usize = 256;
+
+fn has_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META)
+}
+
+pub(crate) fn textarea_input(
+    textarea: &mut tui_textarea::TextArea<'static>,
+    key: KeyEvent,
+) -> bool {
+    let cmd = has_command_modifier(key.modifiers);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Left if cmd => textarea.move_cursor(tui_textarea::CursorMove::Head),
+        KeyCode::Right if cmd => textarea.move_cursor(tui_textarea::CursorMove::End),
+        KeyCode::Backspace if cmd => {
+            textarea.delete_line_by_head();
+        }
+        KeyCode::Char('a') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::Head),
+        KeyCode::Char('e') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::End),
+        KeyCode::Char('u') if ctrl => {
+            textarea.delete_line_by_head();
+        }
+        _ => return textarea.input(key),
+    };
+    true
+}
 
 fn drain_pending_terminal_events(idle_timeout: Duration) {
     for _ in 0..EVENT_DRAIN_LIMIT {
@@ -2268,7 +2294,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    ta.input(key);
+                    textarea_input(ta, key);
                     self.diff_view.search_query = ta.lines().join("");
                     self.diff_view.update_search();
                 }
@@ -2987,7 +3013,7 @@ impl Gui {
                             }
                         } else {
                             // Not at boundary — forward to textarea for normal cursor movement
-                            textarea.input(key);
+                            textarea_input(textarea, key);
                         }
                     }
                 } else if is_commit
@@ -3012,17 +3038,7 @@ impl Gui {
                         ..
                     } = &mut self.popup
                     {
-                        // Cmd+Backspace: delete only the current visual row (each soft-wrap
-                        // row is its own textarea line), not the whole field. Without this
-                        // explicit handling, terminals that don't translate Cmd+Backspace
-                        // into Ctrl+U fall through and behave inconsistently.
-                        if key.code == KeyCode::Backspace
-                            && key.modifiers.contains(KeyModifiers::SUPER)
-                        {
-                            textarea.delete_line_by_head();
-                        } else {
-                            textarea.input(key);
-                        }
+                        textarea_input(textarea, key);
                         let popup_width = (self.layout.width * 60 / 100)
                             .min(60)
                             .max(30)
@@ -3258,7 +3274,7 @@ impl Gui {
                     {
                         match focus {
                             popup::CommitInputFocus::Summary => {
-                                summary_textarea.input(key);
+                                textarea_input(summary_textarea, key);
                             }
                             popup::CommitInputFocus::Body => {
                                 // Body is driven by body_state (the unwrapped source of truth);
@@ -3267,7 +3283,7 @@ impl Gui {
                                 let mut handled = true;
                                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+                                let cmd = has_command_modifier(key.modifiers);
                                 match key.code {
                                     KeyCode::Char(c) if !ctrl && !alt && !cmd => {
                                         body_state.insert_char(c);
@@ -3572,7 +3588,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    search_textarea.input(key);
+                    textarea_input(search_textarea, key);
                     let new_search = search_textarea.lines().join("");
                     if new_search != search {
                         *selected = 0;
@@ -3644,7 +3660,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    core.search_textarea.input(key);
+                    textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
                         // Remove any previous raw-ref item at index 0
@@ -3743,7 +3759,7 @@ impl Gui {
                 }
                 _ => {
                     // Search/filter — jump to matching theme
-                    core.search_textarea.input(key);
+                    textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
                         let new_lower = new_search.to_lowercase();
@@ -5054,7 +5070,7 @@ impl Gui {
                         self.search_textarea = None;
                     }
                     _ => {
-                        ta.input(key);
+                        textarea_input(ta, key);
                         // Sync textarea content back to search_query
                         self.search_query = ta.lines().join("");
                         self.update_search_matches();
@@ -7068,6 +7084,7 @@ fn setup_terminal() -> Result<(Term, bool)> {
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
         )?;
     }

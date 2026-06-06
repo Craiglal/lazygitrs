@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::config::keybindings::parse_key;
 use crate::gui::modes::diff_mode::{DiffModeFocus, DiffModeSelector};
 use crate::gui::popup::{HelpEntry, HelpSection, MenuItem, PopupState};
-use crate::gui::{DiffPayload, DiffResult, Gui};
+use crate::gui::{DiffPayload, DiffResult, Gui, textarea_input};
 use crate::model::FileChangeStatus;
 use crate::os::platform::Platform;
 use crate::pager::side_by_side::{DiffPanelLayout, DiffViewState};
@@ -199,7 +199,7 @@ fn handle_combobox_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
         _ => {
             // Forward all other keys to the textarea (handles Backspace, Opt+Backspace, etc.)
             if let Some(ref mut ta) = gui.diff_mode.textarea {
-                ta.input(key);
+                textarea_input(ta, key);
             }
             // Re-search after any text change
             let model = gui.model.lock().unwrap();
@@ -236,7 +236,7 @@ fn handle_file_search_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
                 gui.needs_diff_refresh = true;
             }
             _ => {
-                ta.input(key);
+                textarea_input(ta, key);
                 gui.diff_mode.file_search_query = ta.lines().join("");
                 gui.diff_mode.update_file_search_matches();
                 gui.needs_diff_refresh = true;
@@ -444,7 +444,7 @@ fn handle_diff_search_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
                 }
             }
             _ => {
-                ta.input(key);
+                textarea_input(ta, key);
                 gui.diff_view.search_query = ta.lines().join("");
                 gui.diff_view.update_search();
             }
