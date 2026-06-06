@@ -35,6 +35,7 @@ pub fn generate_commit_message_cancellable(
     let diff_output = Command::new("git")
         .args(["diff", "--cached"])
         .current_dir(repo_path)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()?;

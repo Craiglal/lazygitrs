@@ -74,7 +74,7 @@ impl GitCommands {
     }
 
     fn git(&self) -> CmdBuilder {
-        CmdBuilder::git().cwd_path(&self.repo_path)
+        CmdBuilder::git_no_optional_locks().cwd_path(&self.repo_path)
     }
 
     /// Public access to the git command builder.

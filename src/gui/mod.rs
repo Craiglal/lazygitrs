@@ -321,6 +321,14 @@ fn synthesize_new_file_diff(filename: &str, content: &str) -> String {
 }
 
 impl Gui {
+    fn show_error(&mut self, title: &str, err: anyhow::Error) {
+        self.popup = PopupState::Message {
+            title: title.to_string(),
+            message: format!("{:#}", err),
+            kind: MessageKind::Error,
+        };
+    }
+
     pub fn new(config: AppConfig, git: GitCommands) -> Result<Self> {
         let (diff_tx, diff_rx) = mpsc::channel();
         let (ai_commit_tx, ai_commit_rx) = mpsc::channel();
@@ -750,7 +758,9 @@ impl Gui {
             if event::poll(std::time::Duration::from_millis(16))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        self.handle_key(key)?;
+                        if let Err(err) = self.handle_key(key) {
+                            self.show_error("Command failed", err);
+                        }
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
                     Event::Resize(w, h) => {
@@ -822,15 +832,29 @@ impl Gui {
 
             // Refresh data if needed
             if self.needs_refresh {
-                self.refresh()?;
-                self.needs_refresh = false;
-                self.needs_files_refresh = false;
-                self.needs_diff_refresh = true;
-                self.last_refresh_at = Instant::now();
+                match self.refresh() {
+                    Ok(()) => {
+                        self.needs_refresh = false;
+                        self.needs_files_refresh = false;
+                        self.needs_diff_refresh = true;
+                        self.last_refresh_at = Instant::now();
+                    }
+                    Err(err) => {
+                        self.needs_refresh = false;
+                        self.show_error("Refresh failed", err);
+                    }
+                }
             } else if self.needs_files_refresh {
-                self.refresh_files_only()?;
-                self.needs_files_refresh = false;
-                self.needs_diff_refresh = true;
+                match self.refresh_files_only() {
+                    Ok(()) => {
+                        self.needs_files_refresh = false;
+                        self.needs_diff_refresh = true;
+                    }
+                    Err(err) => {
+                        self.needs_files_refresh = false;
+                        self.show_error("Refresh failed", err);
+                    }
+                }
             }
 
             if self.should_quit {
