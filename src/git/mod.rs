@@ -58,15 +58,78 @@ pub const DEFAULT_COMMIT_LIMIT: usize = 300;
 /// Total number of `ModelPart` variants that `load_model_streaming` sends.
 pub const MODEL_PART_COUNT: usize = 13;
 
+struct RepoPaths {
+    worktree_path: PathBuf,
+    repo_path: PathBuf,
+}
+
 /// Facade for all git operations. Mirrors lazygit's GitCommand.
 pub struct GitCommands {
     repo_path: PathBuf,
+    repo_name: String,
 }
 
 impl GitCommands {
     pub fn new(repo_path: &Path) -> Result<Self> {
-        let repo_path = repo_path.canonicalize()?;
-        Ok(Self { repo_path })
+        let paths = Self::resolve_repo_paths(repo_path)?;
+        let repo_name = paths
+            .repo_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        Ok(Self {
+            repo_path: paths.worktree_path,
+            repo_name,
+        })
+    }
+
+    fn resolve_repo_paths(path: &Path) -> Result<RepoPaths> {
+        let fallback = path.canonicalize()?;
+        let result = CmdBuilder::git()
+            .cwd_path(path)
+            .args(&[
+                "rev-parse",
+                "--path-format=absolute",
+                "--show-toplevel",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--is-bare-repository",
+                "--show-superproject-working-tree",
+            ])
+            .run()?;
+
+        if !result.success {
+            return Ok(RepoPaths {
+                worktree_path: fallback.clone(),
+                repo_path: fallback,
+            });
+        }
+
+        let lines: Vec<&str> = result.stdout_trimmed().lines().collect();
+        if lines.len() < 4 || lines[0].is_empty() {
+            return Ok(RepoPaths {
+                worktree_path: fallback.clone(),
+                repo_path: fallback,
+            });
+        }
+
+        let worktree_path = PathBuf::from(lines[0]).canonicalize()?;
+        let repo_git_dir_path = PathBuf::from(lines[2]);
+        let is_submodule = lines.get(4).is_some_and(|line| !line.is_empty());
+        let repo_path = if is_submodule {
+            worktree_path.clone()
+        } else {
+            repo_git_dir_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| worktree_path.clone())
+        };
+
+        Ok(RepoPaths {
+            worktree_path,
+            repo_path,
+        })
     }
 
     pub fn repo_path(&self) -> &Path {
@@ -74,7 +137,7 @@ impl GitCommands {
     }
 
     fn git(&self) -> CmdBuilder {
-        CmdBuilder::git().cwd_path(&self.repo_path)
+        CmdBuilder::git_no_optional_locks().cwd_path(&self.repo_path)
     }
 
     /// Public access to the git command builder.
@@ -252,10 +315,7 @@ impl GitCommands {
 
     /// Get the repo name (last component of path).
     pub fn repo_name(&self) -> String {
-        self.repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string())
+        self.repo_name.clone()
     }
 
     /// Check if the working directory is a valid git repo.
@@ -302,5 +362,118 @@ impl GitCommands {
             .args(&["log", "-1", "--format=%an", hash])
             .run_expecting_success()?;
         Ok(result.stdout_trimmed().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "lazygitrs-{prefix}-{unique}-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn new_resolves_repo_path_to_worktree_root_from_subdirectory() {
+        let temp = TempDir::new("repo-root");
+        let repo = temp.path().join("my-repo");
+        let subdir = repo.join("nested").join("folder");
+        std::fs::create_dir_all(&subdir).expect("create nested repo dir");
+
+        let status = Command::new("git")
+            .arg("init")
+            .arg(&repo)
+            .status()
+            .expect("run git init");
+        assert!(status.success());
+
+        let git = GitCommands::new(&subdir).expect("create git commands");
+
+        assert_eq!(git.repo_path(), repo.canonicalize().unwrap());
+        assert_eq!(git.repo_name(), "my-repo");
+    }
+
+    #[test]
+    fn repo_name_comes_from_main_repo_for_linked_worktree() {
+        let temp = TempDir::new("linked-worktree");
+        let repo = temp.path().join("main-repo");
+        let linked = temp.path().join("linked-checkout");
+        std::fs::create_dir_all(&repo).expect("create repo dir");
+
+        assert_success(Command::new("git").arg("init").arg(&repo).status());
+        assert_success(
+            Command::new("git")
+                .args(["config", "user.email", "test@example.com"])
+                .current_dir(&repo)
+                .status(),
+        );
+        assert_success(
+            Command::new("git")
+                .args(["config", "user.name", "Test"])
+                .current_dir(&repo)
+                .status(),
+        );
+        std::fs::write(repo.join("file"), "content").expect("write file");
+        assert_success(
+            Command::new("git")
+                .args(["add", "file"])
+                .current_dir(&repo)
+                .status(),
+        );
+        assert_success(
+            Command::new("git")
+                .args(["commit", "-m", "init"])
+                .current_dir(&repo)
+                .status(),
+        );
+        assert_success(
+            Command::new("git")
+                .arg("worktree")
+                .arg("add")
+                .arg(&linked)
+                .arg("-b")
+                .arg("linked")
+                .current_dir(&repo)
+                .status(),
+        );
+
+        let subdir = linked.join("nested");
+        std::fs::create_dir_all(&subdir).expect("create linked subdir");
+        let git = GitCommands::new(&subdir).expect("create git commands");
+
+        assert_eq!(git.repo_path(), linked.canonicalize().unwrap());
+        assert_eq!(git.repo_name(), "main-repo");
+    }
+
+    fn assert_success(status: std::io::Result<std::process::ExitStatus>) {
+        assert!(status.expect("run git command").success());
     }
 }

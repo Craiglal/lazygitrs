@@ -52,8 +52,10 @@ impl App {
     }
 
     pub fn run(mut self) -> Result<()> {
+        let git = GitCommands::new(&self.repo_path).context("Failed to initialize git commands")?;
+
         // Update recent repos
-        let repo_str = self.repo_path.to_string_lossy().to_string();
+        let repo_str = git.repo_path().to_string_lossy().to_string();
         self.config.app_state.add_recent_repo(&repo_str);
         let _ = self.config.save_state();
 

@@ -8,14 +8,14 @@ pub mod scroll;
 pub mod views;
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute};
 use ratatui::Terminal;
@@ -183,6 +183,46 @@ mod ref_picker_tests {
 }
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
+const EVENT_DRAIN_LIMIT: usize = 256;
+
+fn has_command_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META)
+}
+
+pub(crate) fn textarea_input(
+    textarea: &mut tui_textarea::TextArea<'static>,
+    key: KeyEvent,
+) -> bool {
+    let cmd = has_command_modifier(key.modifiers);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Left if cmd => textarea.move_cursor(tui_textarea::CursorMove::Head),
+        KeyCode::Right if cmd => textarea.move_cursor(tui_textarea::CursorMove::End),
+        KeyCode::Backspace if cmd => {
+            textarea.delete_line_by_head();
+        }
+        KeyCode::Char('a') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::Head),
+        KeyCode::Char('e') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::End),
+        KeyCode::Char('u') if ctrl => {
+            textarea.delete_line_by_head();
+        }
+        _ => return textarea.input(key),
+    };
+    true
+}
+
+fn drain_pending_terminal_events(idle_timeout: Duration) {
+    for _ in 0..EVENT_DRAIN_LIMIT {
+        match event::poll(idle_timeout) {
+            Ok(true) => {
+                if event::read().is_err() {
+                    break;
+                }
+            }
+            Ok(false) | Err(_) => break,
+        }
+    }
+}
 
 /// A completed diff result from the background thread.
 pub(crate) struct DiffResult {
@@ -425,6 +465,14 @@ fn synthesize_new_file_diff(filename: &str, content: &str) -> String {
 }
 
 impl Gui {
+    fn show_error(&mut self, title: &str, err: anyhow::Error) {
+        self.popup = PopupState::Message {
+            title: title.to_string(),
+            message: format!("{:#}", err),
+            kind: MessageKind::Error,
+        };
+    }
+
     pub fn new(config: AppConfig, git: GitCommands) -> Result<Self> {
         let (diff_tx, diff_rx) = mpsc::channel();
         let (ai_commit_tx, ai_commit_rx) = mpsc::channel();
@@ -864,7 +912,9 @@ impl Gui {
             if event::poll(std::time::Duration::from_millis(16))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        self.handle_key(key)?;
+                        if let Err(err) = self.handle_key(key) {
+                            self.show_error("Command failed", err);
+                        }
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
                     Event::Resize(w, h) => {
@@ -940,15 +990,29 @@ impl Gui {
 
             // Refresh data if needed
             if self.needs_refresh {
-                self.refresh()?;
-                self.needs_refresh = false;
-                self.needs_files_refresh = false;
-                self.needs_diff_refresh = true;
-                self.last_refresh_at = Instant::now();
+                match self.refresh() {
+                    Ok(()) => {
+                        self.needs_refresh = false;
+                        self.needs_files_refresh = false;
+                        self.needs_diff_refresh = true;
+                        self.last_refresh_at = Instant::now();
+                    }
+                    Err(err) => {
+                        self.needs_refresh = false;
+                        self.show_error("Refresh failed", err);
+                    }
+                }
             } else if self.needs_files_refresh {
-                self.refresh_files_only()?;
-                self.needs_files_refresh = false;
-                self.needs_diff_refresh = true;
+                match self.refresh_files_only() {
+                    Ok(()) => {
+                        self.needs_files_refresh = false;
+                        self.needs_diff_refresh = true;
+                    }
+                    Err(err) => {
+                        self.needs_files_refresh = false;
+                        self.show_error("Refresh failed", err);
+                    }
+                }
             }
         }
 
@@ -1075,16 +1139,17 @@ impl Gui {
                     }
                 }
                 Err(e) => {
-                    // On failure, restore the stashed editor so user can type manually
                     if let Some(stashed) = self.pending_commit_popup.take() {
-                        self.popup = stashed;
-                    } else {
-                        self.popup = PopupState::Message {
-                            title: "AI generation failed".to_string(),
-                            message: format!("{}", e),
-                            kind: MessageKind::Error,
-                        };
+                        self.saved_commit_popup = Some(stashed);
                     }
+                    self.popup = PopupState::Message {
+                        title: "AI generation failed".to_string(),
+                        message: format!(
+                            "{}\n\nYour commit draft was saved. Open the commit prompt again to restore it.",
+                            e
+                        ),
+                        kind: MessageKind::Error,
+                    };
                 }
             }
         }
@@ -2369,7 +2434,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    ta.input(key);
+                    textarea_input(ta, key);
                     self.diff_view.search_query = ta.lines().join("");
                     self.diff_view.update_search();
                 }
@@ -3067,7 +3132,7 @@ impl Gui {
                             }
                         } else {
                             // Not at boundary — forward to textarea for normal cursor movement
-                            textarea.input(key);
+                            textarea_input(textarea, key);
                         }
                     }
                 } else if is_commit
@@ -3092,17 +3157,7 @@ impl Gui {
                         ..
                     } = &mut self.popup
                     {
-                        // Cmd+Backspace: delete only the current visual row (each soft-wrap
-                        // row is its own textarea line), not the whole field. Without this
-                        // explicit handling, terminals that don't translate Cmd+Backspace
-                        // into Ctrl+U fall through and behave inconsistently.
-                        if key.code == KeyCode::Backspace
-                            && key.modifiers.contains(KeyModifiers::SUPER)
-                        {
-                            textarea.delete_line_by_head();
-                        } else {
-                            textarea.input(key);
-                        }
+                        textarea_input(textarea, key);
                         let popup_width = (self.layout.width * 60 / 100)
                             .min(60)
                             .max(30)
@@ -3338,7 +3393,7 @@ impl Gui {
                     {
                         match focus {
                             popup::CommitInputFocus::Summary => {
-                                summary_textarea.input(key);
+                                textarea_input(summary_textarea, key);
                             }
                             popup::CommitInputFocus::Body => {
                                 // Body is driven by body_state (the unwrapped source of truth);
@@ -3347,7 +3402,7 @@ impl Gui {
                                 let mut handled = true;
                                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                let cmd = key.modifiers.contains(KeyModifiers::SUPER);
+                                let cmd = has_command_modifier(key.modifiers);
                                 match key.code {
                                     KeyCode::Char(c) if !ctrl && !alt && !cmd => {
                                         body_state.insert_char(c);
@@ -3652,7 +3707,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    search_textarea.input(key);
+                    textarea_input(search_textarea, key);
                     let new_search = search_textarea.lines().join("");
                     if new_search != search {
                         *selected = 0;
@@ -3724,7 +3779,7 @@ impl Gui {
                     }
                 }
                 _ => {
-                    core.search_textarea.input(key);
+                    textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
                         update_ref_picker_search(core, &new_search, *allow_freeform, list_height);
@@ -3794,7 +3849,7 @@ impl Gui {
                 }
                 _ => {
                     // Search/filter — jump to matching theme
-                    core.search_textarea.input(key);
+                    textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
                         let new_lower = new_search.to_lowercase();
@@ -5106,7 +5161,7 @@ impl Gui {
                         self.search_textarea = None;
                     }
                     _ => {
-                        ta.input(key);
+                        textarea_input(ta, key);
                         // Sync textarea content back to search_query
                         self.search_query = ta.lines().join("");
                         self.update_search_matches();
@@ -7120,6 +7175,7 @@ fn setup_terminal() -> Result<(Term, bool)> {
             crossterm::event::PushKeyboardEnhancementFlags(
                 crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                     | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
             )
         )?;
     }
@@ -7129,20 +7185,32 @@ fn setup_terminal() -> Result<(Term, bool)> {
 }
 
 fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
-    terminal::disable_raw_mode()?;
+    drain_pending_terminal_events(Duration::from_millis(0));
+
     if keyboard_enhanced {
         execute!(
             terminal.backend_mut(),
-            crossterm::event::PopKeyboardEnhancementFlags
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::PopKeyboardEnhancementFlags,
+            crossterm::event::DisableBracketedPaste,
+            cursor::Show,
+            LeaveAlternateScreen
+        )?;
+    } else {
+        execute!(
+            terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableFocusChange,
+            crossterm::event::DisableBracketedPaste,
+            cursor::Show,
+            LeaveAlternateScreen
         )?;
     }
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableFocusChange,
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture,
-        cursor::Show
-    )?;
+    terminal.backend_mut().flush()?;
+
+    drain_pending_terminal_events(Duration::from_millis(25));
+    terminal::disable_raw_mode()?;
+
     Ok(())
 }

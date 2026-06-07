@@ -248,3 +248,11 @@
 - [x] Add a "unified diff" view and a "side-by-side (split) diff view". Currently we only have split diff view by default. Let's give it a hotkey
 
 - [x] See the other "remotes" added in 'status'. So that when 'Copy PR URL' is used, it can copy the PR Url on the "upstream" if the PR is actually there. Just fallback. For instance, I made a PR on /Users/carlo/Desktop/Projects/zed, I tried 'copy pr url' or 'open pr url' and just get empty, but in fact, I do have a PR in https://github.com/zed-industries/zed/pull/58041. Idk if this needs some good proper configurators for `gh repo set-default` and stuff like that.
+
+- [x] I'm in a repo. I `cd` to a subfolder in the repo. I get `<foldername> -> <branch>` which is not normal. the <foldername> should be the repository name.
+
+- [x] On Wezterm, I did `config.enable_kitty_keyboard = true`, now cmd+left or cmd+right doesn't work anymore (for skipping to the first/last character on the current line). Idk if this is a wezterm problem I need to patch or just on the wezterm lua side. Currently still works on the Zed Terminal btw.
+
+Also another thing I noticed, a missed keyboard behavior we didn't do yet... Doing cmd+backspace to clear from the current cursor. Not observed yet, even on the zed terminal. This is a mustfix.
+
+Where I observed this behavior: I noticed this for the "Commit Message" and "Description". Generally where I can input text i..e the "Interactive rebase on" dialog palette or the help `?` command palette.
