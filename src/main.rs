@@ -43,8 +43,8 @@ fn install_panic_hook() {
             stdout,
             crossterm::event::DisableMouseCapture,
             crossterm::event::DisableFocusChange,
-            crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen,
         );
         let _ = crossterm::terminal::disable_raw_mode();
         prev(info);

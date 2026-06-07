@@ -87,6 +87,10 @@ impl CmdBuilder {
         Self::new("git")
     }
 
+    pub fn git_no_optional_locks() -> Self {
+        Self::git().env("GIT_OPTIONAL_LOCKS", "0")
+    }
+
     pub fn arg(mut self, arg: &str) -> Self {
         self.args.push(arg.to_string());
         self

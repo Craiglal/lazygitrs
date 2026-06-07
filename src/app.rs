@@ -52,14 +52,22 @@ impl App {
     }
 
     pub fn run(mut self) -> Result<()> {
+        let git = GitCommands::new(&self.repo_path).context("Failed to initialize git commands")?;
+
         // Update recent repos
-        let repo_str = self.repo_path.to_string_lossy().to_string();
+        let repo_str = git.repo_path().to_string_lossy().to_string();
         self.config.app_state.add_recent_repo(&repo_str);
         let _ = self.config.save_state();
 
+<<<<<<< HEAD
         let git = GitCommands::new(&self.repo_path).context("Failed to initialize git commands")?;
         let debug = self.config.debug;
 
+||||||| 165223c
+        let git = GitCommands::new(&self.repo_path).context("Failed to initialize git commands")?;
+
+=======
+>>>>>>> 79913f71ecac735c698f473cb85fe2cb4c2d4835
         let mut gui = Gui::new(self.config, git)?;
         gui.run()?;
 
