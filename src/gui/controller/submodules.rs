@@ -126,12 +126,7 @@ fn enter_submodule(gui: &mut Gui) -> Result<()> {
             title: "Enter submodule".to_string(),
             message: format!("Open lazygitrs in submodule '{}'?", name),
             on_confirm: Box::new(move |gui| {
-                let exe = std::env::current_exe().unwrap_or_else(|_| "lazygitrs".into());
-                std::process::Command::new(exe)
-                    .arg("--path")
-                    .arg(&abs_path)
-                    .spawn()?;
-                gui.should_quit = true;
+                gui.request_repo_open(abs_path.clone());
                 Ok(())
             }),
         };

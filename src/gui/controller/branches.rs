@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::config::KeybindingConfig;
 use crate::config::keybindings::parse_key;
 use crate::gui::Gui;
+use crate::gui::controller::input_normalization::replace_spaces_with_dashes;
 use crate::gui::popup::{MenuItem, MessageKind, PopupState, make_textarea};
 use crate::os::platform::Platform;
 
@@ -176,6 +177,7 @@ fn checkout_picker(gui: &mut Gui) -> Result<()> {
             search_textarea: make_help_search_textarea(),
             scroll_offset: 0,
         },
+        allow_freeform: true,
         on_confirm: Box::new(|gui, ref_name| {
             show_checkout_error_or_refresh(gui, ref_name)?;
             Ok(())
@@ -205,8 +207,9 @@ fn new_branch(gui: &mut Gui) -> Result<()> {
         title: "New branch name".to_string(),
         textarea: make_textarea(""),
         on_confirm: Box::new(|gui, name| {
+            let name = replace_spaces_with_dashes(name);
             if !name.is_empty() {
-                gui.git.create_branch(name)?;
+                gui.git.create_branch(&name)?;
                 gui.needs_refresh = true;
             }
             Ok(())

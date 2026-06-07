@@ -6,6 +6,7 @@ pub mod commits;
 pub mod custom_commands;
 pub mod diff_mode;
 pub mod files;
+pub mod input_normalization;
 pub mod patch_building;
 pub mod rebase_mode;
 pub mod reflog;
