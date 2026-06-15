@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::event::KeyEvent;
 
-use crate::config::keybindings::parse_key;
+use crate::config::keybindings::key_matches;
 use crate::config::user_config::CustomCommand;
 use crate::gui::Gui;
 use crate::gui::context::ContextId;
@@ -27,10 +27,8 @@ pub fn try_handle_key(gui: &mut Gui, key: KeyEvent) -> Result<bool> {
             continue;
         }
 
-        if let Some(expected) = parse_key(&cmd.key) {
-            if key.code == expected.code && key.modifiers == expected.modifiers {
-                return execute_custom_command(gui, cmd).map(|_| true);
-            }
+        if key_matches(key, &cmd.key) {
+            return execute_custom_command(gui, cmd).map(|_| true);
         }
     }
 

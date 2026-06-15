@@ -445,3 +445,63 @@ pub fn parse_key(s: &str) -> Option<KeyEvent> {
 
     None
 }
+
+pub fn key_matches(key: KeyEvent, binding: &str) -> bool {
+    if let Some(expected) = parse_key(binding) {
+        if key.code == expected.code && key.modifiers == expected.modifiers {
+            return true;
+        }
+
+        // Terminals disagree on printable uppercase letters: some report `P` as
+        // Char('P') + SHIFT, some as Char('P'), and some as Char('p') + SHIFT.
+        if let (KeyCode::Char(actual), KeyCode::Char(expected_ch)) = (key.code, expected.code)
+            && expected_ch.is_uppercase()
+        {
+            let actual_has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let actual_matches_upper = actual == expected_ch;
+            let actual_matches_shifted_lower =
+                actual_has_shift && actual.to_ascii_uppercase() == expected_ch;
+
+            if actual_matches_upper || actual_matches_shifted_lower {
+                let key_mods = key.modifiers.difference(KeyModifiers::SHIFT);
+                let expected_mods = expected.modifiers.difference(KeyModifiers::SHIFT);
+                return key_mods == expected_mods;
+            }
+        }
+    }
+
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uppercase_binding_matches_with_or_without_shift_modifier() {
+        assert!(key_matches(
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT),
+            "P"
+        ));
+        assert!(key_matches(
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::NONE),
+            "P"
+        ));
+        assert!(key_matches(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::SHIFT),
+            "P"
+        ));
+    }
+
+    #[test]
+    fn uppercase_binding_still_rejects_unrelated_modifiers() {
+        assert!(!key_matches(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            "P"
+        ));
+        assert!(!key_matches(
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL),
+            "P"
+        ));
+    }
+}

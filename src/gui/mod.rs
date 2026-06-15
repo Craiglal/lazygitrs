@@ -21,7 +21,7 @@ use crossterm::{cursor, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::config::keybindings::parse_key;
+use crate::config::keybindings::key_matches;
 use crate::config::{AppConfig, AppState};
 use crate::git::{DEFAULT_COMMIT_LIMIT, GitCommands, MODEL_PART_COUNT, ModelPart};
 use crate::model::Model;
@@ -7145,12 +7145,7 @@ fn read_clipboard() -> Option<String> {
 }
 
 fn matches_key(key: KeyEvent, binding: &str) -> bool {
-    if let Some(expected) = parse_key(binding) {
-        // Compare code and modifiers, ignore kind/state
-        key.code == expected.code && key.modifiers == expected.modifiers
-    } else {
-        false
-    }
+    key_matches(key, binding)
 }
 
 fn rect_contains(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {

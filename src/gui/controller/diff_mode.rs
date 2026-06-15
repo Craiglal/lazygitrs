@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::config::keybindings::parse_key;
+use crate::config::keybindings::key_matches;
 use crate::gui::modes::diff_mode::{DiffModeFocus, DiffModeSelector};
 use crate::gui::popup::{HelpEntry, HelpSection, MenuItem, PopupState};
 use crate::gui::{DiffPayload, DiffResult, Gui, textarea_input};
@@ -897,9 +897,5 @@ fn show_diff_mode_help(gui: &mut Gui) {
 }
 
 fn matches_key(key: KeyEvent, binding: &str) -> bool {
-    if let Some(expected) = parse_key(binding) {
-        key.code == expected.code && key.modifiers == expected.modifiers
-    } else {
-        false
-    }
+    key_matches(key, binding)
 }

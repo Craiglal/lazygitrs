@@ -144,7 +144,18 @@ pub fn compute_graph(commits: &[(String, Vec<String>)]) -> Vec<GraphRow> {
         }
 
         // Build cells from a side-by-side comparison of lanes_before vs lanes.
-        let width = lanes.len().max(lanes_before.len()).max(commit_col + 1);
+        let max_connector_col = deferred_cols
+            .iter()
+            .chain(new_merge_cols.iter())
+            .chain(closing.iter())
+            .copied()
+            .max()
+            .map_or(0, |col| col + 1);
+        let width = lanes
+            .len()
+            .max(lanes_before.len())
+            .max(commit_col + 1)
+            .max(max_connector_col);
         let mut cells: Vec<Cell> = vec![Cell::default(); width];
 
         let is_merge = !merge_parents.is_empty();
@@ -370,5 +381,30 @@ mod tests {
                 "│ ◯", // 22d0113: feature tip
             ]
         );
+    }
+
+    #[test]
+    fn deferred_merge_connector_can_outlive_trimmed_lanes() {
+        let commits = vec![
+            (
+                "7d56b93".into(),
+                vec!["3593f3e".into(), "9e68a4a".into()],
+            ),
+            (
+                "26802f6".into(),
+                vec!["26b6dcb".into(), "30b5037".into()],
+            ),
+            ("26b6dcb".into(), vec!["9e91df9".into()]),
+            (
+                "a69e53d".into(),
+                vec!["90d4cf3".into(), "30b5037".into()],
+            ),
+            ("30b5037".into(), vec!["d9892a4".into()]),
+        ];
+
+        let rows = compute_graph(&commits);
+
+        assert_eq!(rows.len(), commits.len());
+        assert!(rows.iter().all(|row| row.commit_col < row.cells.len()));
     }
 }

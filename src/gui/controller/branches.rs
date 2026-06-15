@@ -2,7 +2,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::config::KeybindingConfig;
-use crate::config::keybindings::parse_key;
+use crate::config::keybindings::key_matches;
 use crate::gui::Gui;
 use crate::gui::controller::input_normalization::replace_spaces_with_dashes;
 use crate::gui::popup::{MenuItem, MessageKind, PopupState, make_textarea};
@@ -722,9 +722,5 @@ fn open_in_browser_menu(gui: &mut Gui) -> Result<()> {
 }
 
 fn matches_key(key: KeyEvent, binding: &str) -> bool {
-    if let Some(expected) = parse_key(binding) {
-        key.code == expected.code && key.modifiers == expected.modifiers
-    } else {
-        false
-    }
+    key_matches(key, binding)
 }
