@@ -120,6 +120,14 @@ impl GitCommands {
         Ok(())
     }
 
+    pub fn continue_merge(&self) -> Result<()> {
+        self.git()
+            .args(&["merge", "--continue"])
+            .env("GIT_EDITOR", "true")
+            .run_expecting_success()?;
+        Ok(())
+    }
+
     pub fn continue_cherry_pick(&self) -> Result<()> {
         self.git()
             .args(&["cherry-pick", "--continue"])

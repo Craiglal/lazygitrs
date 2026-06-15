@@ -1804,11 +1804,11 @@ fn render_status_bar(
 
     // When in a special state (rebasing/merging/cherry-picking), show those options prominently
     if model.is_rebasing {
-        hints.push(("m", "continue/abort/skip rebase"));
+        hints.push(("m", "resolve/continue/abort/skip rebase"));
     } else if model.is_merging {
-        hints.push(("m", "continue/abort merge"));
+        hints.push(("m", "resolve/continue/abort merge"));
     } else if model.is_cherry_picking {
-        hints.push(("m", "continue/abort cherry-pick"));
+        hints.push(("m", "resolve/continue/abort cherry-pick"));
     }
 
     if diff_focused && !diff_view.is_empty() {

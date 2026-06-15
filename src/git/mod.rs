@@ -5,6 +5,7 @@ pub mod commit;
 pub mod diff;
 pub mod file;
 pub mod loader;
+pub mod merge_conflict;
 pub mod rebase;
 pub mod remote;
 pub mod staging;

@@ -27,6 +27,7 @@ pub struct ParsedDiff {
     pub hunk_line_offsets: Vec<(usize, usize, usize)>,
     pub sections: Vec<FileSection>,
     pub file_exists_on_disk: bool,
+    pub title_suffix: Option<String>,
 }
 
 /// Which panel of the side-by-side diff the selection is in.
@@ -301,6 +302,7 @@ pub struct DiffViewState {
     pub filename: String,
     pub old_content: String,
     pub new_content: String,
+    pub title_suffix: Option<String>,
     pub tab_width: usize,
     /// Per-file-section highlighters for multi-file diffs.
     sections: Vec<FileSection>,
@@ -353,6 +355,7 @@ impl Default for DiffViewState {
             filename: String::new(),
             old_content: String::new(),
             new_content: String::new(),
+            title_suffix: None,
             tab_width: 4,
             sections: Vec::new(),
             selection: None,
@@ -562,7 +565,45 @@ impl DiffViewState {
             hunk_line_offsets: Vec::new(),
             sections,
             file_exists_on_disk,
+            title_suffix: None,
         }
+    }
+
+    /// Parse a Git conflict preview into a ParsedDiff on any thread.
+    ///
+    /// The real filename is preserved so editor/open actions still target the
+    /// worktree path; conflict-stage context is shown as title metadata.
+    pub fn parse_conflict_preview(
+        filename: &str,
+        base: Option<&str>,
+        ours: &str,
+        theirs: &str,
+        tab_width: usize,
+        file_exists_on_disk: bool,
+        ours_deleted: bool,
+        theirs_deleted: bool,
+    ) -> ParsedDiff {
+        let mut parsed =
+            Self::parse_content(filename, ours, theirs, tab_width, file_exists_on_disk);
+        let base_note = if base.is_some() {
+            ", base available"
+        } else {
+            ", no base"
+        };
+        let ours_label = if ours_deleted {
+            "ours deleted".to_string()
+        } else {
+            "ours (stage 2)".to_string()
+        };
+        let theirs_label = if theirs_deleted {
+            "theirs deleted".to_string()
+        } else {
+            "theirs (stage 3)".to_string()
+        };
+        parsed.title_suffix = Some(format!(
+            "conflict: {ours_label} ↔ {theirs_label}{base_note}"
+        ));
+        parsed
     }
 
     /// Parse raw diff output into a ParsedDiff on any thread (no &self needed).
@@ -598,6 +639,7 @@ impl DiffViewState {
                 hunk_line_offsets,
                 sections,
                 file_exists_on_disk,
+                title_suffix: None,
             }
         } else {
             let file_count = file_diffs.len();
@@ -650,6 +692,7 @@ impl DiffViewState {
                 hunk_line_offsets,
                 sections,
                 file_exists_on_disk,
+                title_suffix: None,
             }
         }
     }
@@ -660,6 +703,7 @@ impl DiffViewState {
         let prev_selected_revert_hunk = self.selected_revert_hunk;
         let prev_hovered_revert_hunk = self.hovered_revert_hunk;
         self.filename = parsed.filename;
+        self.title_suffix = parsed.title_suffix;
         self.old_content = parsed.old_content;
         self.new_content = parsed.new_content;
         self.lines = parsed.lines;
@@ -695,6 +739,7 @@ impl DiffViewState {
         let prev_selected_revert_hunk = self.selected_revert_hunk;
         let prev_hovered_revert_hunk = self.hovered_revert_hunk;
         self.filename = filename.to_string();
+        self.title_suffix = None;
         self.old_content = old.to_string();
         self.new_content = new.to_string();
         self.lines = super::diff_algo::compute_side_by_side(old, new, self.tab_width);
@@ -745,6 +790,7 @@ impl DiffViewState {
             // bypassing Myers re-diff so multi-hunk content can't alias.
             let same_file = self.filename == actual_name;
             self.filename = actual_name.to_string();
+            self.title_suffix = None;
             self.old_content = old.clone();
             self.new_content = new.clone();
             self.lines = super::diff_algo::compute_side_by_side_from_unified_diff(
@@ -775,6 +821,7 @@ impl DiffViewState {
             let prev_selected_revert_hunk = self.selected_revert_hunk;
             let prev_hovered_revert_hunk = self.hovered_revert_hunk;
             self.filename = new_filename;
+            self.title_suffix = None;
             self.old_content = String::new();
             self.new_content = String::new();
             self.lines = Vec::new();
@@ -1176,10 +1223,15 @@ pub fn render_diff(
         DiffSideView::NewOnly => " [new] ",
         DiffSideView::Both => "",
     };
+    let title_suffix = state
+        .title_suffix
+        .as_ref()
+        .map(|suffix| format!(" — {suffix}"))
+        .unwrap_or_default();
     let title = if side_label.is_empty() {
-        format!(" {} ", state.filename)
+        format!(" {}{} ", state.filename, title_suffix)
     } else {
-        format!(" {}{} ", state.filename, side_label)
+        format!(" {}{}{} ", state.filename, side_label, title_suffix)
     };
 
     let mut block = Block::default()
@@ -2913,6 +2965,52 @@ mod tests {
         assert_eq!(
             state.line_chunk_panel_at_row(layout.inner_y + 1, &layout, DiffPanel::New),
             Some((0, 1, DiffPanel::New))
+        );
+    }
+
+    #[test]
+    fn conflict_preview_keeps_real_filename_and_labels_stages() {
+        let parsed = DiffViewState::parse_conflict_preview(
+            "file.txt",
+            Some("base\n"),
+            "ours\n",
+            "theirs\n",
+            4,
+            true,
+            false,
+            false,
+        );
+
+        assert_eq!(parsed.filename, "file.txt");
+        assert_eq!(
+            parsed.title_suffix.as_deref(),
+            Some("conflict: ours (stage 2) ↔ theirs (stage 3), base available")
+        );
+
+        let mut state = DiffViewState::new();
+        state.apply_parsed(parsed);
+        assert_eq!(
+            state.title_suffix.as_deref(),
+            Some("conflict: ours (stage 2) ↔ theirs (stage 3), base available")
+        );
+    }
+
+    #[test]
+    fn conflict_preview_labels_deleted_sides() {
+        let parsed = DiffViewState::parse_conflict_preview(
+            "file.txt",
+            Some("base\n"),
+            "",
+            "theirs\n",
+            4,
+            true,
+            true,
+            false,
+        );
+
+        assert_eq!(
+            parsed.title_suffix.as_deref(),
+            Some("conflict: ours deleted ↔ theirs (stage 3), base available")
         );
     }
 }

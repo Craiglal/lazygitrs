@@ -23,6 +23,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::config::keybindings::key_matches;
 use crate::config::{AppConfig, AppState};
+use crate::git::merge_conflict::ResolveChoice;
 use crate::git::{DEFAULT_COMMIT_LIMIT, GitCommands, MODEL_PART_COUNT, ModelPart};
 use crate::model::Model;
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode, build_file_tree};
@@ -1617,6 +1618,7 @@ impl Gui {
                     let name = file.name.clone();
                     let has_staged = file.has_staged_changes;
                     let has_unstaged = file.has_unstaged_changes;
+                    let has_conflicts = file.has_merge_conflicts;
                     let tracked = file.tracked;
                     drop(model);
 
@@ -1630,31 +1632,60 @@ impl Gui {
                         if gen_counter.load(Ordering::Relaxed) != generation {
                             return;
                         }
-                        let diff_result = if has_unstaged {
-                            git.diff_file(&name)
-                        } else if has_staged {
-                            git.diff_file_staged(&name)
-                        } else {
-                            Ok(String::new())
-                        };
-
                         let exists = git.repo_path().join(&name).exists();
-                        let payload = match diff_result {
-                            Ok(diff) if diff.is_empty() && !tracked => {
-                                match git.file_content(&name) {
-                                    Ok(content) if !content.is_empty() => {
-                                        DiffPayload::Parsed(DiffViewState::parse_content(
-                                            &name, "", &content, 4, exists,
-                                        ))
+                        let payload = if has_conflicts {
+                            match git.conflict_stages(&name) {
+                                Ok(stages) => {
+                                    let base =
+                                        stages.base.and_then(|bytes| String::from_utf8(bytes).ok());
+                                    let ours_deleted = stages.ours.is_none();
+                                    let theirs_deleted = stages.theirs.is_none();
+                                    let ours = stages.ours.unwrap_or_default();
+                                    let theirs = stages.theirs.unwrap_or_default();
+                                    match (String::from_utf8(ours), String::from_utf8(theirs)) {
+                                        (Ok(ours), Ok(theirs)) => DiffPayload::Parsed(
+                                            DiffViewState::parse_conflict_preview(
+                                                &name,
+                                                base.as_deref(),
+                                                &ours,
+                                                &theirs,
+                                                4,
+                                                exists,
+                                                ours_deleted,
+                                                theirs_deleted,
+                                            ),
+                                        ),
+                                        _ => DiffPayload::Empty,
                                     }
-                                    _ => DiffPayload::Empty,
                                 }
+                                Err(_) => DiffPayload::Empty,
                             }
-                            Ok(diff) if diff.is_empty() => DiffPayload::Empty,
-                            Ok(diff) => DiffPayload::Parsed(DiffViewState::parse_diff_output(
-                                &name, &diff, 4, exists,
-                            )),
-                            Err(_) => DiffPayload::Empty,
+                        } else {
+                            let diff_result = if has_unstaged {
+                                git.diff_file(&name)
+                            } else if has_staged {
+                                git.diff_file_staged(&name)
+                            } else {
+                                Ok(String::new())
+                            };
+
+                            match diff_result {
+                                Ok(diff) if diff.is_empty() && !tracked => {
+                                    match git.file_content(&name) {
+                                        Ok(content) if !content.is_empty() => {
+                                            DiffPayload::Parsed(DiffViewState::parse_content(
+                                                &name, "", &content, 4, exists,
+                                            ))
+                                        }
+                                        _ => DiffPayload::Empty,
+                                    }
+                                }
+                                Ok(diff) if diff.is_empty() => DiffPayload::Empty,
+                                Ok(diff) => DiffPayload::Parsed(DiffViewState::parse_diff_output(
+                                    &name, &diff, 4, exists,
+                                )),
+                                Err(_) => DiffPayload::Empty,
+                            }
                         };
                         let _ = tx.send(DiffResult {
                             generation,
@@ -2249,8 +2280,9 @@ impl Gui {
             let is_cherry_picking = model.is_cherry_picking;
             drop(model);
 
-            // If rebasing, re-enter the interactive rebase view
-            if is_rebasing {
+            // If a conflicted file is selected, show resolution actions even during rebase.
+            // Otherwise, rebasing keeps its existing shortcut back into the progress view.
+            if is_rebasing && self.selected_conflicted_file_name().is_none() {
                 if !self.rebase_mode.active {
                     self.rebase_mode.in_progress_dismissed = false;
                     self.sync_rebase_progress_view();
@@ -2258,8 +2290,8 @@ impl Gui {
                 return Ok(());
             }
 
-            if is_merging || is_cherry_picking {
-                return self.show_rebase_options_menu(false, is_merging, is_cherry_picking);
+            if is_rebasing || is_merging || is_cherry_picking {
+                return self.show_rebase_options_menu(is_rebasing, is_merging, is_cherry_picking);
             }
         }
 
@@ -4079,7 +4111,7 @@ impl Gui {
                 },
                 HelpEntry {
                     key: kb.universal.create_rebase_options_menu.clone(),
-                    description: "Rebase options".into(),
+                    description: "Rebase/merge/conflict options".into(),
                 },
                 HelpEntry {
                     key: kb.universal.create_patch_options_menu.clone(),
@@ -4760,6 +4792,96 @@ impl Gui {
         };
     }
 
+    fn selected_conflicted_file_name(&self) -> Option<String> {
+        if self.context_mgr.active() != ContextId::Files {
+            return None;
+        }
+        let file_idx = self.selected_file_index()?;
+        let model = self.model.lock().ok()?;
+        model
+            .files
+            .get(file_idx)
+            .filter(|file| file.has_merge_conflicts)
+            .map(|file| file.name.clone())
+    }
+
+    fn open_conflict_file_in_editor(&mut self, path: &str) -> Result<()> {
+        let abs_path_buf = self.git.repo_path().join(path);
+        if !abs_path_buf.exists() {
+            anyhow::bail!("file does not exist: {path}");
+        }
+        let abs_path = abs_path_buf.to_string_lossy().to_string();
+        let os = &self.config.user_config.os;
+        if !os.edit.is_empty() {
+            crate::config::user_config::OsConfig::run_template(&os.edit, &abs_path)?;
+        } else {
+            crate::os::platform::Platform::open_file(&abs_path)?;
+        }
+        Ok(())
+    }
+
+    fn show_conflict_resolution_menu(&mut self, path: String) -> Result<()> {
+        let resolve_item = |label: &str, key: &str, choice: ResolveChoice| {
+            let path = path.clone();
+            popup::MenuItem {
+                label: label.to_string(),
+                description: "write selected resolution, git add, and refresh".to_string(),
+                key: Some(key.to_string()),
+                action: Some(Box::new(move |gui| {
+                    gui.git.resolve_conflict(&path, choice)?;
+                    gui.needs_refresh = true;
+                    gui.needs_files_refresh = true;
+                    gui.needs_diff_refresh = true;
+                    Ok(())
+                })),
+            }
+        };
+
+        let editor_path = path.clone();
+        let mark_path = path.clone();
+        let items = vec![
+            resolve_item(
+                "Use ours (stage 2) and stage file",
+                "o",
+                ResolveChoice::Ours,
+            ),
+            resolve_item(
+                "Use theirs (stage 3) and stage file",
+                "t",
+                ResolveChoice::Theirs,
+            ),
+            resolve_item("Use both and stage file", "b", ResolveChoice::Both),
+            popup::MenuItem {
+                label: "Open in editor".to_string(),
+                description: "manual resolution in configured editor".to_string(),
+                key: Some("e".to_string()),
+                action: Some(Box::new(move |gui| {
+                    gui.open_conflict_file_in_editor(&editor_path)
+                })),
+            },
+            popup::MenuItem {
+                label: "Mark resolved and stage file".to_string(),
+                description: "git add only if conflict markers are gone".to_string(),
+                key: Some("s".to_string()),
+                action: Some(Box::new(move |gui| {
+                    gui.git.mark_conflict_resolved(&mark_path)?;
+                    gui.needs_refresh = true;
+                    gui.needs_files_refresh = true;
+                    gui.needs_diff_refresh = true;
+                    Ok(())
+                })),
+            },
+        ];
+
+        self.popup = PopupState::Menu {
+            title: format!("Resolve conflict: {path}"),
+            items,
+            selected: 0,
+            loading_index: None,
+        };
+        Ok(())
+    }
+
     fn show_rebase_options_menu(
         &mut self,
         is_rebasing: bool,
@@ -4767,6 +4889,17 @@ impl Gui {
         is_cherry_picking: bool,
     ) -> Result<()> {
         let mut items = Vec::new();
+
+        if let Some(path) = self.selected_conflicted_file_name() {
+            items.push(popup::MenuItem {
+                label: format!("Resolve selected conflict: {path}"),
+                description: "choose ours/theirs/both, edit manually, or mark resolved".to_string(),
+                key: Some("r".to_string()),
+                action: Some(Box::new(move |gui| {
+                    gui.show_conflict_resolution_menu(path.clone())
+                })),
+            });
+        }
 
         if is_rebasing {
             items.push(popup::MenuItem {
@@ -4802,6 +4935,23 @@ impl Gui {
         }
 
         if is_merging {
+            items.push(popup::MenuItem {
+                label: "Continue merge".to_string(),
+                description: "git merge --continue (requires all conflicts resolved)".to_string(),
+                key: Some("c".to_string()),
+                action: Some(Box::new(|gui| {
+                    let unresolved = gui.git.unmerged_paths()?;
+                    if !unresolved.is_empty() {
+                        anyhow::bail!(
+                            "cannot continue merge while conflicts remain: {}",
+                            unresolved.join(", ")
+                        );
+                    }
+                    gui.git.continue_merge()?;
+                    gui.needs_refresh = true;
+                    Ok(())
+                })),
+            });
             items.push(popup::MenuItem {
                 label: "Abort merge".to_string(),
                 description: "git merge --abort".to_string(),

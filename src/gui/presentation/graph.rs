@@ -386,19 +386,10 @@ mod tests {
     #[test]
     fn deferred_merge_connector_can_outlive_trimmed_lanes() {
         let commits = vec![
-            (
-                "7d56b93".into(),
-                vec!["3593f3e".into(), "9e68a4a".into()],
-            ),
-            (
-                "26802f6".into(),
-                vec!["26b6dcb".into(), "30b5037".into()],
-            ),
+            ("7d56b93".into(), vec!["3593f3e".into(), "9e68a4a".into()]),
+            ("26802f6".into(), vec!["26b6dcb".into(), "30b5037".into()]),
             ("26b6dcb".into(), vec!["9e91df9".into()]),
-            (
-                "a69e53d".into(),
-                vec!["90d4cf3".into(), "30b5037".into()],
-            ),
+            ("a69e53d".into(), vec!["90d4cf3".into(), "30b5037".into()]),
             ("30b5037".into(), vec!["d9892a4".into()]),
         ];
 
