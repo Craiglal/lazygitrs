@@ -331,8 +331,12 @@ pub struct DiffViewState {
     pub search_match_idx: usize,
     /// Textarea widget for search input.
     pub search_textarea: Option<tui_textarea::TextArea<'static>>,
+    /// Whether keyboard input is in modal change-block navigation/action mode.
+    pub block_mode_active: bool,
     /// Currently selected revert-button hunk index (for keyboard cycling).
     pub selected_revert_hunk: Option<usize>,
+    /// Hunk index that was just staged from block mode and should get transient feedback.
+    staged_feedback_hunk: Option<usize>,
     /// Hunk index currently under the mouse cursor (for tooltip rendering).
     pub hovered_revert_hunk: Option<usize>,
     /// Pre-revert file snapshots, most-recent last. Bounded by
@@ -369,7 +373,9 @@ impl Default for DiffViewState {
             search_matches: Vec::new(),
             search_match_idx: 0,
             search_textarea: None,
+            block_mode_active: false,
             selected_revert_hunk: None,
+            staged_feedback_hunk: None,
             hovered_revert_hunk: None,
             revert_undo_stack: Vec::new(),
             revert_undo_high_water: 0,
@@ -711,6 +717,7 @@ impl DiffViewState {
         self.hunk_line_offsets = parsed.hunk_line_offsets;
         self.sections = parsed.sections;
         self.file_exists_on_disk = parsed.file_exists_on_disk;
+        self.clear_staged_hunk_feedback();
         self.selected_revert_hunk = if same_file {
             prev_selected_revert_hunk.filter(|&i| i < self.hunk_starts.len())
         } else {
@@ -745,6 +752,7 @@ impl DiffViewState {
         self.lines = super::diff_algo::compute_side_by_side(old, new, self.tab_width);
         self.hunk_starts = super::diff_algo::find_hunk_starts(&self.lines);
         self.hunk_line_offsets = Vec::new(); // Full content — no offsets needed
+        self.clear_staged_hunk_feedback();
         if same_file {
             // Clamp scroll in case the diff got shorter
             let max = self.lines.len().saturating_sub(1);
@@ -1134,6 +1142,50 @@ impl DiffViewState {
         offsets
     }
 
+    /// Enter modal change-block mode and select the nearest visible block.
+    pub fn enter_block_mode(&mut self) {
+        self.block_mode_active = true;
+        self.cycle_next_revert_hunk();
+    }
+
+    /// Exit modal change-block mode and clear the block selection.
+    pub fn exit_block_mode(&mut self) {
+        self.block_mode_active = false;
+        self.selected_revert_hunk = None;
+        self.clear_staged_hunk_feedback();
+    }
+
+    /// Mark a hunk as just staged, giving the renderer a transient visual cue.
+    pub fn mark_hunk_staged_for_feedback(&mut self, hunk_idx: usize) {
+        self.staged_feedback_hunk = Some(hunk_idx);
+    }
+
+    pub fn is_hunk_staged_for_feedback(&self, hunk_idx: usize) -> bool {
+        self.staged_feedback_hunk == Some(hunk_idx)
+    }
+
+    pub fn is_line_staged_for_feedback(&self, line_idx: usize) -> bool {
+        let Some(hunk_idx) = self.hunk_index_containing_line(line_idx) else {
+            return false;
+        };
+        self.is_hunk_staged_for_feedback(hunk_idx)
+    }
+
+    fn hunk_index_containing_line(&self, line_idx: usize) -> Option<usize> {
+        if self.hunk_starts.is_empty() {
+            return None;
+        }
+        match self.hunk_starts.binary_search(&line_idx) {
+            Ok(idx) => Some(idx),
+            Err(0) => None,
+            Err(insert_idx) => Some(insert_idx - 1),
+        }
+    }
+
+    fn clear_staged_hunk_feedback(&mut self) {
+        self.staged_feedback_hunk = None;
+    }
+
     /// Jump to the next hunk and select it as the revert target. Always
     /// scrolls to the hunk's start line — same motion as `next_hunk` —
     /// even if it's already in the viewport. Wraps to the first hunk
@@ -1228,10 +1280,22 @@ pub fn render_diff(
         .as_ref()
         .map(|suffix| format!(" — {suffix}"))
         .unwrap_or_default();
-    let title = if side_label.is_empty() {
-        format!(" {}{} ", state.filename, title_suffix)
+    let mode_label = if state.block_mode_active {
+        if state.staged_feedback_hunk.is_some() {
+            "  BLOCK MODE: ✓ staged · j/k move · s stage · r revert · q/Esc exit"
+        } else {
+            "  BLOCK MODE: j/k move · s stage · r revert · q/Esc exit"
+        }
     } else {
-        format!(" {}{}{} ", state.filename, side_label, title_suffix)
+        ""
+    };
+    let title = if side_label.is_empty() {
+        format!(" {}{}{} ", state.filename, title_suffix, mode_label)
+    } else {
+        format!(
+            " {}{}{}{} ",
+            state.filename, side_label, title_suffix, mode_label
+        )
     };
 
     let mut block = Block::default()
@@ -1482,8 +1546,17 @@ pub fn render_diff(
                 .highlighters_for_section(diff_line.section_index)
                 .unwrap_or((&default_hl, &default_hl));
 
-            let (left_bg, right_bg) = line_bg_colors(diff_line.change_type, theme);
-            let (left_gutter_bg, right_gutter_bg) = gutter_bg_colors(diff_line.change_type, theme);
+            let (mut left_bg, mut right_bg) = line_bg_colors(diff_line.change_type, theme);
+            let (mut left_gutter_bg, mut right_gutter_bg) =
+                gutter_bg_colors(diff_line.change_type, theme);
+            if diff_line.change_type != ChangeType::Equal
+                && state.is_line_staged_for_feedback(line_idx)
+            {
+                left_bg = Color::Rgb(16, 64, 32);
+                right_bg = Color::Rgb(16, 64, 32);
+                left_gutter_bg = Color::Rgb(16, 64, 32);
+                right_gutter_bg = Color::Rgb(16, 64, 32);
+            }
             let (left_gutter_fg, right_gutter_fg) = gutter_fg_colors(diff_line.change_type, theme);
             let gutter_style = Style::default().fg(left_gutter_fg).bg(left_gutter_bg);
             let right_gutter_style = Style::default().fg(right_gutter_fg).bg(right_gutter_bg);
@@ -1607,16 +1680,21 @@ pub fn render_diff(
                         && marker_hunk_idx == state.hovered_revert_hunk;
                     let (divider_char, marker_style) = if show_marker {
                         let is_selected = marker_hunk_idx == state.selected_revert_hunk;
+                        let is_staged = marker_hunk_idx
+                            .is_some_and(|hunk_idx| state.is_hunk_staged_for_feedback(hunk_idx));
                         // Hover wins over selection so the hover state is always
                         // visible — even on a hunk that's currently selected.
-                        let fg = if marker_is_hovered {
+                        let fg = if is_staged {
+                            Color::Green
+                        } else if marker_is_hovered {
                             theme.accent_secondary
                         } else if is_selected {
                             theme.accent
                         } else {
                             theme.separator
                         };
-                        ("󰧛", Style::default().fg(fg).add_modifier(Modifier::BOLD))
+                        let glyph = if is_staged { "✓" } else { "󰧛" };
+                        (glyph, Style::default().fg(fg).add_modifier(Modifier::BOLD))
                     } else {
                         ("│", divider_style)
                     };
@@ -1716,14 +1794,19 @@ pub fn render_diff(
                     && marker_hunk_idx == state.hovered_revert_hunk;
                 let (divider_char, marker_style) = if show_marker {
                     let is_selected = marker_hunk_idx == state.selected_revert_hunk;
-                    let fg = if marker_is_hovered {
+                    let is_staged = marker_hunk_idx
+                        .is_some_and(|hunk_idx| state.is_hunk_staged_for_feedback(hunk_idx));
+                    let fg = if is_staged {
+                        Color::Green
+                    } else if marker_is_hovered {
                         theme.accent_secondary
                     } else if is_selected {
                         theme.accent
                     } else {
                         theme.separator
                     };
-                    ("󰧛", Style::default().fg(fg).add_modifier(Modifier::BOLD))
+                    let glyph = if is_staged { "✓" } else { "󰧛" };
+                    (glyph, Style::default().fg(fg).add_modifier(Modifier::BOLD))
                 } else {
                     ("│", divider_style)
                 };
@@ -1834,6 +1917,14 @@ fn render_unified_diff_body(
             None
         };
 
+        let staged_feedback_bg = if diff_line.change_type != ChangeType::Equal
+            && state.is_line_staged_for_feedback(line_idx)
+        {
+            Some(Color::Rgb(16, 64, 32))
+        } else {
+            None
+        };
+
         match diff_line.change_type {
             ChangeType::Equal => {
                 let old_num = state.file_line_number(line_idx, DiffPanel::Old);
@@ -1884,8 +1975,8 @@ fn render_unified_diff_body(
                         ChangeType::Delete,
                         true,
                         old_highlighter,
-                        theme.diff_remove_bg,
-                        theme.diff_remove_gutter_bg,
+                        staged_feedback_bg.unwrap_or(theme.diff_remove_bg),
+                        staged_feedback_bg.unwrap_or(theme.diff_remove_gutter_bg),
                         theme.diff_remove_gutter_fg,
                         content_width,
                         marker_hunk_idx.take(),
@@ -1912,8 +2003,8 @@ fn render_unified_diff_body(
                         ChangeType::Insert,
                         false,
                         new_highlighter,
-                        theme.diff_add_bg,
-                        theme.diff_add_gutter_bg,
+                        staged_feedback_bg.unwrap_or(theme.diff_add_bg),
+                        staged_feedback_bg.unwrap_or(theme.diff_add_gutter_bg),
                         theme.diff_add_gutter_fg,
                         content_width,
                         marker_hunk_idx.take(),
@@ -1940,8 +2031,8 @@ fn render_unified_diff_body(
                         ChangeType::Delete,
                         true,
                         old_highlighter,
-                        theme.diff_remove_bg,
-                        theme.diff_remove_gutter_bg,
+                        staged_feedback_bg.unwrap_or(theme.diff_remove_bg),
+                        staged_feedback_bg.unwrap_or(theme.diff_remove_gutter_bg),
                         theme.diff_remove_gutter_fg,
                         content_width,
                         marker_hunk_idx.take(),
@@ -1966,8 +2057,8 @@ fn render_unified_diff_body(
                         ChangeType::Insert,
                         false,
                         new_highlighter,
-                        theme.diff_add_bg,
-                        theme.diff_add_gutter_bg,
+                        staged_feedback_bg.unwrap_or(theme.diff_add_bg),
+                        staged_feedback_bg.unwrap_or(theme.diff_add_gutter_bg),
                         theme.diff_add_gutter_fg,
                         content_width,
                         marker_hunk_idx.take(),
@@ -2054,18 +2145,22 @@ fn render_unified_row(
             if let Some(hunk_idx) = marker_hunk_idx {
                 let is_hovered = Some(hunk_idx) == state.hovered_revert_hunk;
                 let is_selected = Some(hunk_idx) == state.selected_revert_hunk;
-                let fg = if is_hovered {
+                let is_staged = state.is_hunk_staged_for_feedback(hunk_idx);
+                let fg = if is_staged {
+                    Color::Green
+                } else if is_hovered {
                     theme.accent_secondary
                 } else if is_selected {
                     theme.accent
                 } else {
                     theme.separator
                 };
+                let glyph = if is_staged { "✓" } else { "󰧛" };
                 buf_write_str(
                     buf,
                     prefix_x,
                     y,
-                    "󰧛",
+                    glyph,
                     Style::default()
                         .fg(fg)
                         .bg(gutter_bg)
@@ -2993,6 +3088,57 @@ mod tests {
             state.title_suffix.as_deref(),
             Some("conflict: ours (stage 2) ↔ theirs (stage 3), base available")
         );
+    }
+
+    #[test]
+    fn block_mode_selects_nearest_change_block_and_exits_cleanly() {
+        let mut state = DiffViewState::new();
+        state.lines = vec![
+            diff_line(ChangeType::Equal),
+            diff_line(ChangeType::Insert),
+            diff_line(ChangeType::Equal),
+            diff_line(ChangeType::Delete),
+        ];
+        state.hunk_starts = vec![1, 3];
+        state.scroll_offset = 2;
+
+        assert!(!state.block_mode_active);
+
+        state.enter_block_mode();
+
+        assert!(state.block_mode_active);
+        assert_eq!(state.selected_revert_hunk, Some(1));
+        assert_eq!(state.scroll_offset, 3);
+
+        state.cycle_prev_revert_hunk();
+        assert_eq!(state.selected_revert_hunk, Some(0));
+        assert_eq!(state.scroll_offset, 1);
+
+        state.exit_block_mode();
+        assert!(!state.block_mode_active);
+        assert_eq!(state.selected_revert_hunk, None);
+    }
+
+    #[test]
+    fn block_mode_staged_feedback_is_transient() {
+        let mut state = DiffViewState::new();
+        state.hunk_starts = vec![1, 3];
+
+        assert!(!state.is_hunk_staged_for_feedback(1));
+
+        state.mark_hunk_staged_for_feedback(1);
+        assert!(state.is_hunk_staged_for_feedback(1));
+        assert!(!state.is_hunk_staged_for_feedback(0));
+        assert!(!state.is_line_staged_for_feedback(2));
+        assert!(state.is_line_staged_for_feedback(3));
+        assert!(state.is_line_staged_for_feedback(10));
+
+        state.exit_block_mode();
+        assert!(!state.is_hunk_staged_for_feedback(1));
+
+        state.mark_hunk_staged_for_feedback(0);
+        state.reset_keep_prefs();
+        assert!(!state.is_hunk_staged_for_feedback(0));
     }
 
     #[test]

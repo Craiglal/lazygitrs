@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::{AppConfig, Theme};
 use crate::git::GitCommands;
+use crate::git::merge_conflict::ResolveChoice;
 use crate::model::Model;
 use crate::model::commit::{Commit, CommitStat};
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode};
@@ -98,7 +99,12 @@ pub fn render(
         if diff_focused {
             // Diff is focused: show diff fullscreen
             if !diff_view.is_empty() {
-                let show_revert_markers = ctx_mgr.active() == ContextId::Files;
+                let show_revert_markers = selected_file_has_unstaged_changes(
+                    model,
+                    ctx_mgr,
+                    show_file_tree,
+                    file_tree_nodes,
+                ) && !diff_view.hunk_starts.is_empty();
                 side_by_side::render_diff(
                     frame,
                     fl.main_panel,
@@ -384,6 +390,8 @@ pub fn render(
             theme,
             model,
             diff_focused,
+            selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
+                && !diff_view.hunk_starts.is_empty(),
         );
         // Render text selection highlight overlay and tooltip (must be before popup)
         render_selection_overlay(frame, diff_view, fl.main_panel, theme);
@@ -938,7 +946,9 @@ pub fn render(
                 .border_style(theme.active_border);
             render_status_main(frame, fl.main_panel, model, config, theme, status_block);
         } else if !diff_view.is_empty() {
-            let show_revert_markers = ctx_mgr.active() == ContextId::Files;
+            let show_revert_markers =
+                selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
+                    && !diff_view.hunk_starts.is_empty();
             side_by_side::render_diff(
                 frame,
                 fl.main_panel,
@@ -1060,6 +1070,8 @@ pub fn render(
             theme,
             model,
             diff_focused,
+            selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
+                && !diff_view.hunk_starts.is_empty(),
         );
     }
 
@@ -1179,26 +1191,6 @@ fn command_log_geometry(main_panel: Rect, command_count: usize) -> Option<(Rect,
         Rect::new(log_x, log_y, log_width, log_height + 2),
         log_height,
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::command_log_geometry;
-    use ratatui::layout::Rect;
-
-    #[test]
-    fn command_log_is_hidden_when_main_panel_is_absent() {
-        assert_eq!(command_log_geometry(Rect::default(), 1), None);
-    }
-
-    #[test]
-    fn command_log_visible_lines_are_clamped_to_short_main_panel() {
-        let (rect, visible_lines) =
-            command_log_geometry(Rect::new(10, 4, 80, 2), 5).expect("log should fit");
-
-        assert_eq!(visible_lines, 1);
-        assert_eq!(rect, Rect::new(40, 4, 50, 3));
-    }
 }
 
 /// Build a window title like " 4 Commit Files (abc1234 feat: some change) ".
@@ -1619,6 +1611,28 @@ fn render_list_with_range_ctx(
     ctx_mgr.set_scroll_offset(ctx, so);
 }
 
+fn selected_file_has_unstaged_changes(
+    model: &Model,
+    ctx_mgr: &ContextManager,
+    show_file_tree: bool,
+    file_tree_nodes: &[FileTreeNode],
+) -> bool {
+    if ctx_mgr.active() != ContextId::Files {
+        return false;
+    }
+    let selected = ctx_mgr.selected_active();
+    let file_idx = if show_file_tree {
+        file_tree_nodes
+            .get(selected)
+            .and_then(|node| node.file_index)
+    } else {
+        Some(selected)
+    };
+    file_idx
+        .and_then(|idx| model.files.get(idx))
+        .is_some_and(|file| file.has_unstaged_changes)
+}
+
 fn render_list_with_range_raw(
     frame: &mut Frame,
     rect: Rect,
@@ -1798,6 +1812,7 @@ fn render_status_bar(
     _theme: &crate::config::Theme,
     model: &Model,
     diff_focused: bool,
+    diff_block_actions_available: bool,
 ) {
     let mut hints: Vec<(&str, &str)> = Vec::new();
     let mut emphasized: Vec<&str> = Vec::new();
@@ -1817,18 +1832,32 @@ fn render_status_bar(
         // enter right next to its cycle keys. enter itself only appears when a
         // hunk is actually selected (pressing it otherwise is a no-op).
         if ctx_mgr.active() == ContextId::Files {
-            let has_selection = diff_view.selected_revert_hunk.is_some();
-            let has_undo = !diff_view.revert_undo_stack.is_empty();
-            let mut idx = 0;
-            if has_selection {
-                hints.insert(idx, ("enter", "hunk menu"));
-                emphasized.push("enter");
-                idx += 1;
-            }
-            hints.insert(idx, ("{/}", "cycle hunks"));
-            idx += 1;
-            if has_undo {
-                hints.insert(idx, ("u", "undo revert"));
+            if diff_view.block_mode_active && diff_block_actions_available {
+                hints.insert(0, ("s", "stage block"));
+                hints.insert(1, ("r", "revert block"));
+                hints.insert(2, ("j/k", "move block"));
+                hints.insert(3, ("q/esc", "exit block mode"));
+                emphasized.extend(["s", "r"]);
+            } else {
+                let has_selection = diff_view.selected_revert_hunk.is_some();
+                let has_undo = !diff_view.revert_undo_stack.is_empty();
+                let mut idx = 0;
+                if diff_block_actions_available {
+                    hints.insert(idx, ("B", "block mode"));
+                    idx += 1;
+                }
+                if has_selection && diff_block_actions_available {
+                    hints.insert(idx, ("enter", "hunk menu"));
+                    emphasized.push("enter");
+                    idx += 1;
+                }
+                if diff_block_actions_available {
+                    hints.insert(idx, ("{/}", "cycle hunks"));
+                    idx += 1;
+                }
+                if has_undo {
+                    hints.insert(idx, ("u", "undo revert"));
+                }
             }
         } else {
             hints.push(("{/}", "prev/next hunk"));
@@ -2314,6 +2343,72 @@ pub fn render_loading_overlay(
 
     let widget = Paragraph::new(text).block(block);
     frame.render_widget(widget, popup_rect);
+}
+
+fn conflict_choice_label(choice: Option<ResolveChoice>) -> &'static str {
+    match choice {
+        Some(ResolveChoice::Ours) => "ours",
+        Some(ResolveChoice::Theirs) => "theirs",
+        Some(ResolveChoice::Both) => "both",
+        None => "unresolved",
+    }
+}
+
+fn one_line_preview(text: &str) -> String {
+    let preview = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if preview.is_empty() {
+        "∅".to_string()
+    } else if preview.chars().count() > 28 {
+        format!("{}…", preview.chars().take(27).collect::<String>())
+    } else {
+        preview.to_string()
+    }
+}
+
+fn push_conflict_section(
+    lines: &mut Vec<Line>,
+    title: &str,
+    text: &str,
+    style: Style,
+    width: usize,
+    max_lines: usize,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        style.add_modifier(Modifier::BOLD),
+    )));
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled("  ∅", style)));
+        return;
+    }
+
+    let wrap_width = width.saturating_sub(4).max(12);
+    let mut emitted = 0usize;
+    for raw in text.lines() {
+        let wrapped = textwrap::wrap(raw, wrap_width);
+        if wrapped.is_empty() {
+            lines.push(Line::from(""));
+            emitted += 1;
+        } else {
+            for wrapped_line in wrapped {
+                if emitted >= max_lines {
+                    lines.push(Line::from(Span::styled("  …", style)));
+                    return;
+                }
+                lines.push(Line::from(Span::styled(format!("  {wrapped_line}"), style)));
+                emitted += 1;
+            }
+        }
+        if emitted >= max_lines {
+            lines.push(Line::from(Span::styled("  …", style)));
+            return;
+        }
+    }
 }
 
 pub fn render_popup(
@@ -2840,6 +2935,162 @@ pub fn render_popup(
                 let hint = Line::from(hint_spans);
                 frame.render_widget(Paragraph::new(hint), hint_area);
             }
+        }
+        PopupState::ConflictBlocks {
+            path,
+            blocks,
+            choices,
+            selected,
+            scroll_offset,
+        } => {
+            if area.width < 8 || area.height < 8 {
+                return;
+            }
+            let popup_width = (area.width * 90 / 100).max(50).min(120).min(area.width);
+            let popup_height = (area.height * 85 / 100).max(14).min(area.height);
+            let x = (area.width.saturating_sub(popup_width)) / 2;
+            let y = (area.height.saturating_sub(popup_height)) / 2;
+            let popup_rect = Rect::new(x, y, popup_width, popup_height);
+            frame.render_widget(Clear, popup_rect);
+            let block = Block::default()
+                .title(format!(" Resolve conflict blocks: {path} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.accent));
+            frame.render_widget(block, popup_rect);
+
+            let inner = popup_rect.inner(ratatui::layout::Margin {
+                horizontal: 1,
+                vertical: 1,
+            });
+            if inner.height < 6 {
+                return;
+            }
+
+            let list_height = blocks.len().min(5).max(1) as u16;
+            let list_area = Rect::new(inner.x, inner.y, inner.width, list_height);
+            let visible: Vec<(usize, &crate::git::merge_conflict::TextConflictBlock)> = blocks
+                .iter()
+                .enumerate()
+                .skip(*scroll_offset)
+                .take(list_height as usize)
+                .collect();
+            let list_items: Vec<ListItem> = visible
+                .iter()
+                .map(|(idx, block)| {
+                    let choice = choices.get(*idx).copied().flatten();
+                    let marker = if *idx == *selected { "▶" } else { " " };
+                    let line = format!(
+                        " {marker} block {}  [{}]  ours: {}  theirs: {}",
+                        idx + 1,
+                        conflict_choice_label(choice),
+                        one_line_preview(&block.ours),
+                        one_line_preview(&block.theirs)
+                    );
+                    let style = if *idx == *selected {
+                        Style::default().bg(theme.selected_bg).fg(theme.text_strong)
+                    } else {
+                        Style::default().fg(theme.text)
+                    };
+                    ListItem::new(Line::from(Span::styled(line, style)))
+                })
+                .collect();
+            frame.render_widget(List::new(list_items), list_area);
+
+            let sep_y = list_area.y + list_area.height;
+            if sep_y < inner.y + inner.height {
+                let sep = "─".repeat(inner.width as usize);
+                frame.render_widget(
+                    Paragraph::new(Span::styled(sep, Style::default().fg(theme.text_dimmed))),
+                    Rect::new(inner.x, sep_y, inner.width, 1),
+                );
+            }
+
+            if let Some(block) = blocks.get(*selected) {
+                let mut lines: Vec<Line> = Vec::new();
+                let selected_choice = choices.get(*selected).copied().flatten();
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("Block {} / {}", *selected + 1, blocks.len()),
+                        Style::default()
+                            .fg(theme.accent_secondary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("result: {}", conflict_choice_label(selected_choice)),
+                        Style::default().fg(theme.text_strong),
+                    ),
+                ]));
+                push_conflict_section(
+                    &mut lines,
+                    "BASE",
+                    block.base.as_deref().unwrap_or(""),
+                    Style::default().fg(theme.text_dimmed),
+                    inner.width as usize,
+                    4,
+                );
+                push_conflict_section(
+                    &mut lines,
+                    "OURS (stage 2)",
+                    &block.ours,
+                    Style::default().fg(Color::Green),
+                    inner.width as usize,
+                    5,
+                );
+                push_conflict_section(
+                    &mut lines,
+                    "THEIRS (stage 3)",
+                    &block.theirs,
+                    Style::default().fg(Color::Blue),
+                    inner.width as usize,
+                    5,
+                );
+                let result_preview = match selected_choice {
+                    Some(ResolveChoice::Ours) => block.ours.clone(),
+                    Some(ResolveChoice::Theirs) => block.theirs.clone(),
+                    Some(ResolveChoice::Both) => format!("{}{}", block.ours, block.theirs),
+                    None => "choose o/t/b".to_string(),
+                };
+                push_conflict_section(
+                    &mut lines,
+                    "RESULT PREVIEW",
+                    &result_preview,
+                    Style::default().fg(theme.accent_secondary),
+                    inner.width as usize,
+                    5,
+                );
+
+                let detail_y = sep_y.saturating_add(1);
+                let hint_height = 1;
+                let detail_height = inner
+                    .y
+                    .saturating_add(inner.height)
+                    .saturating_sub(detail_y)
+                    .saturating_sub(hint_height);
+                if detail_height > 0 {
+                    frame.render_widget(
+                        Paragraph::new(lines),
+                        Rect::new(inner.x, detail_y, inner.width, detail_height),
+                    );
+                }
+            }
+
+            let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+            let hint = Line::from(vec![
+                Span::styled(" j/k", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": block  ", Style::default().fg(theme.text_dimmed)),
+                Span::styled("o", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": ours  ", Style::default().fg(theme.text_dimmed)),
+                Span::styled("t", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": theirs  ", Style::default().fg(theme.text_dimmed)),
+                Span::styled("b", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": both  ", Style::default().fg(theme.text_dimmed)),
+                Span::styled("enter", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": save+stage  ", Style::default().fg(theme.text_dimmed)),
+                Span::styled("esc", Style::default().fg(theme.accent_secondary)),
+                Span::styled(": cancel", Style::default().fg(theme.text_dimmed)),
+            ]);
+            frame.render_widget(Paragraph::new(hint), hint_area);
         }
         PopupState::Help {
             sections,
@@ -3500,4 +3751,61 @@ fn lookup_or_fetch_message(
         }
     });
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::merge_conflict::TextConflictBlock;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn command_log_is_hidden_when_main_panel_is_absent() {
+        assert_eq!(command_log_geometry(Rect::default(), 1), None);
+    }
+
+    #[test]
+    fn command_log_visible_lines_are_clamped_to_short_main_panel() {
+        let (rect, visible_lines) =
+            command_log_geometry(Rect::new(10, 4, 80, 2), 5).expect("log should fit");
+
+        assert_eq!(visible_lines, 1);
+        assert_eq!(rect, Rect::new(40, 4, 50, 3));
+    }
+
+    #[test]
+    fn conflict_blocks_popup_does_not_panic_on_short_terminal() {
+        let popup = PopupState::ConflictBlocks {
+            path: "file.txt".to_string(),
+            blocks: vec![TextConflictBlock {
+                index: 0,
+                context_before: String::new(),
+                base: Some("base\n".to_string()),
+                ours: "ours\n".to_string(),
+                theirs: "theirs\n".to_string(),
+                context_after: String::new(),
+            }],
+            choices: vec![None],
+            selected: 0,
+            scroll_offset: 0,
+        };
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_popup(
+                    frame,
+                    &popup,
+                    Rect::new(0, 0, 80, 10),
+                    0,
+                    &Theme::default(),
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+    }
 }

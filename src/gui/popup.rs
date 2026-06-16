@@ -1,6 +1,8 @@
 use anyhow::Result;
 use tui_textarea::{CursorMove, TextArea};
 
+use crate::git::merge_conflict::{ResolveChoice, TextConflictBlock};
+
 use super::Gui;
 
 fn is_word_char(c: char) -> bool {
@@ -509,6 +511,14 @@ pub enum PopupState {
         selected: usize,
         search: String,
         on_confirm: ChecklistAction,
+    },
+    /// Native conflict block resolver with diff3-style block preview.
+    ConflictBlocks {
+        path: String,
+        blocks: Vec<TextConflictBlock>,
+        choices: Vec<Option<ResolveChoice>>,
+        selected: usize,
+        scroll_offset: usize,
     },
     /// Keybinding help overlay with integrated search.
     Help {

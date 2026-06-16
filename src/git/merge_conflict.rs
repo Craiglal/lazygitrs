@@ -19,6 +19,35 @@ pub enum ResolveChoice {
     Both,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextConflictBlock {
+    pub index: usize,
+    /// Unchanged lines immediately before the changed region, for display only.
+    pub context_before: String,
+    pub base: Option<String>,
+    pub ours: String,
+    pub theirs: String,
+    /// Unchanged lines immediately after the changed region, for display only.
+    pub context_after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TextConflictSegment {
+    Context(String),
+    Conflict(TextConflictBlock),
+}
+
+const CONFLICT_DISPLAY_CONTEXT_LINES: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StageTextRegions {
+    prefix: String,
+    base: Option<String>,
+    ours: String,
+    theirs: String,
+    suffix: String,
+}
+
 impl GitCommands {
     pub fn conflict_stages(&self, path: &str) -> Result<ConflictStageContent> {
         let stages = self.unmerged_stages_for_path(path)?;
@@ -91,6 +120,30 @@ impl GitCommands {
         }
     }
 
+    pub fn conflict_blocks(&self, path: &str) -> Result<Vec<TextConflictBlock>> {
+        if let Ok(contents) = std::fs::read_to_string(self.repo_path().join(path)) {
+            let blocks = parse_text_conflict_blocks(&contents)?;
+            if !blocks.is_empty() {
+                return Ok(blocks);
+            }
+        }
+
+        Ok(vec![self.stage_conflict_block(path)?])
+    }
+
+    pub fn resolve_conflict_blocks(&self, path: &str, choices: &[ResolveChoice]) -> Result<()> {
+        let contents = std::fs::read_to_string(self.repo_path().join(path))
+            .with_context(|| format!("failed to read conflicted file {path}"))?;
+        let blocks = parse_text_conflict_blocks(&contents)?;
+        if blocks.is_empty() {
+            return self.resolve_stage_conflict_block(path, choices);
+        }
+
+        let resolved = resolve_text_conflict_blocks(&contents, choices)?;
+        self.write_worktree_file(path, resolved.as_bytes())?;
+        self.mark_conflict_resolved(path)
+    }
+
     pub fn mark_conflict_resolved(&self, path: &str) -> Result<()> {
         let full_path = self.repo_path().join(path);
         if let Ok(contents) = std::fs::read_to_string(&full_path)
@@ -141,6 +194,41 @@ impl GitCommands {
         Ok(output.stdout)
     }
 
+    fn stage_conflict_block(&self, path: &str) -> Result<TextConflictBlock> {
+        let stages = self.conflict_stages(path)?;
+        let stage_text = stage_text_regions(stages)
+            .with_context(|| format!("failed to build stage-backed conflict block for {path}"))?;
+        if stage_text.ours.is_empty() && stage_text.theirs.is_empty() {
+            bail!("no text conflict content found for {path}");
+        }
+
+        Ok(TextConflictBlock {
+            index: 0,
+            context_before: tail_lines(&stage_text.prefix, CONFLICT_DISPLAY_CONTEXT_LINES),
+            base: stage_text.base,
+            ours: stage_text.ours,
+            theirs: stage_text.theirs,
+            context_after: head_lines(&stage_text.suffix, CONFLICT_DISPLAY_CONTEXT_LINES),
+        })
+    }
+
+    fn resolve_stage_conflict_block(&self, path: &str, choices: &[ResolveChoice]) -> Result<()> {
+        let [choice] = choices else {
+            bail!("choice count mismatch: got {}, expected 1", choices.len());
+        };
+
+        match choice {
+            ResolveChoice::Ours => self.resolve_conflict(path, ResolveChoice::Ours),
+            ResolveChoice::Theirs => self.resolve_conflict(path, ResolveChoice::Theirs),
+            ResolveChoice::Both => {
+                let stages = self.conflict_stages(path)?;
+                let resolved = resolve_stage_text_regions(stages)?;
+                self.write_worktree_file(path, resolved.as_bytes())?;
+                self.mark_conflict_resolved(path)
+            }
+        }
+    }
+
     fn materialize_resolution_stage(
         &self,
         path: &str,
@@ -185,6 +273,89 @@ fn parse_unmerged_stage(line: &str) -> Option<u8> {
     meta.split_whitespace().nth(2)?.parse().ok()
 }
 
+fn stage_text_regions(stages: ConflictStageContent) -> Result<StageTextRegions> {
+    let base = stages
+        .base
+        .map(String::from_utf8)
+        .transpose()
+        .context("base stage is not UTF-8 text")?;
+    let ours = stages
+        .ours
+        .map(String::from_utf8)
+        .transpose()
+        .context("ours stage is not UTF-8 text")?
+        .unwrap_or_default();
+    let theirs = stages
+        .theirs
+        .map(String::from_utf8)
+        .transpose()
+        .context("theirs stage is not UTF-8 text")?
+        .unwrap_or_default();
+
+    Ok(match base {
+        Some(base) if !ours.is_empty() && !theirs.is_empty() => {
+            split_stage_text_regions(&base, &ours, &theirs)
+        }
+        base => StageTextRegions {
+            prefix: String::new(),
+            base,
+            ours,
+            theirs,
+            suffix: String::new(),
+        },
+    })
+}
+
+fn resolve_stage_text_regions(stages: ConflictStageContent) -> Result<String> {
+    let regions = stage_text_regions(stages)?;
+    let mut resolved = String::new();
+    resolved.push_str(&regions.prefix);
+    resolved.push_str(&regions.ours);
+    resolved.push_str(&regions.theirs);
+    resolved.push_str(&regions.suffix);
+    Ok(resolved)
+}
+
+fn split_stage_text_regions(base: &str, ours: &str, theirs: &str) -> StageTextRegions {
+    let base_lines = split_inclusive_lines(base);
+    let ours_lines = split_inclusive_lines(ours);
+    let theirs_lines = split_inclusive_lines(theirs);
+
+    let min_len = base_lines
+        .len()
+        .min(ours_lines.len())
+        .min(theirs_lines.len());
+    let mut prefix_len = 0;
+    while prefix_len < min_len
+        && base_lines[prefix_len] == ours_lines[prefix_len]
+        && base_lines[prefix_len] == theirs_lines[prefix_len]
+    {
+        prefix_len += 1;
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < min_len.saturating_sub(prefix_len)
+        && base_lines[base_lines.len() - 1 - suffix_len]
+            == ours_lines[ours_lines.len() - 1 - suffix_len]
+        && base_lines[base_lines.len() - 1 - suffix_len]
+            == theirs_lines[theirs_lines.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let base_mid_end = base_lines.len().saturating_sub(suffix_len);
+    let ours_mid_end = ours_lines.len().saturating_sub(suffix_len);
+    let theirs_mid_end = theirs_lines.len().saturating_sub(suffix_len);
+
+    StageTextRegions {
+        prefix: base_lines[..prefix_len].concat(),
+        base: Some(base_lines[prefix_len..base_mid_end].concat()),
+        ours: ours_lines[prefix_len..ours_mid_end].concat(),
+        theirs: theirs_lines[prefix_len..theirs_mid_end].concat(),
+        suffix: base_lines[base_mid_end..].concat(),
+    }
+}
+
 fn contains_conflict_markers(contents: &str) -> bool {
     contents.lines().any(|line| {
         line.starts_with("<<<<<<<")
@@ -194,23 +365,112 @@ fn contains_conflict_markers(contents: &str) -> bool {
     })
 }
 
-fn resolve_markers_with_both(contents: &str) -> Result<String> {
+fn blocks_with_display_context(segments: &[TextConflictSegment]) -> Vec<TextConflictBlock> {
+    segments
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, segment)| match segment {
+            TextConflictSegment::Context(_) => None,
+            TextConflictSegment::Conflict(block) => {
+                let context_before = match idx.checked_sub(1).and_then(|prev| segments.get(prev)) {
+                    Some(TextConflictSegment::Context(context)) => {
+                        tail_lines(context, CONFLICT_DISPLAY_CONTEXT_LINES)
+                    }
+                    _ => String::new(),
+                };
+                let context_after = match segments.get(idx + 1) {
+                    Some(TextConflictSegment::Context(context)) => {
+                        head_lines(context, CONFLICT_DISPLAY_CONTEXT_LINES)
+                    }
+                    _ => String::new(),
+                };
+                let mut block = block.clone();
+                block.context_before = context_before;
+                block.context_after = context_after;
+                Some(block)
+            }
+        })
+        .collect()
+}
+
+fn head_lines(contents: &str, limit: usize) -> String {
+    split_inclusive_lines(contents)
+        .into_iter()
+        .take(limit)
+        .collect()
+}
+
+fn tail_lines(contents: &str, limit: usize) -> String {
     let lines = split_inclusive_lines(contents);
+    let start = lines.len().saturating_sub(limit);
+    lines.into_iter().skip(start).collect()
+}
+
+pub fn parse_text_conflict_blocks(contents: &str) -> Result<Vec<TextConflictBlock>> {
+    let segments = parse_text_conflict_segments(contents)?;
+    Ok(blocks_with_display_context(&segments))
+}
+
+pub fn resolve_text_conflict_blocks(contents: &str, choices: &[ResolveChoice]) -> Result<String> {
+    let segments = parse_text_conflict_segments(contents)?;
+    let block_count = segments
+        .iter()
+        .filter(|segment| matches!(segment, TextConflictSegment::Conflict(_)))
+        .count();
+    if block_count == 0 {
+        bail!("no conflict markers found");
+    }
+    if choices.len() != block_count {
+        bail!(
+            "choice count mismatch: got {}, expected {block_count}",
+            choices.len()
+        );
+    }
+
     let mut output = String::new();
+    let mut choice_idx = 0;
+    for segment in segments {
+        match segment {
+            TextConflictSegment::Context(context) => output.push_str(&context),
+            TextConflictSegment::Conflict(block) => {
+                match choices[choice_idx] {
+                    ResolveChoice::Ours => output.push_str(&block.ours),
+                    ResolveChoice::Theirs => output.push_str(&block.theirs),
+                    ResolveChoice::Both => {
+                        output.push_str(&block.ours);
+                        output.push_str(&block.theirs);
+                    }
+                }
+                choice_idx += 1;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn parse_text_conflict_segments(contents: &str) -> Result<Vec<TextConflictSegment>> {
+    let lines = split_inclusive_lines(contents);
+    let mut segments = Vec::new();
+    let mut context = String::new();
     let mut index = 0;
-    let mut resolved_any = false;
+    let mut block_index = 0;
 
     while index < lines.len() {
         let line = lines[index];
         if !line.starts_with("<<<<<<<") {
-            output.push_str(line);
+            context.push_str(line);
             index += 1;
             continue;
         }
 
-        resolved_any = true;
+        if !context.is_empty() {
+            segments.push(TextConflictSegment::Context(std::mem::take(&mut context)));
+        }
+
         index += 1;
         let mut ours = String::new();
+        let mut base: Option<String> = None;
         let mut theirs = String::new();
         let mut saw_separator = false;
         let mut saw_end = false;
@@ -219,12 +479,15 @@ fn resolve_markers_with_both(contents: &str) -> Result<String> {
             let line = lines[index];
             if line.starts_with("|||||||") {
                 index += 1;
+                let mut base_content = String::new();
                 while index < lines.len() && !lines[index].starts_with("=======") {
                     if lines[index].starts_with("<<<<<<<") || lines[index].starts_with(">>>>>>>") {
                         bail!("malformed conflict markers");
                     }
+                    base_content.push_str(lines[index]);
                     index += 1;
                 }
+                base = Some(base_content);
                 continue;
             }
             if line.starts_with("=======") {
@@ -264,15 +527,27 @@ fn resolve_markers_with_both(contents: &str) -> Result<String> {
             bail!("malformed conflict markers");
         }
 
-        output.push_str(&ours);
-        output.push_str(&theirs);
+        segments.push(TextConflictSegment::Conflict(TextConflictBlock {
+            index: block_index,
+            context_before: String::new(),
+            base,
+            ours,
+            theirs,
+            context_after: String::new(),
+        }));
+        block_index += 1;
     }
 
-    if !resolved_any {
-        bail!("no conflict markers found");
+    if !context.is_empty() {
+        segments.push(TextConflictSegment::Context(context));
     }
 
-    Ok(output)
+    Ok(segments)
+}
+
+fn resolve_markers_with_both(contents: &str) -> Result<String> {
+    let block_count = parse_text_conflict_blocks(contents)?.len();
+    resolve_text_conflict_blocks(contents, &vec![ResolveChoice::Both; block_count])
 }
 
 fn split_inclusive_lines(contents: &str) -> Vec<&str> {
@@ -317,6 +592,27 @@ mod tests {
             run_git(&root, &["checkout", &initial_branch]);
             fs::write(root.join("file.txt"), "before\ncurrent\nafter\n").unwrap();
             run_git(&root, &["commit", "-am", "current change"]);
+            assert_conflicting_merge(&root, "incoming");
+
+            Self { root }
+        }
+
+        fn with_two_text_conflicts() -> Self {
+            let root = unique_temp_dir("merge-multi-conflict");
+            init_repo(&root);
+
+            fs::write(root.join("file.txt"), "a\nbase1\nb\nbase2\nc\n").unwrap();
+            run_git(&root, &["add", "file.txt"]);
+            run_git(&root, &["commit", "-m", "initial"]);
+            let initial_branch = current_branch(&root);
+
+            run_git(&root, &["checkout", "-b", "incoming"]);
+            fs::write(root.join("file.txt"), "a\nincoming1\nb\nincoming2\nc\n").unwrap();
+            run_git(&root, &["commit", "-am", "incoming changes"]);
+
+            run_git(&root, &["checkout", &initial_branch]);
+            fs::write(root.join("file.txt"), "a\ncurrent1\nb\ncurrent2\nc\n").unwrap();
+            run_git(&root, &["commit", "-am", "current changes"]);
             assert_conflicting_merge(&root, "incoming");
 
             Self { root }
@@ -453,6 +749,111 @@ mod tests {
 
         assert_eq!(repo.file_text(), "before\ncurrent\nincoming\nafter\n");
         assert!(!repo.file_text().contains("<<<<<<<"));
+        assert!(!repo.git().has_unmerged_entries("file.txt").unwrap());
+    }
+
+    #[test]
+    fn parses_diff3_conflict_blocks_with_base_sections() {
+        let blocks = super::parse_text_conflict_blocks(
+            "start\n<<<<<<< ours\ncurrent\n||||||| base\nbase\n=======\nincoming\n>>>>>>> theirs\nend\n",
+        )
+        .unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].ours, "current\n");
+        assert_eq!(blocks[0].base.as_deref(), Some("base\n"));
+        assert_eq!(blocks[0].theirs, "incoming\n");
+    }
+
+    #[test]
+    fn conflict_blocks_include_nearby_context_for_display() {
+        let blocks = super::parse_text_conflict_blocks(
+            "keep-1\nkeep-2\nkeep-3\nkeep-4\n<<<<<<< ours\ncurrent\n=======\nincoming\n>>>>>>> theirs\nafter-1\nafter-2\nafter-3\nafter-4\n",
+        )
+        .unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].context_before, "keep-2\nkeep-3\nkeep-4\n");
+        assert_eq!(blocks[0].context_after, "after-1\nafter-2\nafter-3\n");
+    }
+
+    #[test]
+    fn resolves_conflict_blocks_with_independent_choices() {
+        let resolved = super::resolve_text_conflict_blocks(
+            "a\n<<<<<<< ours\no1\n=======\nt1\n>>>>>>> theirs\nb\n<<<<<<< ours\no2\n=======\nt2\n>>>>>>> theirs\nc\n",
+            &[ResolveChoice::Theirs, ResolveChoice::Both],
+        )
+        .unwrap();
+
+        assert_eq!(resolved, "a\nt1\nb\no2\nt2\nc\n");
+    }
+
+    #[test]
+    fn per_block_resolution_rejects_choice_count_mismatch() {
+        let err = super::resolve_text_conflict_blocks(
+            "<<<<<<< ours\no\n=======\nt\n>>>>>>> theirs\n",
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("choice count"));
+    }
+
+    #[test]
+    fn resolves_real_file_with_per_block_choices() {
+        let repo = TestRepo::with_two_text_conflicts();
+        let blocks = super::parse_text_conflict_blocks(&repo.file_text()).unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        repo.git()
+            .resolve_conflict_blocks("file.txt", &[ResolveChoice::Theirs, ResolveChoice::Both])
+            .unwrap();
+
+        assert_eq!(
+            repo.file_text(),
+            "a\nincoming1\nb\ncurrent2\nincoming2\nc\n"
+        );
+        assert!(!repo.git().has_unmerged_entries("file.txt").unwrap());
+    }
+
+    #[test]
+    fn conflict_blocks_fall_back_to_stages_when_worktree_has_no_markers() {
+        let repo = TestRepo::with_text_conflict();
+        fs::write(repo.root.join("file.txt"), "manual edit without markers\n").unwrap();
+
+        let blocks = repo.git().conflict_blocks("file.txt").unwrap();
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].context_before, "before\n");
+        assert_eq!(blocks[0].base.as_deref(), Some("base\n"));
+        assert_eq!(blocks[0].ours, "current\n");
+        assert_eq!(blocks[0].theirs, "incoming\n");
+        assert_eq!(blocks[0].context_after, "after\n");
+    }
+
+    #[test]
+    fn resolves_stage_fallback_block_when_worktree_has_no_markers() {
+        let repo = TestRepo::with_text_conflict();
+        fs::write(repo.root.join("file.txt"), "manual edit without markers\n").unwrap();
+
+        repo.git()
+            .resolve_conflict_blocks("file.txt", &[ResolveChoice::Theirs])
+            .unwrap();
+
+        assert_eq!(repo.file_text(), "before\nincoming\nafter\n");
+        assert!(!repo.git().has_unmerged_entries("file.txt").unwrap());
+    }
+
+    #[test]
+    fn stage_fallback_both_keeps_shared_context_once() {
+        let repo = TestRepo::with_text_conflict();
+        fs::write(repo.root.join("file.txt"), "manual edit without markers\n").unwrap();
+
+        repo.git()
+            .resolve_conflict_blocks("file.txt", &[ResolveChoice::Both])
+            .unwrap();
+
+        assert_eq!(repo.file_text(), "before\ncurrent\nincoming\nafter\n");
         assert!(!repo.git().has_unmerged_entries("file.txt").unwrap());
     }
 

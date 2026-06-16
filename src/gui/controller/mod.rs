@@ -3,6 +3,7 @@ pub mod branch_commits;
 pub mod branches;
 pub mod commit_files;
 pub mod commits;
+pub mod conflict_mode;
 pub mod custom_commands;
 pub mod diff_mode;
 pub mod files;

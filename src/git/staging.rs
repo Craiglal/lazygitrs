@@ -100,6 +100,23 @@ impl GitCommands {
             .with_context(|| format!("failed to revert hunk in {}", file_path))?;
         Ok(())
     }
+
+    /// Stage only the lines of a single visual change block into the index.
+    pub fn stage_visual_block_to_index(
+        &self,
+        file_path: &str,
+        unified_diff: &str,
+        want_old: Option<(usize, usize)>,
+        want_new: Option<(usize, usize)>,
+    ) -> Result<()> {
+        let patch = build_visual_block_patch(file_path, unified_diff, want_old, want_new)?;
+        self.git()
+            .args(&["apply", "--cached", "--unidiff-zero", "-"])
+            .stdin(patch)
+            .run_expecting_success()
+            .with_context(|| format!("failed to stage hunk in {}", file_path))?;
+        Ok(())
+    }
 }
 
 fn build_visual_block_patch(
@@ -256,4 +273,93 @@ fn build_patch(file_path: &str, hunk: &DiffHunk) -> String {
         patch.push('\n');
     }
     patch
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    struct TempRepo {
+        root: PathBuf,
+        git: GitCommands,
+    }
+
+    impl TempRepo {
+        fn new() -> Self {
+            let root = unique_temp_dir("staging");
+            fs::create_dir_all(&root).unwrap();
+            run_git(&root, &["init"]);
+            run_git(&root, &["config", "user.name", "Test User"]);
+            run_git(&root, &["config", "user.email", "test@example.com"]);
+            let git = GitCommands::new(&root).unwrap();
+            Self { root, git }
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "lazygitrs-{prefix}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn run_git(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[test]
+    fn stages_only_selected_visual_block() {
+        let repo = TempRepo::new();
+        fs::write(
+            repo.root.join("file.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        )
+        .unwrap();
+        run_git(&repo.root, &["add", "file.txt"]);
+        run_git(&repo.root, &["commit", "-m", "initial"]);
+
+        fs::write(
+            repo.root.join("file.txt"),
+            "one\nTWO\nthree\nfour\nfive\nsix\nSEVEN\neight\n",
+        )
+        .unwrap();
+
+        let diff = repo.git.diff_file("file.txt").unwrap();
+        repo.git
+            .stage_visual_block_to_index("file.txt", &diff, Some((2, 2)), Some((2, 2)))
+            .unwrap();
+
+        let staged = run_git(&repo.root, &["diff", "--cached", "--", "file.txt"]);
+        assert!(staged.contains("-two"));
+        assert!(staged.contains("+TWO"));
+        assert!(!staged.contains("-seven"));
+        assert!(!staged.contains("+SEVEN"));
+    }
 }

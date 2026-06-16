@@ -34,6 +34,7 @@ use crate::pager::side_by_side::{
 
 use self::context::{ContextId, ContextManager, SideWindow};
 use self::layout::LayoutState;
+use self::modes::conflict_mode::ConflictModeState;
 use self::modes::diff_mode::DiffModeState;
 use self::modes::patch_building::PatchBuildingState;
 use self::modes::rebase_mode::{EntryStatus, RebaseModeState, RebasePhase};
@@ -42,6 +43,15 @@ use self::popup::{ListPickerItem, MessageKind, PopupState};
 
 /// Compute the display row index for a given item selection,
 /// accounting for category header rows inserted between groups.
+pub(crate) fn diff_block_mode_actionable(has_unstaged_changes: bool, hunk_count: usize) -> bool {
+    has_unstaged_changes && hunk_count > 0
+}
+
+pub(crate) fn is_diff_block_mode_toggle(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('B')
+        || (key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::SHIFT))
+}
+
 fn list_picker_display_idx(items: &[ListPickerItem], sel: usize) -> usize {
     let mut di = 0usize;
     let mut last_cat = String::new();
@@ -356,6 +366,8 @@ pub struct Gui {
     pub patch_building: PatchBuildingState,
     /// Diff/compare mode state.
     pub diff_mode: DiffModeState,
+    /// Dedicated merge-conflict resolution mode state.
+    pub conflict_mode: ConflictModeState,
     /// Interactive rebase mode state.
     pub rebase_mode: RebaseModeState,
     /// Stashed commit editor popup while commit menu or AI generation is shown.
@@ -579,6 +591,7 @@ impl Gui {
             undo_reflog_idx: 0,
             patch_building: PatchBuildingState::new(),
             diff_mode: DiffModeState::new(),
+            conflict_mode: ConflictModeState::new(),
             rebase_mode: RebaseModeState::new(),
             pending_commit_popup: None,
             saved_commit_popup: None,
@@ -750,7 +763,27 @@ impl Gui {
             // Render
             let theme = self.active_theme();
             terminal.draw(|frame| {
-                if self.rebase_mode.active {
+                if self.conflict_mode.active {
+                    presentation::conflict_mode::render(frame, &mut self.conflict_mode, &theme);
+                    if self.popup != PopupState::None {
+                        views::render_popup(
+                            frame,
+                            &self.popup,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            self.commit_ai_button_hovered,
+                            !self
+                                .config
+                                .user_config
+                                .git
+                                .commit
+                                .generate_command
+                                .trim()
+                                .is_empty(),
+                        );
+                    }
+                } else if self.rebase_mode.active {
                     presentation::rebase_mode::render(frame, &mut self.rebase_mode, &theme);
                     // Render popup overlay on top of rebase mode
                     if self.popup != PopupState::None {
@@ -2060,6 +2093,11 @@ impl Gui {
             return self.handle_search_key(key);
         }
 
+        // Conflict merge view takes priority over normal/rebase/diff UI.
+        if self.conflict_mode.active {
+            return controller::conflict_mode::handle_key(self, key);
+        }
+
         // Rebase mode takes priority over everything
         if self.rebase_mode.active {
             return controller::rebase_mode::handle_key(self, key);
@@ -2101,6 +2139,11 @@ impl Gui {
         }
         if matches_key(key, &keybindings.universal.reset_side_panel) {
             self.layout.side_panel_ratio = self.config.user_config.gui.side_panel_width;
+            return Ok(());
+        }
+
+        if is_diff_block_mode_toggle(key) && self.context_mgr.active() == ContextId::Files {
+            self.enter_diff_block_mode_or_show_message();
             return Ok(());
         }
 
@@ -2566,6 +2609,79 @@ impl Gui {
         }
 
         let keybindings = &self.config.user_config.keybinding;
+
+        if self.diff_view.block_mode_active {
+            if !self.current_diff_block_mode_actionable() {
+                self.diff_view.exit_block_mode();
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.diff_view.exit_block_mode();
+                    return Ok(());
+                }
+                _ if is_diff_block_mode_toggle(key) => {
+                    self.diff_view.exit_block_mode();
+                    return Ok(());
+                }
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('}') => {
+                    self.diff_view.cycle_next_revert_hunk();
+                    return Ok(());
+                }
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::Char('{') => {
+                    self.diff_view.cycle_prev_revert_hunk();
+                    return Ok(());
+                }
+                KeyCode::Char('r') => {
+                    if let Some(hunk_idx) = self.diff_view.selected_revert_hunk {
+                        if let Err(err) = self.revert_selected_file_hunk(hunk_idx) {
+                            self.popup = PopupState::Message {
+                                title: "Revert block failed".to_string(),
+                                message: format!("{}", err),
+                                kind: MessageKind::Error,
+                            };
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('s') => {
+                    if let Some(hunk_idx) = self.diff_view.selected_revert_hunk {
+                        if let Err(err) = self.stage_selected_file_hunk(hunk_idx) {
+                            self.popup = PopupState::Message {
+                                title: "Stage block failed".to_string(),
+                                message: format!("{}", err),
+                                kind: MessageKind::Error,
+                            };
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('u') => {
+                    if !self.diff_view.revert_undo_stack.is_empty() {
+                        if let Err(err) = self.undo_last_revert_block() {
+                            self.popup = PopupState::Message {
+                                title: "Undo revert failed".to_string(),
+                                message: format!("{}", err),
+                                kind: MessageKind::Error,
+                            };
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    if let Some(hunk_idx) = self.diff_view.selected_revert_hunk {
+                        self.show_hunk_context_menu(hunk_idx);
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+
+        if is_diff_block_mode_toggle(key) && self.context_mgr.active() == ContextId::Files {
+            self.enter_diff_block_mode_or_show_message();
+            return Ok(());
+        }
 
         // e / o on the diff panel (no active selection) mirror the Files tab:
         // open the working-tree file in the editor (at the first changed hunk)
@@ -3039,6 +3155,105 @@ impl Gui {
                     _ => {}
                 }
             }
+            PopupState::ConflictBlocks { .. } => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let PopupState::ConflictBlocks {
+                        blocks,
+                        selected,
+                        scroll_offset,
+                        ..
+                    } = &mut self.popup
+                        && *selected + 1 < blocks.len()
+                    {
+                        *selected += 1;
+                        let visible_window = 5usize;
+                        if *selected >= *scroll_offset + visible_window {
+                            *scroll_offset = (*selected).saturating_sub(visible_window - 1);
+                        }
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let PopupState::ConflictBlocks {
+                        selected,
+                        scroll_offset,
+                        ..
+                    } = &mut self.popup
+                        && *selected > 0
+                    {
+                        *selected -= 1;
+                        if *selected < *scroll_offset {
+                            *scroll_offset = *selected;
+                        }
+                    }
+                }
+                KeyCode::Char('o') => {
+                    if let PopupState::ConflictBlocks {
+                        choices, selected, ..
+                    } = &mut self.popup
+                        && let Some(choice) = choices.get_mut(*selected)
+                    {
+                        *choice = Some(ResolveChoice::Ours);
+                    }
+                }
+                KeyCode::Char('t') => {
+                    if let PopupState::ConflictBlocks {
+                        choices, selected, ..
+                    } = &mut self.popup
+                        && let Some(choice) = choices.get_mut(*selected)
+                    {
+                        *choice = Some(ResolveChoice::Theirs);
+                    }
+                }
+                KeyCode::Char('b') => {
+                    if let PopupState::ConflictBlocks {
+                        choices, selected, ..
+                    } = &mut self.popup
+                        && let Some(choice) = choices.get_mut(*selected)
+                    {
+                        *choice = Some(ResolveChoice::Both);
+                    }
+                }
+                KeyCode::Char(' ') | KeyCode::Char('c') => {
+                    if let PopupState::ConflictBlocks {
+                        choices, selected, ..
+                    } = &mut self.popup
+                        && let Some(choice) = choices.get_mut(*selected)
+                    {
+                        *choice = Some(match *choice {
+                            None => ResolveChoice::Ours,
+                            Some(ResolveChoice::Ours) => ResolveChoice::Theirs,
+                            Some(ResolveChoice::Theirs) => ResolveChoice::Both,
+                            Some(ResolveChoice::Both) => ResolveChoice::Ours,
+                        });
+                    }
+                }
+                KeyCode::Enter => {
+                    if focus_first_unresolved_conflict_block(&mut self.popup) {
+                        return Ok(());
+                    }
+
+                    let popup = std::mem::replace(&mut self.popup, PopupState::None);
+                    if let PopupState::ConflictBlocks { path, choices, .. } = popup {
+                        let resolved_choices: Vec<ResolveChoice> =
+                            choices.into_iter().flatten().collect();
+                        if let Err(e) = self.git.resolve_conflict_blocks(&path, &resolved_choices) {
+                            self.popup = PopupState::Message {
+                                title: "Error".to_string(),
+                                message: format!("{}", e),
+                                kind: MessageKind::Error,
+                            };
+                        } else {
+                            self.needs_refresh = true;
+                            self.needs_files_refresh = true;
+                            self.needs_diff_refresh = true;
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.popup = PopupState::None;
+                }
+                _ => {}
+            },
             PopupState::Input {
                 is_commit,
                 confirm_focused,
@@ -4820,6 +5035,13 @@ impl Gui {
         Ok(())
     }
 
+    fn show_conflict_block_resolver(&mut self, path: String) -> Result<()> {
+        let blocks = self.git.conflict_blocks(&path)?;
+        self.popup = PopupState::None;
+        self.conflict_mode.enter(path, blocks);
+        Ok(())
+    }
+
     fn show_conflict_resolution_menu(&mut self, path: String) -> Result<()> {
         let resolve_item = |label: &str, key: &str, choice: ResolveChoice| {
             let path = path.clone();
@@ -4837,9 +5059,19 @@ impl Gui {
             }
         };
 
+        let block_path = path.clone();
         let editor_path = path.clone();
         let mark_path = path.clone();
         let items = vec![
+            popup::MenuItem {
+                label: "Open native merge view".to_string(),
+                description: "JetBrains-style ours/result/theirs view with per-block choices"
+                    .to_string(),
+                key: Some("d".to_string()),
+                action: Some(Box::new(move |gui| {
+                    gui.show_conflict_block_resolver(block_path.clone())
+                })),
+            },
             resolve_item(
                 "Use ours (stage 2) and stage file",
                 "o",
@@ -6645,9 +6877,24 @@ impl Gui {
                 action: Some(Box::new(|_gui| Ok(()))),
             },
             popup::MenuItem {
+                label: "Stage hunk".to_string(),
+                description: "Apply this change block to the index".to_string(),
+                key: Some("s".to_string()),
+                action: Some(Box::new(move |gui| {
+                    if let Err(err) = gui.stage_selected_file_hunk(hunk_idx) {
+                        gui.popup = PopupState::Message {
+                            title: "Stage block failed".to_string(),
+                            message: format!("{}", err),
+                            kind: MessageKind::Error,
+                        };
+                    }
+                    Ok(())
+                })),
+            },
+            popup::MenuItem {
                 label: "Revert hunk".to_string(),
-                description: String::new(),
-                key: None,
+                description: "Remove this change block from the worktree".to_string(),
+                key: Some("r".to_string()),
                 action: Some(Box::new(move |gui| {
                     if let Err(err) = gui.revert_selected_file_hunk(hunk_idx) {
                         gui.popup = PopupState::Message {
@@ -6667,6 +6914,84 @@ impl Gui {
             selected: 0,
             loading_index: None,
         };
+    }
+
+    fn selected_file_has_unstaged_changes(&self) -> bool {
+        if self.context_mgr.active() != ContextId::Files {
+            return false;
+        }
+        let Some(file_idx) = self.selected_file_index() else {
+            return false;
+        };
+        let model = self.model.lock().unwrap();
+        model
+            .files
+            .get(file_idx)
+            .is_some_and(|file| file.has_unstaged_changes)
+    }
+
+    fn current_diff_block_mode_actionable(&self) -> bool {
+        diff_block_mode_actionable(
+            self.selected_file_has_unstaged_changes(),
+            self.diff_view.hunk_starts.len(),
+        )
+    }
+
+    fn enter_diff_block_mode_or_show_message(&mut self) {
+        if self.current_diff_block_mode_actionable() {
+            self.diff_focused = true;
+            self.diff_view.enter_block_mode();
+        } else {
+            self.popup = PopupState::Message {
+                title: "Block mode".to_string(),
+                message: "Block mode is available only for unstaged file changes.".to_string(),
+                kind: MessageKind::Info,
+            };
+        }
+    }
+
+    fn stage_selected_file_hunk(&mut self, hunk_idx: usize) -> Result<()> {
+        let Some(file_idx) = self.selected_file_index() else {
+            return Ok(());
+        };
+
+        let model = self.model.lock().unwrap();
+        let Some(file) = model.files.get(file_idx) else {
+            return Ok(());
+        };
+
+        if !file.has_unstaged_changes {
+            self.popup = PopupState::Message {
+                title: "Stage block".to_string(),
+                message: "Block staging is available only for unstaged changes.".to_string(),
+                kind: MessageKind::Info,
+            };
+            return Ok(());
+        }
+
+        let file_name = file.name.clone();
+        drop(model);
+
+        let Some((want_old, want_new)) = self.diff_view.visual_block_line_ranges(hunk_idx) else {
+            return Ok(());
+        };
+        if want_old.is_none() && want_new.is_none() {
+            return Ok(());
+        }
+
+        let diff = self.git.diff_file(&file_name)?;
+        if diff.is_empty() {
+            return Ok(());
+        }
+
+        self.git
+            .stage_visual_block_to_index(&file_name, &diff, want_old, want_new)?;
+
+        self.diff_view.mark_hunk_staged_for_feedback(hunk_idx);
+        self.diff_view.selection = None;
+        self.needs_files_refresh = true;
+        self.needs_diff_refresh = true;
+        Ok(())
     }
 
     fn revert_selected_file_hunk(&mut self, hunk_idx: usize) -> Result<()> {
@@ -7114,6 +7439,27 @@ impl Gui {
 
 /// Split a commit message into (summary, body).
 /// The summary is the first line; the body is everything after the first blank line separator.
+fn focus_first_unresolved_conflict_block(popup: &mut PopupState) -> bool {
+    if let PopupState::ConflictBlocks {
+        choices,
+        selected,
+        scroll_offset,
+        ..
+    } = popup
+        && let Some(first_unresolved) = choices.iter().position(Option::is_none)
+    {
+        *selected = first_unresolved;
+        let visible_window = 5usize;
+        if *selected < *scroll_offset {
+            *scroll_offset = *selected;
+        } else if *selected >= *scroll_offset + visible_window {
+            *scroll_offset = (*selected).saturating_sub(visible_window - 1);
+        }
+        return true;
+    }
+    false
+}
+
 fn split_commit_message(msg: &str) -> (String, String) {
     match msg.find('\n') {
         Some(idx) => {
@@ -7358,4 +7704,78 @@ fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> 
     terminal::disable_raw_mode()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::merge_conflict::{ResolveChoice, TextConflictBlock};
+
+    #[test]
+    fn diff_block_mode_requires_unstaged_changes_and_hunks() {
+        assert!(diff_block_mode_actionable(true, 1));
+        assert!(!diff_block_mode_actionable(false, 1));
+        assert!(!diff_block_mode_actionable(true, 0));
+        assert!(!diff_block_mode_actionable(false, 0));
+    }
+
+    #[test]
+    fn diff_block_mode_toggle_accepts_shift_b_terminal_forms() {
+        assert!(is_diff_block_mode_toggle(KeyEvent::new(
+            KeyCode::Char('B'),
+            KeyModifiers::NONE,
+        )));
+        assert!(is_diff_block_mode_toggle(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!is_diff_block_mode_toggle(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    #[test]
+    fn unresolved_conflict_block_enter_preserves_choices_and_focuses_first_unresolved() {
+        let mut popup = PopupState::ConflictBlocks {
+            path: "file.txt".to_string(),
+            blocks: vec![
+                TextConflictBlock {
+                    index: 0,
+                    context_before: String::new(),
+                    base: None,
+                    ours: "ours-1\n".to_string(),
+                    theirs: "theirs-1\n".to_string(),
+                    context_after: String::new(),
+                },
+                TextConflictBlock {
+                    index: 1,
+                    context_before: String::new(),
+                    base: None,
+                    ours: "ours-2\n".to_string(),
+                    theirs: "theirs-2\n".to_string(),
+                    context_after: String::new(),
+                },
+            ],
+            choices: vec![Some(ResolveChoice::Ours), None],
+            selected: 0,
+            scroll_offset: 0,
+        };
+
+        assert!(focus_first_unresolved_conflict_block(&mut popup));
+
+        match popup {
+            PopupState::ConflictBlocks {
+                choices,
+                selected,
+                scroll_offset,
+                ..
+            } => {
+                assert_eq!(choices, vec![Some(ResolveChoice::Ours), None]);
+                assert_eq!(selected, 1);
+                assert_eq!(scroll_offset, 0);
+            }
+            _ => panic!("popup should stay in conflict block resolver"),
+        }
+    }
 }
