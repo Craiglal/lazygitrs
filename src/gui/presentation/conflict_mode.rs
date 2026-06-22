@@ -6,7 +6,8 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 use crate::config::Theme;
 use crate::git::merge_conflict::ResolveChoice;
-use crate::gui::modes::conflict_mode::{ConflictBlockState, ConflictModeState};
+use crate::gui::modes::conflict_mode::{ConflictBlockState, ConflictDiffCache, ConflictModeState};
+use crate::pager::side_by_side::{self, DiffViewLayout, DiffViewState};
 
 pub fn render(frame: &mut Frame, state: &mut ConflictModeState, theme: &Theme) {
     let area = frame.area();
@@ -88,11 +89,17 @@ fn render_block_list(frame: &mut Frame, area: Rect, state: &mut ConflictModeStat
     frame.render_widget(List::new(items), inner);
 }
 
-fn render_three_way(frame: &mut Frame, area: Rect, state: &ConflictModeState, theme: &Theme) {
-    let Some(block) = state.blocks.get(state.selected) else {
+fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState, theme: &Theme) {
+    if state.blocks.get(state.selected).is_none() {
         frame.render_widget(Paragraph::new("No conflict blocks"), area);
         return;
-    };
+    }
+    ensure_conflict_diff_cache(state);
+    let block = &state.blocks[state.selected];
+    let cache = state
+        .diff_cache
+        .as_ref()
+        .expect("conflict diff cache should be populated for selected block");
 
     let top = Layout::default()
         .direction(Direction::Vertical)
@@ -128,27 +135,32 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &ConflictModeState, th
         ])
         .split(body[0]);
 
-    render_text_panel(
+    render_embedded_diff_panel(
         frame,
         triptych[0],
-        "→ Ours / Current  [o]",
-        source_panel_lines(block, &block.block.ours, "→ ", Color::Green, theme),
+        &cache.ours,
         theme,
         block.choice == Some(ResolveChoice::Ours),
     );
-    render_text_panel(
-        frame,
-        triptych[1],
-        "Result Preview",
-        result_panel_lines(block, theme),
-        theme,
-        block.choice.is_some(),
-    );
-    render_text_panel(
+    if let Some(result) = cache.result.as_ref() {
+        render_embedded_diff_panel(frame, triptych[1], result, theme, true);
+    } else {
+        render_text_panel(
+            frame,
+            triptych[1],
+            "Result Preview",
+            vec![Line::from(Span::styled(
+                "Choose ours (o), theirs (t), or both (b).",
+                Style::default().fg(theme.text_dimmed),
+            ))],
+            theme,
+            false,
+        );
+    }
+    render_embedded_diff_panel(
         frame,
         triptych[2],
-        "← Theirs / Incoming  [t]",
-        source_panel_lines(block, &block.block.theirs, "← ", Color::Blue, theme),
+        &cache.theirs,
         theme,
         block.choice == Some(ResolveChoice::Theirs),
     );
@@ -171,14 +183,73 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &ConflictModeState, th
         theme,
         false,
     );
-    render_text_panel(
+    render_embedded_diff_panel(
         frame,
         lower[1],
-        "⇄ Both Preview  [b]",
-        both_panel_lines(block, theme),
+        &cache.both,
         theme,
         block.choice == Some(ResolveChoice::Both),
     );
+}
+
+fn render_embedded_diff_panel(
+    frame: &mut Frame,
+    area: Rect,
+    state: &DiffViewState,
+    theme: &Theme,
+    highlighted: bool,
+) {
+    side_by_side::render_diff(frame, area, state, theme, highlighted, false, false);
+}
+
+fn ensure_conflict_diff_cache(state: &mut ConflictModeState) {
+    let Some(block) = state.blocks.get(state.selected).cloned() else {
+        state.diff_cache = None;
+        return;
+    };
+    if state
+        .diff_cache
+        .as_ref()
+        .is_some_and(|cache| cache.selected == state.selected && cache.choice == block.choice)
+    {
+        return;
+    }
+
+    let base = base_preview(&block);
+    let result = block.choice.map(|_| {
+        conflict_diff_view(
+            &state.path,
+            "result preview",
+            &base,
+            &result_preview(&block),
+        )
+    });
+    state.diff_cache = Some(ConflictDiffCache {
+        selected: state.selected,
+        choice: block.choice,
+        ours: conflict_diff_view(
+            &state.path,
+            "ours/current [o]",
+            &base,
+            &text_with_context(&block, &block.block.ours),
+        ),
+        result,
+        theirs: conflict_diff_view(
+            &state.path,
+            "theirs/incoming [t]",
+            &base,
+            &text_with_context(&block, &block.block.theirs),
+        ),
+        both: conflict_diff_view(
+            &state.path,
+            "both preview [b]",
+            &base,
+            &text_with_context(
+                &block,
+                &format!("{}{}", block.block.ours, block.block.theirs),
+            ),
+        ),
+    });
 }
 
 fn render_text_panel(
@@ -268,6 +339,18 @@ fn badge_style(choice: Option<ResolveChoice>, theme: &Theme) -> Style {
         Some(ResolveChoice::Both) => Style::default().fg(theme.accent_secondary),
         None => Style::default().fg(Color::Yellow),
     }
+}
+
+fn conflict_diff_view(filename: &str, title_suffix: &str, old: &str, new: &str) -> DiffViewState {
+    let mut state = DiffViewState::new();
+    state.view_layout = DiffViewLayout::Unified;
+    state.load(filename, old, new);
+    state.title_suffix = Some(title_suffix.to_string());
+    state
+}
+
+fn base_preview(block: &ConflictBlockState) -> String {
+    text_with_context(block, block.block.base.as_deref().unwrap_or(""))
 }
 
 fn result_panel_lines(block: &ConflictBlockState, theme: &Theme) -> Vec<Line<'static>> {
@@ -377,6 +460,43 @@ mod tests {
     use super::*;
     use crate::config::Theme;
     use crate::git::merge_conflict::TextConflictBlock;
+
+    fn conflict_block() -> TextConflictBlock {
+        TextConflictBlock {
+            index: 0,
+            context_before: "before\n".to_string(),
+            base: Some("base\n".to_string()),
+            ours: "ours\n".to_string(),
+            theirs: "theirs\n".to_string(),
+            context_after: "after\n".to_string(),
+        }
+    }
+
+    #[test]
+    fn unresolved_result_stays_plain_until_choice_is_selected() {
+        let mut state = ConflictModeState::new();
+        state.enter("file.txt".to_string(), vec![conflict_block()]);
+
+        ensure_conflict_diff_cache(&mut state);
+        let cache = state.diff_cache.as_ref().unwrap();
+        assert!(cache.result.is_none());
+
+        state.set_choice_current(ResolveChoice::Ours);
+        ensure_conflict_diff_cache(&mut state);
+        let cache = state.diff_cache.as_ref().unwrap();
+        assert!(cache.result.is_some());
+    }
+
+    #[test]
+    fn conflict_diff_view_uses_diff_viewer_unified_layout_with_title_suffix() {
+        let state = conflict_diff_view("file.txt", "ours", "base\n", "ours\n");
+
+        assert_eq!(state.filename, "file.txt");
+        assert_eq!(state.view_layout, DiffViewLayout::Unified);
+        assert_eq!(state.title_suffix.as_deref(), Some("ours"));
+        assert_eq!(state.hunk_starts, vec![0]);
+        assert!(!state.lines.is_empty());
+    }
 
     #[test]
     fn result_panel_lines_dim_context_and_color_actual_changes() {

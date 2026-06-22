@@ -82,6 +82,7 @@ fn move_to_next_unresolved(gui: &mut Gui) {
         let idx = (gui.conflict_mode.selected + step) % len;
         if gui.conflict_mode.blocks[idx].choice.is_none() {
             gui.conflict_mode.selected = idx;
+            gui.conflict_mode.invalidate_diff_cache();
             gui.conflict_mode
                 .ensure_visible(gui.conflict_mode.visible_height);
             return;
@@ -98,6 +99,7 @@ fn move_to_prev_unresolved(gui: &mut Gui) {
         let idx = (gui.conflict_mode.selected + len - step) % len;
         if gui.conflict_mode.blocks[idx].choice.is_none() {
             gui.conflict_mode.selected = idx;
+            gui.conflict_mode.invalidate_diff_cache();
             gui.conflict_mode
                 .ensure_visible(gui.conflict_mode.visible_height);
             return;

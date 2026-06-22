@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 
 use crate::git::merge_conflict::{ResolveChoice, TextConflictBlock};
+use crate::pager::side_by_side::DiffViewState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConflictBlockState {
@@ -8,7 +9,15 @@ pub struct ConflictBlockState {
     pub choice: Option<ResolveChoice>,
 }
 
-#[derive(Debug, Clone)]
+pub struct ConflictDiffCache {
+    pub selected: usize,
+    pub choice: Option<ResolveChoice>,
+    pub ours: DiffViewState,
+    pub result: Option<DiffViewState>,
+    pub theirs: DiffViewState,
+    pub both: DiffViewState,
+}
+
 pub struct ConflictModeState {
     pub active: bool,
     pub path: String,
@@ -16,6 +25,7 @@ pub struct ConflictModeState {
     pub selected: usize,
     pub scroll: usize,
     pub visible_height: usize,
+    pub diff_cache: Option<ConflictDiffCache>,
 }
 
 impl ConflictModeState {
@@ -27,6 +37,7 @@ impl ConflictModeState {
             selected: 0,
             scroll: 0,
             visible_height: 0,
+            diff_cache: None,
         }
     }
 
@@ -52,12 +63,19 @@ impl ConflictModeState {
         self.selected = 0;
         self.scroll = 0;
         self.visible_height = 0;
+        self.diff_cache = None;
+        self.diff_cache = None;
     }
 
     pub fn set_choice_current(&mut self, choice: ResolveChoice) {
         if let Some(block) = self.blocks.get_mut(self.selected) {
             block.choice = Some(choice);
+            self.invalidate_diff_cache();
         }
+    }
+
+    pub fn invalidate_diff_cache(&mut self) {
+        self.diff_cache = None;
     }
 
     pub fn unresolved_count(&self) -> usize {
@@ -85,6 +103,7 @@ impl ConflictModeState {
     pub fn move_up(&mut self) {
         if self.selected > 0 {
             self.selected -= 1;
+            self.invalidate_diff_cache();
         }
         self.ensure_visible(self.visible_height);
     }
@@ -92,6 +111,7 @@ impl ConflictModeState {
     pub fn move_down(&mut self) {
         if self.selected + 1 < self.blocks.len() {
             self.selected += 1;
+            self.invalidate_diff_cache();
         }
         self.ensure_visible(self.visible_height);
     }
