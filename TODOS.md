@@ -256,3 +256,14 @@
 Also another thing I noticed, a missed keyboard behavior we didn't do yet... Doing cmd+backspace to clear from the current cursor. Not observed yet, even on the zed terminal. This is a mustfix.
 
 Where I observed this behavior: I noticed this for the "Commit Message" and "Description". Generally where I can input text i..e the "Interactive rebase on" dialog palette or the help `?` command palette.
+
+- [x] IN the original lazygit, When i delete tags, I can see a dialog with actions to delete local tag, delete remote tag, and 'delete local and remote tag'. Let's do that here as well.
+  - [x] improvement, use the palette selector for branches and refs, find a way to reuse
+
+- [x] Bug, I get rect whatever error when the error box shows up. My hypothesis is out of bounds or something.
+
+- [x] Bug, git mv in non-filetree view and filetree view, broken and no diff.
+
+- [x] Graph is still not good, the feature where it becomes a solid circle disappeared. But only for nodes that have like this connected + hexagon look.
+
+- [x] `-` in '3 Branches' does not work
