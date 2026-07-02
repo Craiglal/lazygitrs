@@ -33,6 +33,38 @@ Then run:
 lazygitrs
 ```
 
+#### Nix (flake)
+
+On Nix, install declaratively instead of building with cargo:
+
+```sh
+nix run github:blankeos/lazygitrs         # run without installing
+nix profile install github:blankeos/lazygitrs
+```
+
+With [Home Manager](https://github.com/nix-community/home-manager), import the module and enable it:
+
+```nix
+{
+  inputs.lazygitrs.url = "github:blankeos/lazygitrs";
+
+  # in your home configuration:
+  imports = [ inputs.lazygitrs.homeManagerModules.default ];
+
+  programs.lazygitrs = {
+    enable = true;
+    # optional: render ~/.config/lazygitrs/config.yml from Nix
+    settings = {
+      gui.theme.activeBorderColor = [ "green" "bold" ];
+      git.autoRefresh = true;
+    };
+  };
+}
+```
+
+The flake also exposes `overlays.default` and a dev shell (`nix develop`). The
+binary is wrapped so it always finds `git` on `PATH`.
+
 ### What's different
 
 - [x] **AI commit messages** — works with whatever agent you already use (claude, opencode, codex, or my minimal shim [modelcli](https://github.com/blankeos/modelcli)). Set `git.commit.generateCommand` (see [Configuration](#configuration)):
