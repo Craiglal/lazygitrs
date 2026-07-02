@@ -5454,29 +5454,53 @@ impl Gui {
     }
 
     fn undo(&mut self) -> Result<()> {
-        // Get reflog entries
+        // Get reflog entries with their subjects so we know *what* each HEAD
+        // move was. A `checkout`/`switch` must be reversed with a checkout, not
+        // a reset: resetting would drag the current branch onto another
+        // branch's tip and silently corrupt it.
         let result = self
             .git
             .git_cmd()
-            .args(&["reflog", "--format=%H", "-n", "20"])
+            .args(&["reflog", "--format=%H%x09%gs", "-n", "20"])
             .run()?;
         if !result.success {
             return Ok(());
         }
-        let entries: Vec<&str> = result.stdout.lines().collect();
+        let entries: Vec<(&str, &str)> = result
+            .stdout
+            .lines()
+            .map(|line| line.split_once('\t').unwrap_or((line, "")))
+            .collect();
         let next_idx = self.undo_reflog_idx + 1;
         if next_idx >= entries.len() {
             return Ok(()); // Nothing more to undo
         }
 
-        let target_hash = entries[next_idx].to_string();
+        let target_hash = entries[next_idx].0.to_string();
+        let op_subject = entries[self.undo_reflog_idx].1;
+        let action = reflog_undo_action(&target_hash, op_subject);
         let short = &target_hash[..7.min(target_hash.len())];
+        let message = match &action {
+            ReflogUndoAction::Checkout(_) => {
+                format!("Undo branch switch — checkout {}? ({})", next_idx, short)
+            }
+            ReflogUndoAction::Reset(_) => {
+                format!("Undo to reflog entry {}? ({})", next_idx, short)
+            }
+        };
 
         self.popup = PopupState::Confirm {
             title: "Undo".to_string(),
-            message: format!("Undo to reflog entry {}? ({})", next_idx, short),
+            message,
             on_confirm: Box::new(move |gui| {
-                gui.git.reset_to_commit(&target_hash, "--mixed")?;
+                match &action {
+                    ReflogUndoAction::Reset(hash) => {
+                        gui.git.reset_to_commit(hash, "--mixed")?;
+                    }
+                    ReflogUndoAction::Checkout(hash) => {
+                        gui.git.checkout_branch(hash)?;
+                    }
+                }
                 gui.undo_reflog_idx = next_idx;
                 gui.needs_refresh = true;
                 Ok(())
@@ -5493,25 +5517,46 @@ impl Gui {
         let result = self
             .git
             .git_cmd()
-            .args(&["reflog", "--format=%H", "-n", "20"])
+            .args(&["reflog", "--format=%H%x09%gs", "-n", "20"])
             .run()?;
         if !result.success {
             return Ok(());
         }
-        let entries: Vec<&str> = result.stdout.lines().collect();
+        let entries: Vec<(&str, &str)> = result
+            .stdout
+            .lines()
+            .map(|line| line.split_once('\t').unwrap_or((line, "")))
+            .collect();
         let prev_idx = self.undo_reflog_idx - 1;
         if prev_idx >= entries.len() {
             return Ok(());
         }
 
-        let target_hash = entries[prev_idx].to_string();
+        let target_hash = entries[prev_idx].0.to_string();
+        let op_subject = entries[prev_idx].1;
+        let action = reflog_undo_action(&target_hash, op_subject);
         let short = &target_hash[..7.min(target_hash.len())];
+        let message = match &action {
+            ReflogUndoAction::Checkout(_) => {
+                format!("Redo branch switch — checkout {}? ({})", prev_idx, short)
+            }
+            ReflogUndoAction::Reset(_) => {
+                format!("Redo to reflog entry {}? ({})", prev_idx, short)
+            }
+        };
 
         self.popup = PopupState::Confirm {
             title: "Redo".to_string(),
-            message: format!("Redo to reflog entry {}? ({})", prev_idx, short),
+            message,
             on_confirm: Box::new(move |gui| {
-                gui.git.reset_to_commit(&target_hash, "--mixed")?;
+                match &action {
+                    ReflogUndoAction::Reset(hash) => {
+                        gui.git.reset_to_commit(hash, "--mixed")?;
+                    }
+                    ReflogUndoAction::Checkout(hash) => {
+                        gui.git.checkout_branch(hash)?;
+                    }
+                }
                 gui.undo_reflog_idx = prev_idx;
                 gui.needs_refresh = true;
                 Ok(())
@@ -7706,6 +7751,33 @@ fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> 
     Ok(())
 }
 
+/// How a reflog-based undo/redo step should be applied to the working copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReflogUndoAction {
+    /// Move the current branch's tip (reverses a commit/reset/merge/rebase/pull).
+    Reset(String),
+    /// Re-position HEAD across refs (reverses a `checkout`/`switch`).
+    Checkout(String),
+}
+
+/// Decide how to reverse (or replay) a reflog move to `target_hash`, based on
+/// the reflog subject of the operation being undone/redone
+/// (e.g. `"checkout: moving from feature to main"`).
+///
+/// A `checkout`/`switch` moved HEAD *between* refs, so it must be reversed with
+/// a checkout — a `reset` would move the *current* branch's ref onto the target
+/// commit and silently corrupt the branch. Every other operation (commit,
+/// reset, merge, rebase, pull, cherry-pick, amend, …) moved the current
+/// branch's own tip, so `reset --mixed` is the correct reversal.
+fn reflog_undo_action(target_hash: &str, op_subject: &str) -> ReflogUndoAction {
+    let subject = op_subject.trim_start();
+    if subject.starts_with("checkout:") || subject.starts_with("switch:") {
+        ReflogUndoAction::Checkout(target_hash.to_string())
+    } else {
+        ReflogUndoAction::Reset(target_hash.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7776,6 +7848,41 @@ mod tests {
                 assert_eq!(scroll_offset, 0);
             }
             _ => panic!("popup should stay in conflict block resolver"),
+        }
+    }
+
+    #[test]
+    fn reflog_undo_reverses_a_checkout_with_a_checkout_not_a_reset() {
+        // Regression: after `git checkout main` (from a feature branch),
+        // reflog[1] is the feature branch's tip. Undo must NOT reset the
+        // current branch onto it — that silently corrupted the checked-out
+        // branch on every reboot. It must reverse the switch with a checkout.
+        assert_eq!(
+            reflog_undo_action("2e41a2d3a", "checkout: moving from SEOAI-771 to main"),
+            ReflogUndoAction::Checkout("2e41a2d3a".to_string()),
+        );
+        assert_eq!(
+            reflog_undo_action("abc123", "switch: moving from a to b"),
+            ReflogUndoAction::Checkout("abc123".to_string()),
+        );
+    }
+
+    #[test]
+    fn reflog_undo_reverses_content_moving_ops_with_a_reset() {
+        for subject in [
+            "commit: add feature",
+            "commit (amend): reword",
+            "reset: moving to abc123",
+            "pull: Fast-forward",
+            "merge topic: Merge made by the 'ort' strategy.",
+            "rebase (finish): returning to refs/heads/main",
+            "cherry-pick: pick a change",
+        ] {
+            assert_eq!(
+                reflog_undo_action("def456", subject),
+                ReflogUndoAction::Reset("def456".to_string()),
+                "operation {subject:?} moves the current branch tip, so undo must reset",
+            );
         }
     }
 }
