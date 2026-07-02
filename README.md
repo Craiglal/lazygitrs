@@ -38,15 +38,15 @@ lazygitrs
 On Nix, install declaratively instead of building with cargo:
 
 ```sh
-nix run github:blankeos/lazygitrs         # run without installing
-nix profile install github:blankeos/lazygitrs
+nix run github:Craiglal/lazygitrs?ref=develop         # run without installing
+nix profile install github:Craiglal/lazygitrs?ref=develop
 ```
 
 With [Home Manager](https://github.com/nix-community/home-manager), import the module and enable it:
 
 ```nix
 {
-  inputs.lazygitrs.url = "github:blankeos/lazygitrs";
+  inputs.lazygitrs.url = "github:Craiglal/lazygitrs?ref=develop";
 
   # in your home configuration:
   imports = [ inputs.lazygitrs.homeManagerModules.default ];
