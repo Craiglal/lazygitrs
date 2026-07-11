@@ -74,23 +74,36 @@ the tail of `fn main()` — everything **after** the `review_command` subcommand
 whitespace resolution, `App::new`, terminal setup, and the main loop) — into:
 
 ```rust
-// tuicr fork, in src/lib.rs (or a new src/run.rs re-exported from lib)
-pub fn run_review(opts: RunOptions) -> anyhow::Result<()>;
+// tuicr fork, in a new src/run.rs re-exported from lib.rs
+pub fn run_review(cli_args: CliArgs) -> anyhow::Result<()>;
 ```
 
-`RunOptions` mirrors the review-relevant CLI fields already parsed by tuicr's `parse_cli_args`:
-`revisions`, `working_tree`, `path_filter`, `file_path`, `pr_target`, `repo_url_override`,
-`theme`, `appearance`, `output_to_stdout` (always `false` when embedded), `no_update_check`
-(force `true` when embedded — no background update thread inside another app).
+The boundary type is tuicr's **existing `CliArgs`** struct (`src/cli.rs`) — the normalized
+options `parse_cli_args` already produces — given a `#[derive(Default)]` so lazygitrs can
+build just the fields it needs: `revisions`, `working_tree`, `path_filter`, `file_path`,
+`pr_target`, `repo_url`, `theme`, `appearance`, `output_to_stdout` (always `false` when
+embedded), `no_update_check` (force `true` when embedded — no background update thread inside
+another app). lazygitrs never constructs the tuicr-only fields (`appearance`,
+`review_command`); they default to `None`.
+
+Because dependents can only call the **library**, `run_review` and the `main.rs`-local
+helpers it uses (`dispatch_action`, `handle_comment_vim_key`, `run_editor_from_tui`, and the
+`CTRL_C_EXIT_TIMEOUT` / `MIN_WIDTH_FOR_FILE_LIST` consts) must move into a lib module (e.g.
+`src/run.rs`, re-exported from `lib.rs`). `parse_cli_args` and `resolve_theme_with_config`
+are already module functions and stay put. This is a **sizable but purely mechanical
+relocation** (~650 lines moved, unchanged), not a rewrite.
 
 The refactor is **behavior-preserving**: tuicr's own `fn main()` becomes a thin shim
 (profile init, panic hook, parse args, handle the `review` subcommand, else call
-`run_review(opts)`), so the fork's normal binary behaves identically and the change is
+`run_review(cli_args)`), so the fork's normal binary behaves identically and the change is
 upstreamable. tuicr sets up and tears down its **own** crossterm-0.29 terminal inside
-`run_review`; lazygitrs's terminal is already suspended at that point.
+`run_review`; lazygitrs's terminal is already suspended at that point. The public boundary is
+tuicr's existing `CliArgs` struct (given a `#[derive(Default)]`), so lazygitrs builds only
+the few fields it needs.
 
-Maintenance: pull upstream tuicr into the fork, re-apply the ~30-line extract patch (one
-commit) per release.
+Maintenance: pull upstream tuicr into the fork and re-apply the relocation per release. A
+pure move rebases cleanly except where upstream edits the moved lines; keep the move in one
+commit and use `git rerere` to ease repeated rebases.
 
 **Panic-hook note:** `run_review` must save the caller's current panic hook and restore it
 on exit (tuicr's `main` installs its own restore-stdio hook). lazygitrs's `catch_unwind`
@@ -132,14 +145,15 @@ interactive custom commands later. It lives in `src/gui/mod.rs` next to
   |---|---|
   | Files (whole working tree) | `working_tree = true` |
   | Files, single file selected | `working_tree = true`, `path_filter = Some(rel_path)` |
-  | Commits / BranchCommits (selected commit `H`) | `revisions = Some(<single-commit diff>)` |
-  | CommitFiles (file in commit `H`) | `revisions = Some(<single-commit diff>)`, `path_filter = Some(rel_path)` |
+  | Commits / BranchCommits (selected commit `H`) | `revisions = Some(H)` (bare hash) |
+  | CommitFiles (file in commit `H`) | `revisions = Some(H)` (bare hash), `path_filter = Some(rel_path)` |
 
-  **Revision form — verify against tuicr's parser.** tuicr resolves `revisions` via **git2**,
-  which does not accept `git rev-list` shorthand like `H^!`. Use the range tuicr's VCS layer
-  actually parses (likely `H~1..H` / `H^..H`), and handle the **root commit** (no parent)
-  case explicitly. The exact string is an implementation detail to confirm against tuicr's
-  revision handling, not assumed.
+  **Revision form (confirmed).** tuicr's `resolve_revision_range`
+  (`src/vcs/git/repository.rs`) parses a bare single commit spec as
+  `RevisionExpression::Single` and diffs it against its first parent automatically. So a
+  single commit is passed as the **bare hash** — no `^!`, no explicit range, and root-commit
+  handling is tuicr's responsibility, not ours. (Ranges `A..B` / merge-base `A...B` are also
+  accepted, reserved for the post-v1 multi-select feature.)
 
 - The controller entry point (bound to `keybindings.*.review` = `<c-r>`):
   1. Build `RunOptions` from context; if the context is unsupported, no-op (or a brief info
