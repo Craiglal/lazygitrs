@@ -25,10 +25,13 @@ pub fn shell_quote(s: &str) -> String {
 /// placeholder can never leak into the command line even if a caller pairs a
 /// line-aware template with an unknown line.
 pub fn expand(template: &str, path: &str, line: Option<usize>, column: usize) -> String {
+    // `{{filename}}` is substituted last, and `str::replace` never re-scans the
+    // text it inserts, so a path that itself contains `{{line}}` or `{{column}}`
+    // cannot be corrupted by a later pass.
     template
-        .replace("{{filename}}", &shell_quote(path))
         .replace("{{line}}", &line.unwrap_or(1).to_string())
         .replace("{{column}}", &column.to_string())
+        .replace("{{filename}}", &shell_quote(path))
 }
 
 #[cfg(test)]
@@ -88,5 +91,18 @@ mod tests {
     #[test]
     fn expand_passes_through_template_without_placeholders() {
         assert_eq!(expand("true", "/tmp/a.rs", None, 1), "true");
+    }
+
+    #[test]
+    fn expand_does_not_rewrite_placeholders_inside_the_path() {
+        assert_eq!(
+            expand(
+                "vim +{{line}} -- {{filename}}",
+                "/tmp/{{line}}.rs",
+                Some(5),
+                1
+            ),
+            "vim +5 -- '/tmp/{{line}}.rs'"
+        );
     }
 }
