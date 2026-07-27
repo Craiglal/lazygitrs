@@ -1,6 +1,10 @@
 //! Resolves which editor command to run for an "open in editor" action, and
 //! expands its command template into a shell command line.
 
+use once_cell::sync::Lazy;
+
+use crate::config::user_config::OsConfig;
+
 /// POSIX single-quote escaping: wrap in single quotes and rewrite any embedded
 /// single quote as `'\''` (close, escaped literal quote, reopen). Safe for any
 /// byte sequence a path can hold.
@@ -227,6 +231,116 @@ pub fn preset_for_editor_string(value: &str) -> Option<&'static Preset> {
     preset_by_name(stem)
 }
 
+/// A resolved editor invocation: a template still holding `{{...}}`
+/// placeholders, plus whether running it requires the real terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorCmd {
+    pub template: String,
+    pub suspend: bool,
+}
+
+/// Pure core of editor resolution. `candidates` are raw `$VISUAL` / `$EDITOR` /
+/// `core.editor` values in priority order, already collected by the caller.
+///
+/// Precedence, first match wins:
+/// 1. `os.editAtLine` (when a line is known) or `os.edit` — explicit config
+/// 2. `os.editPreset`
+/// 3. the first usable candidate, matched to a preset
+/// 4. the first usable candidate, as a generic terminal-editor template
+pub fn resolve_with_candidates(
+    os: &OsConfig,
+    line: Option<usize>,
+    candidates: &[String],
+) -> Option<EditorCmd> {
+    let explicit = if line.is_some() && !os.edit_at_line.is_empty() {
+        Some(os.edit_at_line.clone())
+    } else if !os.edit.is_empty() {
+        Some(os.edit.clone())
+    } else {
+        None
+    };
+    if let Some(template) = explicit {
+        // No preset to consult, so assume a terminal editor: that is both the
+        // common case and the safe one (a detached GUI editor that we wait for
+        // merely delays the redraw, while a terminal editor we do not wait for
+        // is unusable).
+        return Some(EditorCmd {
+            template,
+            suspend: os.suspend_on_edit.unwrap_or(true),
+        });
+    }
+
+    if let Some(preset) = preset_by_name(&os.edit_preset) {
+        return Some(from_preset(preset, line, os));
+    }
+
+    for candidate in candidates {
+        let Some(value) = usable_editor_value(candidate) else {
+            continue;
+        };
+        if let Some(preset) = preset_for_editor_string(value) {
+            return Some(from_preset(preset, line, os));
+        }
+        return Some(EditorCmd {
+            template: format!("{value} {{{{filename}}}}"),
+            suspend: os.suspend_on_edit.unwrap_or(true),
+        });
+    }
+
+    None
+}
+
+fn from_preset(preset: &Preset, line: Option<usize>, os: &OsConfig) -> EditorCmd {
+    let template = if line.is_some() {
+        preset.edit_at_line
+    } else {
+        preset.edit
+    };
+    EditorCmd {
+        template: template.to_string(),
+        suspend: os.suspend_on_edit.unwrap_or(preset.suspend),
+    }
+}
+
+/// Editor candidates from the environment, in priority order.
+///
+/// `$GIT_EDITOR` is deliberately absent: it is git-commit-specific and is
+/// commonly set to `true`, which would silently no-op every edit action.
+///
+/// Memoised so the `git config` subprocess runs at most once per session.
+static ENV_CANDIDATES: Lazy<Vec<String>> = Lazy::new(|| {
+    let mut out = Vec::new();
+    for var in ["VISUAL", "EDITOR"] {
+        if let Ok(value) = std::env::var(var) {
+            out.push(value);
+        }
+    }
+    if let Some(value) = git_core_editor() {
+        out.push(value);
+    }
+    out
+});
+
+/// Read `git config --get core.editor`. Runs in the process working directory,
+/// so a repository-local value is picked up when lazygitrs was launched inside
+/// the repository; global and system values are found regardless.
+fn git_core_editor() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "core.editor"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// Resolve the editor command for an edit action, consulting the environment.
+pub fn resolve(os: &OsConfig, line: Option<usize>) -> Option<EditorCmd> {
+    resolve_with_candidates(os, line, &ENV_CANDIDATES)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -395,5 +509,118 @@ mod tests {
     #[test]
     fn nvim_remote_suspends_because_it_may_exec_an_interactive_nvim() {
         assert!(preset_by_name("nvr").unwrap().suspend);
+    }
+
+    fn os_with_preset(preset: &str) -> OsConfig {
+        OsConfig {
+            edit_preset: preset.to_string(),
+            ..OsConfig::default()
+        }
+    }
+
+    #[test]
+    fn explicit_edit_at_line_beats_everything() {
+        let os = OsConfig {
+            edit: "myed {{filename}}".into(),
+            edit_at_line: "myed +{{line}} {{filename}}".into(),
+            edit_preset: "vscode".into(),
+            ..OsConfig::default()
+        };
+        let cmd = resolve_with_candidates(&os, Some(9), &["nvim".to_string()]).unwrap();
+        assert_eq!(cmd.template, "myed +{{line}} {{filename}}");
+        // No preset matched, so an explicit template defaults to a terminal editor.
+        assert!(cmd.suspend);
+    }
+
+    #[test]
+    fn explicit_edit_is_used_when_no_line_is_known() {
+        let os = OsConfig {
+            edit: "myed {{filename}}".into(),
+            edit_at_line: "myed +{{line}} {{filename}}".into(),
+            ..OsConfig::default()
+        };
+        let cmd = resolve_with_candidates(&os, None, &[]).unwrap();
+        assert_eq!(cmd.template, "myed {{filename}}");
+    }
+
+    #[test]
+    fn preset_beats_a_detected_editor() {
+        let os = os_with_preset("vscode");
+        let cmd = resolve_with_candidates(&os, Some(4), &["nvim".to_string()]).unwrap();
+        assert_eq!(
+            cmd.template,
+            "code --reuse-window --goto -- {{filename}}:{{line}}:{{column}}"
+        );
+        assert!(!cmd.suspend);
+    }
+
+    #[test]
+    fn preset_picks_the_plain_template_without_a_line() {
+        let os = os_with_preset("nvim");
+        let cmd = resolve_with_candidates(&os, None, &[]).unwrap();
+        assert_eq!(cmd.template, "nvim -- {{filename}}");
+    }
+
+    #[test]
+    fn a_detected_editor_resolves_to_its_preset() {
+        let os = OsConfig::default();
+        let cmd = resolve_with_candidates(&os, Some(42), &["nvim".to_string()]).unwrap();
+        assert_eq!(cmd.template, "nvim +{{line}} -- {{filename}}");
+        assert!(cmd.suspend);
+    }
+
+    #[test]
+    fn candidates_are_tried_in_order_and_no_ops_are_skipped() {
+        let os = OsConfig::default();
+        let cmd = resolve_with_candidates(
+            &os,
+            None,
+            &["true".to_string(), "".to_string(), "nano".to_string()],
+        )
+        .unwrap();
+        assert_eq!(cmd.template, "nano -- {{filename}}");
+    }
+
+    #[test]
+    fn an_unknown_detected_editor_gets_a_generic_suspending_template() {
+        let os = OsConfig::default();
+        let cmd =
+            resolve_with_candidates(&os, Some(7), &["my-weird-editor -x".to_string()]).unwrap();
+        assert_eq!(cmd.template, "my-weird-editor -x {{filename}}");
+        assert!(cmd.suspend);
+    }
+
+    #[test]
+    fn suspend_on_edit_overrides_a_gui_preset() {
+        let os = OsConfig {
+            edit_preset: "vscode".into(),
+            suspend_on_edit: Some(true),
+            ..OsConfig::default()
+        };
+        assert!(resolve_with_candidates(&os, None, &[]).unwrap().suspend);
+    }
+
+    #[test]
+    fn suspend_on_edit_overrides_a_terminal_preset() {
+        let os = OsConfig {
+            edit_preset: "nvim".into(),
+            suspend_on_edit: Some(false),
+            ..OsConfig::default()
+        };
+        assert!(!resolve_with_candidates(&os, None, &[]).unwrap().suspend);
+    }
+
+    #[test]
+    fn nothing_resolves_when_there_is_no_config_and_no_candidate() {
+        let os = OsConfig::default();
+        assert!(resolve_with_candidates(&os, None, &[]).is_none());
+        assert!(resolve_with_candidates(&os, None, &["true".to_string()]).is_none());
+    }
+
+    #[test]
+    fn an_unknown_preset_name_falls_through_to_detection() {
+        let os = os_with_preset("no-such-preset");
+        let cmd = resolve_with_candidates(&os, None, &["vim".to_string()]).unwrap();
+        assert_eq!(cmd.template, "vim -- {{filename}}");
     }
 }
