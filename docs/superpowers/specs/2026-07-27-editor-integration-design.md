@@ -170,7 +170,9 @@ working unchanged.
 pub edit_preset: String,          // default ""
 
 /// Force terminal handover on or off, overriding the preset's own value.
-#[serde(rename = "suspendOnEdit")]
+// lazygit keeps this wire name for backwards compatibility even though its own
+// Go field is `SuspendOnEdit`. A Go field name is not the YAML key.
+#[serde(rename = "editInTerminal")]
 pub suspend_on_edit: Option<bool>, // default None
 ```
 
@@ -382,7 +384,9 @@ verification is explicit.
 
 **Unit tests — `src/config/user_config.rs`:**
 
-- YAML with `os: { editPreset: nvim, suspendOnEdit: false }` deserialises into the new fields.
+- YAML with `os: { editPreset: nvim, editInTerminal: false }` deserialises into the new fields. The
+  fixture must use lazygit's real keys, not our own field names — a test that builds its fixture from
+  the same string as the `#[serde(rename)]` only proves self-consistency, not compatibility.
 - YAML with no `os:` block yields `edit_preset == ""` and `suspend_on_edit == None`.
 
 **Manual verification** (requires a TTY, cannot be automated here):

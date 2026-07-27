@@ -13,7 +13,12 @@
 ## Global Constraints
 
 - No new crate dependencies. `once_cell` (`Cargo.toml:23`) is already available; use it for memoisation.
-- YAML config keys must match lazygit exactly: `editPreset`, `suspendOnEdit`. `src/config/mod.rs:20` falls back to `~/.config/lazygit/config.yml`, so an existing lazygit config must keep working.
+- YAML config keys must match lazygit exactly: `editPreset`, and **`editInTerminal`** for the suspend
+  override — lazygit keeps the wire name `editInTerminal` for backwards compatibility even though its own
+Go field is `SuspendOnEdit`. `src/config/mod.rs:20` falls back to
+  `~/.config/lazygit/config.yml`, so an existing lazygit config must keep working. Verify a wire name
+  against lazygit's `pkg/config/user_config.go` before asserting compatibility; a Go field name is not
+  the YAML key.
 - `$GIT_EDITOR` must **never** be consulted. It is commonly set to the no-op binary `true` (it is on the target machine), which would make `e` a silent no-op. The literal values `true`, `false`, and `:` must be rejected wherever they appear in the detection chain.
 - Editor commands run through `sh -c`. `{{filename}}` is always POSIX single-quote escaped; `{{line}}` and `{{column}}` are plain digits.
 - A non-zero editor exit status must surface as an error popup. `sh -c` turns *command not found* into a successful spawn with exit status 127, so swallowing non-zero statuses would hide a mistyped `os.edit` entirely.
@@ -641,7 +646,7 @@ git commit -m "feat(os): add editor preset table and \$EDITOR matching"
 
 ---
 
-### Task 4: `editPreset` and `suspendOnEdit` config fields
+### Task 4: `editPreset` and `editInTerminal` config fields
 
 **Files:**
 - Modify: `src/config/user_config.rs:218-261` (`OsConfig` struct and its `Default` impl)
@@ -649,7 +654,8 @@ git commit -m "feat(os): add editor preset table and \$EDITOR matching"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `OsConfig::edit_preset: String` (YAML `editPreset`, default `""`) and `OsConfig::suspend_on_edit: Option<bool>` (YAML `suspendOnEdit`, default `None`). Task 5 reads both.
+- Produces: `OsConfig::edit_preset: String` (YAML `editPreset`, default `""`) and
+  `OsConfig::suspend_on_edit: Option<bool>` (YAML **`editInTerminal`**, default `None`). Task 5 reads both.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -665,7 +671,10 @@ Add to the `mod tests` block in `src/config/user_config.rs`:
 
     #[test]
     fn os_config_reads_lazygit_editor_keys() {
-        let yaml = "editPreset: nvim\nsuspendOnEdit: false\n";
+        // Keys taken from lazygit's own docs/Config.md `os:` block, so this
+        // test fails if our wire names drift from lazygit's.
+        // lazygit: EditPreset -> "editPreset", SuspendOnEdit -> "editInTerminal".
+        let yaml = "editPreset: nvim\neditInTerminal: false\n";
         let os: OsConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(os.edit_preset, "nvim");
         assert_eq!(os.suspend_on_edit, Some(false));
@@ -696,7 +705,12 @@ In `src/config/user_config.rs`, inside `pub struct OsConfig` (after `copy_to_cli
     #[serde(rename = "editPreset")]
     pub edit_preset: String,
     /// Force terminal handover on or off, overriding the preset's own value.
-    #[serde(rename = "suspendOnEdit")]
+    ///
+    /// The YAML key is lazygit's `editInTerminal`, not `suspendOnEdit`: lazygit
+    /// keeps that wire name for backwards compatibility even though its own Go
+    /// field is called `SuspendOnEdit`. Matching it is what lets an existing
+    /// `~/.config/lazygit/config.yml` keep working.
+    #[serde(rename = "editInTerminal")]
     pub suspend_on_edit: Option<bool>,
 ```
 
@@ -716,7 +730,7 @@ Expected: 6 tests PASS, build succeeds.
 
 ```bash
 git add src/config/user_config.rs
-git commit -m "feat(config): add os.editPreset and os.suspendOnEdit"
+git commit -m "feat(config): add os.editPreset and os.editInTerminal"
 ```
 
 ---
