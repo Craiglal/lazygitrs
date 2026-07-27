@@ -2,3 +2,6 @@ _tmp_*
 target/
 
 .claude/settings.local.json
+
+# Subagent-driven-development scratch workspace
+.superpowers/
