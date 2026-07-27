@@ -281,6 +281,9 @@ pub fn resolve_with_candidates(
         if let Some(preset) = preset_for_editor_string(value) {
             return Some(from_preset(preset, line, os));
         }
+        // A known line number is necessarily dropped here: we have no idea what
+        // at-line syntax an unrecognised editor accepts, so the file is opened at
+        // the top rather than risking a bogus argument.
         return Some(EditorCmd {
             template: format!("{value} {{{{filename}}}}"),
             suspend: os.suspend_on_edit.unwrap_or(true),
@@ -622,5 +625,61 @@ mod tests {
         let os = os_with_preset("no-such-preset");
         let cmd = resolve_with_candidates(&os, None, &["vim".to_string()]).unwrap();
         assert_eq!(cmd.template, "vim -- {{filename}}");
+    }
+
+    #[test]
+    fn suspend_on_edit_overrides_an_explicit_config_template() {
+        // Guards the explicit branch: with suspend_on_edit left at None a
+        // hardcoded `true` here would be indistinguishable from unwrap_or(true).
+        let os = OsConfig {
+            edit: "myed {{filename}}".into(),
+            suspend_on_edit: Some(false),
+            ..OsConfig::default()
+        };
+        let cmd = resolve_with_candidates(&os, None, &[]).unwrap();
+        assert_eq!(cmd.template, "myed {{filename}}");
+        assert!(!cmd.suspend);
+    }
+
+    #[test]
+    fn suspend_on_edit_overrides_a_generic_detected_editor() {
+        // Same guard for the generic-fallback branch.
+        let os = OsConfig {
+            suspend_on_edit: Some(false),
+            ..OsConfig::default()
+        };
+        let cmd = resolve_with_candidates(&os, None, &["my-weird-editor".to_string()]).unwrap();
+        assert_eq!(cmd.template, "my-weird-editor {{filename}}");
+        assert!(!cmd.suspend);
+    }
+
+    #[test]
+    fn the_first_usable_candidate_wins_even_when_a_later_one_matches_a_preset() {
+        // $VISUAL outranks $EDITOR per POSIX convention, so an unrecognised
+        // first candidate is used generically and nvim's preset is never
+        // consulted. Pinned because "prefer any preset match" is an easy
+        // mis-edit that would otherwise pass every test.
+        let os = OsConfig::default();
+        let cmd = resolve_with_candidates(
+            &os,
+            Some(7),
+            &["my-weird-editor".to_string(), "nvim".to_string()],
+        )
+        .unwrap();
+        assert_eq!(cmd.template, "my-weird-editor {{filename}}");
+        assert!(cmd.suspend);
+    }
+
+    #[test]
+    fn explicit_edit_beats_a_preset_when_a_line_is_known() {
+        // edit_at_line is empty, so the no-line `edit` template is used even
+        // though a line is known — explicit config still outranks the preset.
+        let os = OsConfig {
+            edit: "myed {{filename}}".into(),
+            edit_preset: "nvim".into(),
+            ..OsConfig::default()
+        };
+        let cmd = resolve_with_candidates(&os, Some(9), &[]).unwrap();
+        assert_eq!(cmd.template, "myed {{filename}}");
     }
 }
