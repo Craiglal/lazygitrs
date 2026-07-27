@@ -132,17 +132,22 @@ dependency (`Cargo.toml:23`).
 
 Modelled on lazygit's editor presets. `{{column}}` is only meaningful for editors that accept it.
 
+Two entries deliberately differ from a naive reading of lazygit's table, both verified against upstream
+source: `micro` must use the `+LINE` flag because its `file:line` suffix is only parsed when the
+`parsecursor` option is enabled (default off), and `nvim-remote` must suspend because `nvr` with no
+running server execs a fresh interactive `nvim` that needs the terminal.
+
 | Name (aliases) | `edit` | `edit_at_line` | `suspend` |
 | --- | --- | --- | --- |
 | `vi` | `vi -- {{filename}}` | `vi +{{line}} -- {{filename}}` | true |
 | `vim` | `vim -- {{filename}}` | `vim +{{line}} -- {{filename}}` | true |
 | `nvim` | `nvim -- {{filename}}` | `nvim +{{line}} -- {{filename}}` | true |
 | `lvim` | `lvim -- {{filename}}` | `lvim +{{line}} -- {{filename}}` | true |
-| `nvim-remote` (`nvr`) | `nvr -- {{filename}}` | `nvr +{{line}} -- {{filename}}` | false |
+| `nvim-remote` (`nvr`) | `nvr -- {{filename}}` | `nvr +{{line}} -- {{filename}}` | true |
 | `helix` (`hx`) | `hx -- {{filename}}` | `hx -- {{filename}}:{{line}}` | true |
 | `kakoune` (`kak`) | `kak -- {{filename}}` | `kak +{{line}} -- {{filename}}` | true |
 | `nano` | `nano -- {{filename}}` | `nano +{{line}} -- {{filename}}` | true |
-| `micro` | `micro {{filename}}` | `micro {{filename}}:{{line}}` | true |
+| `micro` | `micro {{filename}}` | `micro +{{line}} {{filename}}` | true |
 | `emacs` | `emacs --no-window-system -- {{filename}}` | `emacs --no-window-system +{{line}} -- {{filename}}` | true |
 | `vscode` (`code`) | `code --reuse-window -- {{filename}}` | `code --reuse-window --goto -- {{filename}}:{{line}}:{{column}}` | false |
 | `vscodium` (`codium`) | `codium --reuse-window -- {{filename}}` | `codium --reuse-window --goto -- {{filename}}:{{line}}:{{column}}` | false |
