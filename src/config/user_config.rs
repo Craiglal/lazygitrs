@@ -242,7 +242,12 @@ pub struct OsConfig {
     #[serde(rename = "editPreset")]
     pub edit_preset: String,
     /// Force terminal handover on or off, overriding the preset's own value.
-    #[serde(rename = "suspendOnEdit")]
+    ///
+    /// The YAML key is lazygit's `editInTerminal`, not `suspendOnEdit`: lazygit
+    /// keeps that wire name for backwards compatibility even though its own Go
+    /// field is called `SuspendOnEdit`. Matching it is what lets an existing
+    /// `~/.config/lazygit/config.yml` keep working.
+    #[serde(rename = "editInTerminal")]
     pub suspend_on_edit: Option<bool>,
 }
 
@@ -396,7 +401,10 @@ mod tests {
 
     #[test]
     fn os_config_reads_lazygit_editor_keys() {
-        let yaml = "editPreset: nvim\nsuspendOnEdit: false\n";
+        // Keys taken from lazygit's own docs/Config.md `os:` block, so this
+        // test fails if our wire names drift from lazygit's.
+        // lazygit: EditPreset -> "editPreset", SuspendOnEdit -> "editInTerminal".
+        let yaml = "editPreset: nvim\neditInTerminal: false\n";
         let os: OsConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(os.edit_preset, "nvim");
         assert_eq!(os.suspend_on_edit, Some(false));
