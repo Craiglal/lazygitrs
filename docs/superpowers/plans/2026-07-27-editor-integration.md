@@ -1394,8 +1394,11 @@ pub fn run_edit_request(
 - [ ] **Step 6: Run the tests and build**
 
 Run: `cargo test interactive:: && cargo build`
-Expected: 6 tests PASS, build clean. `run_edit_request` has no caller yet, but it is `pub` in a
-`pub mod`, so no dead-code warning is expected.
+Expected: 6 tests PASS, no errors. `run_edit_request`, `run_with_terminal_suspended`,
+`run_editor_detached`, `EditError`, and `Interactive` WILL each warn `never used` at this point:
+`lazygitrs` is a binary-only crate, so `pub` does **not** exempt an item from dead-code analysis
+the way it would in a lib crate. Measured: 48 warnings under `cargo test` at baseline, 53 after
+this task. Do not suppress them — the next task adds the caller and they resolve.
 
 - [ ] **Step 7: Commit**
 
