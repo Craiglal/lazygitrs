@@ -81,7 +81,11 @@ pub static PRESETS: &[Preset] = &[
         aliases: &["nvr"],
         edit: "nvr -- {{filename}}",
         edit_at_line: "nvr +{{line}} -- {{filename}}",
-        suspend: false,
+        // `nvr` with no running server execs a fresh interactive nvim that
+        // needs the tty, so suspending is the only safe default. When a server
+        // IS already listening nvr returns immediately and the only cost is one
+        // redraw of the restored TUI.
+        suspend: true,
     },
     Preset {
         name: "helix",
@@ -108,7 +112,11 @@ pub static PRESETS: &[Preset] = &[
         name: "micro",
         aliases: &[],
         edit: "micro {{filename}}",
-        edit_at_line: "micro {{filename}}:{{line}}",
+        // micro's `file:line` suffix is only honoured when the `parsecursor`
+        // option is on, and it defaults to off — with the default config that
+        // form opens a new empty buffer named "file.rs:42" instead of the file.
+        // The `+LINE` flag is parsed unconditionally.
+        edit_at_line: "micro +{{line}} {{filename}}",
         suspend: true,
     },
     Preset {
@@ -341,8 +349,10 @@ mod tests {
 
     #[test]
     fn preset_for_editor_string_rejects_no_op_binaries() {
-        // Regression: $GIT_EDITOR is commonly `true`. Launching it would make
-        // `e` exit 0 having done nothing — a silent failure.
+        // Behavioural check only. Note this test cannot detect the loss of the
+        // `usable_editor_value` delegation, because none of these values is a
+        // preset name either — the actual guard for the shared rejection list
+        // is `usable_editor_value_rejects_no_op_binaries` below.
         assert!(preset_for_editor_string("true").is_none());
         assert!(preset_for_editor_string("false").is_none());
         assert!(preset_for_editor_string(":").is_none());
@@ -371,5 +381,19 @@ mod tests {
             Some("my-weird-editor")
         );
         assert!(preset_for_editor_string("my-weird-editor").is_none());
+    }
+
+    #[test]
+    fn micro_jumps_to_a_line_with_the_flag_form_not_the_colon_form() {
+        // The colon form depends on micro's `parsecursor` option, which is off
+        // by default and would open a new empty buffer instead of the file.
+        let micro = preset_by_name("micro").unwrap();
+        assert_eq!(micro.edit_at_line, "micro +{{line}} {{filename}}");
+        assert!(!micro.edit_at_line.contains("{{filename}}:{{line}}"));
+    }
+
+    #[test]
+    fn nvim_remote_suspends_because_it_may_exec_an_interactive_nvim() {
+        assert!(preset_by_name("nvr").unwrap().suspend);
     }
 }
