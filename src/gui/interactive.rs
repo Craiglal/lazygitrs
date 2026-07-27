@@ -2,14 +2,15 @@
 //! plain data, then executed by the main loop, which owns the `Terminal`.
 
 use std::panic::{self, AssertUnwindSafe};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 
 use crate::config::user_config::OsConfig;
 use crate::os::editor::{self, EditorCmd};
 
-use super::{Term, enter_terminal_modes, restore_terminal};
+use super::{Term, drain_pending_terminal_events, enter_terminal_modes, restore_terminal};
 
 /// A request to open a file in the user's editor.
 pub struct EditRequest {
@@ -73,6 +74,9 @@ where
     };
 
     enter_terminal_modes(Some(keyboard_enhanced))?;
+    // Discard any query replies the editor left unread, mirroring the two drains
+    // restore_terminal already does — crossterm would parse them as key events.
+    drain_pending_terminal_events(Duration::from_millis(0));
     terminal.clear()?;
     Ok(value)
 }
@@ -94,12 +98,64 @@ fn run_editor_blocking(cmd: &EditorCmd, req: &EditRequest) -> Result<()> {
     Ok(())
 }
 
-/// Launch a GUI editor without touching the terminal.
-fn run_editor_detached(cmd: &EditorCmd, req: &EditRequest) -> Result<()> {
+/// Launch a GUI editor without touching the terminal. Returns the child so the
+/// caller can reap it and observe an early failure (e.g. `sh` exiting 127 when
+/// the editor binary is missing). stdio is nulled because the alternate screen
+/// is live: anything the child prints would corrupt the TUI's cells.
+fn run_editor_detached(cmd: &EditorCmd, req: &EditRequest) -> Result<DetachedEditor> {
     let cmd_str = editor::expand(&cmd.template, &req.path, req.line, req.column);
     crate::os::cmd::log_command(&cmd_str);
-    Command::new("sh").args(["-c", &cmd_str]).spawn()?;
-    Ok(())
+    let child = Command::new("sh")
+        .args(["-c", &cmd_str])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(DetachedEditor {
+        child,
+        cmd_str,
+        started: Instant::now(),
+    })
+}
+
+/// A detached GUI editor we still owe a `wait()`, kept so the main loop can reap
+/// it and surface an immediate failure.
+pub struct DetachedEditor {
+    child: std::process::Child,
+    cmd_str: String,
+    started: Instant,
+}
+
+impl DetachedEditor {
+    /// Poll without blocking. Returns `Some(Err(..))` only when the child failed
+    /// *promptly*, which means it never really started — a GUI editor that the
+    /// user closes with a non-zero status minutes later is not our problem.
+    /// `Some(Ok(()))` means reaped and fine; `None` means still running.
+    pub fn poll(&mut self) -> Option<Result<()>> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() || self.started.elapsed() > Duration::from_secs(1) {
+                    Some(Ok(()))
+                } else if status.code() == Some(127) {
+                    Some(Err(anyhow::anyhow!(
+                        "editor not found (status 127): {}",
+                        self.cmd_str
+                    )))
+                } else {
+                    Some(Err(anyhow::anyhow!(
+                        "editor exited immediately with status {}: {}",
+                        status
+                            .code()
+                            .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                        self.cmd_str
+                    )))
+                }
+            }
+            Ok(None) => None,
+            // Already reaped or unwaitable — nothing useful to report.
+            Err(_) => Some(Ok(())),
+        }
+    }
 }
 
 /// Last resort when no editor could be resolved: the platform's file opener.
@@ -127,17 +183,21 @@ pub fn run_edit_request(
     keyboard_enhanced: bool,
     os: &OsConfig,
     req: EditRequest,
-) -> Result<(), EditError> {
+) -> Result<Option<DetachedEditor>, EditError> {
     match editor::resolve(os, req.line) {
         Some(cmd) if cmd.suspend => {
             let editor_outcome = run_with_terminal_suspended(terminal, keyboard_enhanced, || {
                 run_editor_blocking(&cmd, &req)
             })
             .map_err(EditError::Terminal)?;
-            editor_outcome.map_err(EditError::Editor)
+            editor_outcome.map(|()| None).map_err(EditError::Editor)
         }
-        Some(cmd) => run_editor_detached(&cmd, &req).map_err(EditError::Editor),
-        None => open_with_default_program(os, &req.path).map_err(EditError::Editor),
+        Some(cmd) => run_editor_detached(&cmd, &req)
+            .map(Some)
+            .map_err(EditError::Editor),
+        None => open_with_default_program(os, &req.path)
+            .map(|()| None)
+            .map_err(EditError::Editor),
     }
 }
 
@@ -216,12 +276,56 @@ mod tests {
             suspend: false,
         };
         let started = std::time::Instant::now();
-        assert!(run_editor_detached(&cmd, &req()).is_ok());
+        let mut detached = run_editor_detached(&cmd, &req()).unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(1),
             "run_editor_detached blocked for {:?}",
             started.elapsed()
         );
+        // Don't leave a live `sleep 5` child unreaped inside the test process.
+        let _ = detached.child.kill();
+        let _ = detached.child.wait();
+    }
+
+    #[test]
+    fn detached_editor_reports_a_missing_binary_promptly() {
+        let cmd = EditorCmd {
+            template: "lazygitrs-no-such-editor-xyz {{filename}}".into(),
+            suspend: false,
+        };
+        let mut detached = run_editor_detached(&cmd, &req()).unwrap();
+        // sh exits 127 almost immediately; poll until it is reaped.
+        let outcome = loop {
+            if let Some(outcome) = detached.poll() {
+                break outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let err = outcome.unwrap_err().to_string();
+        assert!(err.contains("127"), "expected status 127 in: {err}");
+        assert!(err.contains("not found"), "127 arm not taken: {err}");
+    }
+
+    #[test]
+    fn detached_editor_does_not_block_and_reaps_a_healthy_child() {
+        let cmd = EditorCmd {
+            template: "true".into(),
+            suspend: false,
+        };
+        let started = std::time::Instant::now();
+        let mut detached = run_editor_detached(&cmd, &req()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "spawn blocked for {:?}",
+            started.elapsed()
+        );
+        let outcome = loop {
+            if let Some(outcome) = detached.poll() {
+                break outcome;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(outcome.is_ok(), "healthy child reported an error");
     }
 
     #[test]

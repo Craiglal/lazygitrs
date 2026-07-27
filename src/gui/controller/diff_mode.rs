@@ -522,6 +522,8 @@ fn handle_diff_exploration_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
                         line,
                         column,
                     }));
+                } else {
+                    anyhow::bail!("file does not exist: {filename}");
                 }
                 return Ok(());
             }

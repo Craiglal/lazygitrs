@@ -223,7 +223,7 @@ pub(crate) fn textarea_input(
     true
 }
 
-fn drain_pending_terminal_events(idle_timeout: Duration) {
+pub(crate) fn drain_pending_terminal_events(idle_timeout: Duration) {
     for _ in 0..EVENT_DRAIN_LIMIT {
         match event::poll(idle_timeout) {
             Ok(true) => {
@@ -300,6 +300,8 @@ pub struct Gui {
     /// An action that needs the real terminal, queued by a key handler and
     /// executed by `main_loop`, which owns the `Terminal`.
     pub pending_interactive: Option<interactive::Interactive>,
+    /// A detached GUI editor awaiting reaping; see `interactive::DetachedEditor`.
+    pub detached_editor: Option<interactive::DetachedEditor>,
     pub search_query: String,
     /// Whether search input mode is active (typing into search bar).
     pub search_active: bool,
@@ -561,6 +563,7 @@ impl Gui {
             needs_files_refresh: false,
             needs_diff_refresh: true,
             pending_interactive: None,
+            detached_editor: None,
             search_query: String::new(),
             search_active: false,
             search_matches: Vec::new(),
@@ -1014,6 +1017,17 @@ impl Gui {
                 }
             }
 
+            // Reap a detached GUI editor, surfacing a prompt failure (e.g. the
+            // editor binary is missing) rather than letting it vanish.
+            if let Some(detached) = self.detached_editor.as_mut() {
+                if let Some(outcome) = detached.poll() {
+                    self.detached_editor = None;
+                    if let Err(err) = outcome {
+                        self.show_error("Editor failed", err);
+                    }
+                }
+            }
+
             // Run any action that needs the real terminal. This is the only
             // place that hands the terminal over, so key handlers stay pure.
             if let Some(action) = self.pending_interactive.take() {
@@ -1021,7 +1035,7 @@ impl Gui {
                     interactive::Interactive::Edit(req) => {
                         let os = self.config.user_config.os.clone();
                         match interactive::run_edit_request(terminal, keyboard_enhanced, &os, req) {
-                            Ok(()) => {}
+                            Ok(detached) => self.detached_editor = detached,
                             Err(interactive::EditError::Editor(err)) => {
                                 self.show_error("Editor failed", err)
                             }
@@ -2621,6 +2635,8 @@ impl Gui {
                                 line,
                                 column,
                             }));
+                    } else {
+                        anyhow::bail!("file does not exist: {filename}");
                     }
                     return Ok(());
                 }
@@ -2730,8 +2746,7 @@ impl Gui {
         // open the working-tree file in the editor (at the first changed hunk)
         // or in the default program.
         if matches_key(key, &keybindings.universal.edit) {
-            self.open_diff_file_in_editor();
-            return Ok(());
+            return self.open_diff_file_in_editor();
         }
         if matches_key(key, &keybindings.universal.open_file) {
             self.open_diff_file_in_default_program();
@@ -2922,14 +2937,14 @@ impl Gui {
         Ok(())
     }
 
-    fn open_diff_file_in_editor(&mut self) {
+    fn open_diff_file_in_editor(&mut self) -> Result<()> {
         let rel_path = self.diff_view.filename.clone();
         if rel_path.is_empty() {
-            return;
+            return Ok(());
         }
         let abs_path_buf = self.git.repo_path().join(&rel_path);
         if !abs_path_buf.exists() {
-            return;
+            anyhow::bail!("file does not exist: {rel_path}");
         }
         let abs_path = abs_path_buf.to_string_lossy().to_string();
 
@@ -2954,6 +2969,7 @@ impl Gui {
         self.pending_interactive = Some(interactive::Interactive::Edit(
             interactive::EditRequest::at(abs_path, active_hunk_line),
         ));
+        Ok(())
     }
 
     fn open_diff_file_in_default_program(&mut self) {
