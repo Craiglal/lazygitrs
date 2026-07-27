@@ -1514,7 +1514,7 @@ In `src/gui/mod.rs`, between the end of the event-handling block (`}` closing `i
 
 ```
 
-`os` is cloned because `run_edit_request` needs `&OsConfig` while `self` is mutably borrowed for `show_error`. `OsConfig` derives `Clone` (`src/config/user_config.rs:218`) and is a handful of strings.
+`os` is cloned for clarity and future-proofing, **not** because the borrow checker requires it — verified by removing the clone and rebuilding successfully: NLL ends the immutable borrow of `self.config` when `run_edit_request` returns, before `show_error` takes `&mut self`. `OsConfig` derives `Clone` (`src/config/user_config.rs:218`) and is a handful of strings, so the copy is cheap and cannot go stale (it is read once, immediately, in the same iteration).
 
 - [ ] **Step 4: Build and verify no warnings**
 
