@@ -606,7 +606,7 @@ pub fn preset_for_editor_string(value: &str) -> Option<&'static Preset> {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test editor::`
-Expected: PASS, 19 tests.
+Expected: PASS, 20 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -960,7 +960,7 @@ pub fn resolve(os: &OsConfig, line: Option<usize>) -> Option<EditorCmd> {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test editor::`
-Expected: PASS, 30 tests.
+Expected: PASS, 31 tests.
 
 - [ ] **Step 5: Commit**
 
