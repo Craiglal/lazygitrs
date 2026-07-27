@@ -120,18 +120,41 @@ fn run_with_terminal_suspended<F, R>(
     keyboard_enhanced: bool,
     f: F,
 ) -> Result<R>
-where F: FnOnce() -> Result<R>;
+where F: FnOnce() -> R;
 ```
+
+> **AMENDED 2026-07-28 — this helper now exists.** It was implemented by the editor-integration
+> work (`docs/superpowers/specs/2026-07-27-editor-integration-design.md`) and shipped in
+> `src/gui/interactive.rs`. Two things below were **wrong** and have been corrected in place; read
+> the corrected steps, not the original ones.
+>
+> The bound is `F: FnOnce() -> R`, not `FnOnce() -> Result<R>`. The outer `Result` reports only
+> whether the *terminal* survived; the callback's own outcome comes back as `R`. Call syntax is
+> unchanged — `run_with_terminal_suspended(term, kbd, || tuicr::run_review(opts))` still compiles,
+> and simply yields `Result<Result<()>>`. That split is what lets a caller distinguish "the review
+> sub-loop failed" (show a popup, keep going) from "the terminal is gone" (fatal).
 
 Behavior:
 1. `restore_terminal(terminal, keyboard_enhanced)` — leave alt screen, disable raw mode,
    pop keyboard-enhancement flags (reuses the existing `restore_terminal`).
 2. Run `f()` inside `std::panic::catch_unwind` so a panic in the callback (or in tuicr)
    cannot leave the terminal wrecked.
-3. Always re-run `setup_terminal()`-equivalent to rebuild lazygitrs's terminal, then force a
-   full clear/redraw and set `needs_refresh = true`.
-4. Propagate the callback's `Result` (or resume-unwind the panic **after** the terminal is
-   restored) so the caller can show an error popup.
+3. **On a normal return only**, re-enter the terminal modes and force a full clear/redraw.
+   ~~Always~~ — the original "always" was **wrong and dangerous**, and this is the correction that
+   matters most for tuicr. `src/main.rs`'s panic hook fires at the panic *site*, before
+   `catch_unwind` returns, so by the time the payload is in hand step 1 has already restored the
+   terminal and the panic message is already on the primary screen. Rebuilding would re-arm raw
+   mode plus the alternate screen and the clear would **erase the message** — and nothing would undo
+   it, because `run()`'s `restore_terminal` is a statement, not a `Drop` guard, and is skipped while
+   unwinding. The process would exit 101 with the user's shell inside the alternate screen with
+   mouse capture live, recoverable only via `reset`. This matters more here than for an editor:
+   `run_review` is an entire TUI, so a rendering panic inside it is an ordinary bug.
+4. If the callback panicked, `resume_unwind` **without rebuilding**. Otherwise return its value.
+5. `needs_refresh = true` is set by the **caller** (the `main_loop` drain), not by the helper — the
+   helper deliberately knows nothing about `Gui`. See `src/gui/mod.rs`'s drain for the pattern,
+   which also re-syncs `self.layout` from `terminal.size()` afterwards, because an editor or
+   sub-loop handles its own `SIGWINCH` and a resize during the callback would otherwise leave the
+   layout stale.
 
 This is the deferred "Phase 4" subprocess mechanism; it also unlocks `$EDITOR` commits and
 interactive custom commands later. It lives in `src/gui/mod.rs` next to
