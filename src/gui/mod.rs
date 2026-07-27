@@ -1,5 +1,6 @@
 pub mod context;
 pub mod controller;
+pub mod interactive;
 pub mod layout;
 pub mod modes;
 pub mod popup;
@@ -7715,7 +7716,11 @@ fn rect_contains(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
-fn setup_terminal() -> Result<(Term, bool)> {
+/// Enable raw mode and enter the alternate screen with mouse, focus, and paste
+/// reporting. When `keyboard_enhanced` is `None` the terminal is probed and the
+/// result returned; when `Some(v)` a previously probed value is reused, so a
+/// re-entry after suspension cannot disagree with the original setup.
+pub(crate) fn enter_terminal_modes(keyboard_enhanced: Option<bool>) -> Result<bool> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -7726,8 +7731,11 @@ fn setup_terminal() -> Result<(Term, bool)> {
         crossterm::event::EnableBracketedPaste,
         cursor::Hide
     )?;
-    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
-    if keyboard_enhanced {
+    let enhanced = match keyboard_enhanced {
+        Some(value) => value,
+        None => crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false),
+    };
+    if enhanced {
         execute!(
             stdout,
             crossterm::event::PushKeyboardEnhancementFlags(
@@ -7737,12 +7745,17 @@ fn setup_terminal() -> Result<(Term, bool)> {
             )
         )?;
     }
-    let backend = CrosstermBackend::new(stdout);
+    Ok(enhanced)
+}
+
+fn setup_terminal() -> Result<(Term, bool)> {
+    let keyboard_enhanced = enter_terminal_modes(None)?;
+    let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend)?;
     Ok((terminal, keyboard_enhanced))
 }
 
-fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
+pub(crate) fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
     drain_pending_terminal_events(Duration::from_millis(0));
 
     if keyboard_enhanced {
