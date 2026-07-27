@@ -270,6 +270,9 @@ impl OsConfig {
             anyhow::bail!("No command configured");
         }
         let cmd_str = crate::os::editor::expand(template, filename, None, 1);
+        if cmd_str.trim().is_empty() {
+            anyhow::bail!("Empty command after template expansion");
+        }
         crate::os::cmd::log_command(&cmd_str);
         std::process::Command::new("sh")
             .args(["-c", &cmd_str])
@@ -289,6 +292,9 @@ impl OsConfig {
             anyhow::bail!("No command configured");
         }
         let cmd_str = crate::os::editor::expand(template, filename, Some(line), column);
+        if cmd_str.trim().is_empty() {
+            anyhow::bail!("Empty command after template expansion");
+        }
         crate::os::cmd::log_command(&cmd_str);
         std::process::Command::new("sh")
             .args(["-c", &cmd_str])
@@ -360,9 +366,15 @@ mod tests {
     }
 
     #[test]
-    fn run_template_spawns_a_command_containing_a_space_in_the_path() {
-        // Regression: split_whitespace() used to shred this into wrong argv.
-        // `true` ignores its arguments, so success means the command line parsed.
-        assert!(OsConfig::run_template("true {{filename}}", "/my repo/a b.rs").is_ok());
+    fn run_template_quotes_a_path_containing_a_space_as_one_shell_word() {
+        // Regression: the old implementation ran split_whitespace() on the
+        // substituted string, shredding this path into three arguments. The
+        // command log records the expanded line, so asserting on it fails if
+        // anyone reverts the quoting.
+        let log = crate::os::cmd::new_command_log();
+        crate::os::cmd::set_thread_command_log(log.clone());
+        OsConfig::run_template("true {{filename}}", "/my repo/a b.rs").unwrap();
+        let entries = log.lock().unwrap();
+        assert_eq!(entries.last().unwrap().as_str(), "true '/my repo/a b.rs'");
     }
 }
