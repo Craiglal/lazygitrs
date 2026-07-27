@@ -297,6 +297,9 @@ pub struct Gui {
     pub needs_refresh: bool,
     pub needs_files_refresh: bool,
     pub needs_diff_refresh: bool,
+    /// An action that needs the real terminal, queued by a key handler and
+    /// executed by `main_loop`, which owns the `Terminal`.
+    pub pending_interactive: Option<interactive::Interactive>,
     pub search_query: String,
     /// Whether search input mode is active (typing into search bar).
     pub search_active: bool,
@@ -557,6 +560,7 @@ impl Gui {
             needs_refresh: false,
             needs_files_refresh: false,
             needs_diff_refresh: true,
+            pending_interactive: None,
             search_query: String::new(),
             search_active: false,
             search_matches: Vec::new(),
@@ -654,13 +658,13 @@ impl Gui {
         let size = terminal.size()?;
         self.layout.update_size(size.width, size.height);
 
-        let result = self.main_loop(&mut terminal);
+        let result = self.main_loop(&mut terminal, keyboard_enhanced);
 
         restore_terminal(&mut terminal, keyboard_enhanced)?;
         result
     }
 
-    fn main_loop(&mut self, terminal: &mut Term) -> Result<()> {
+    fn main_loop(&mut self, terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
         loop {
             // Drain any model parts that have arrived from the background load.
             if let Some(rx) = &self.initial_load_rx {
@@ -1008,6 +1012,36 @@ impl Gui {
                     }
                     _ => {}
                 }
+            }
+
+            // Run any action that needs the real terminal. This is the only
+            // place that hands the terminal over, so key handlers stay pure.
+            if let Some(action) = self.pending_interactive.take() {
+                match action {
+                    interactive::Interactive::Edit(req) => {
+                        let os = self.config.user_config.os.clone();
+                        match interactive::run_edit_request(terminal, keyboard_enhanced, &os, req) {
+                            Ok(()) => {}
+                            Err(interactive::EditError::Editor(err)) => {
+                                self.show_error("Editor failed", err)
+                            }
+                            // The terminal could not be rebuilt, so nothing can
+                            // be drawn. Bail out and let run()'s
+                            // restore_terminal do the final cleanup.
+                            Err(interactive::EditError::Terminal(err)) => return Err(err),
+                        }
+                    }
+                }
+                // The terminal may have been resized while the editor owned it.
+                // `layout` is otherwise only set at startup (:654) and from a
+                // Resize event, and an editor consumes its own SIGWINCH, so
+                // re-sync explicitly rather than relying on an event arriving.
+                if let Ok(size) = terminal.size() {
+                    self.layout.update_size(size.width, size.height);
+                }
+                // The file may have changed on disk; refresh() also sets
+                // needs_diff_refresh, so the open diff reloads too.
+                self.needs_refresh = true;
             }
 
             if self.should_quit {
