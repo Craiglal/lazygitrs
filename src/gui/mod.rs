@@ -4591,6 +4591,10 @@ impl Gui {
                         description: "Back to branches".into(),
                     },
                     HelpEntry {
+                        key: kb.universal.edit.clone(),
+                        description: "Open in editor".into(),
+                    },
+                    HelpEntry {
                         key: ".".into(),
                         description: "Toggle commit details panel".into(),
                     },
@@ -4709,6 +4713,10 @@ impl Gui {
                         description: "Toggle tree view".into(),
                     },
                     HelpEntry {
+                        key: kb.universal.edit.clone(),
+                        description: "Open in editor".into(),
+                    },
+                    HelpEntry {
                         key: "y".into(),
                         description: "Copy to clipboard menu".into(),
                     },
@@ -4786,6 +4794,10 @@ impl Gui {
                     HelpEntry {
                         key: kb.files.toggle_tree_view.clone(),
                         description: "Toggle tree view".into(),
+                    },
+                    HelpEntry {
+                        key: kb.universal.edit.clone(),
+                        description: "Open in editor".into(),
                     },
                     HelpEntry {
                         key: "y".into(),

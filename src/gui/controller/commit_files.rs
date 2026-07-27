@@ -5,6 +5,7 @@ use crate::config::KeybindingConfig;
 use crate::config::keybindings::key_matches;
 use crate::gui::Gui;
 use crate::gui::context::ContextId;
+use crate::gui::interactive::{EditRequest, Interactive};
 use crate::gui::popup::{MenuItem, PopupState};
 use crate::model::FileChangeStatus;
 use crate::os::platform::Platform;
@@ -62,11 +63,50 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
         return Ok(());
     }
 
+    // Open the working-tree version of the selected file in the editor
+    if matches_key(key, &keybindings.universal.edit) {
+        return open_in_editor(gui);
+    }
+
     // Copy to clipboard
     if key.code == KeyCode::Char('y') {
         return copy_to_clipboard_menu(gui);
     }
 
+    Ok(())
+}
+
+/// Open the selected commit file in the editor. A commit's blob cannot be
+/// edited in place, so this opens the working-tree copy of the same path.
+fn open_in_editor(gui: &mut Gui) -> Result<()> {
+    let selected = gui.context_mgr.selected_active();
+
+    // Tree view maps a node to a file index; list view selects directly.
+    let file_idx = if gui.show_commit_file_tree {
+        gui.commit_file_tree_nodes
+            .get(selected)
+            .and_then(|n| n.file_index)
+    } else {
+        Some(selected)
+    };
+    let Some(idx) = file_idx else { return Ok(()) };
+
+    let model = gui.model.lock().unwrap();
+    let Some(file) = model.commit_files.get(idx) else {
+        return Ok(());
+    };
+    let rel_path = file.current_path().to_string();
+    drop(model);
+
+    let abs_path_buf = gui.git.repo_path().join(&rel_path);
+    if !abs_path_buf.exists() {
+        anyhow::bail!("no longer in the working tree: {rel_path}");
+    }
+
+    gui.pending_interactive = Some(Interactive::Edit(EditRequest::at(
+        abs_path_buf.to_string_lossy().to_string(),
+        None,
+    )));
     Ok(())
 }
 
