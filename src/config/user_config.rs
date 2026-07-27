@@ -262,25 +262,23 @@ impl Default for OsConfig {
 
 impl OsConfig {
     /// Run a command template, replacing `{{filename}}` with the given path.
+    /// Runs via `sh -c` and does **not** wait: this is the "open in default
+    /// program" path, which must never block the TUI.
     /// If the template is empty, returns an error.
     pub fn run_template(template: &str, filename: &str) -> anyhow::Result<()> {
         if template.is_empty() {
             anyhow::bail!("No command configured");
         }
-        let cmd_str = template.replace("{{filename}}", filename);
-        // Split into program + args, respecting the template format
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            anyhow::bail!("Empty command after template expansion");
-        }
+        let cmd_str = crate::os::editor::expand(template, filename, None, 1);
         crate::os::cmd::log_command(&cmd_str);
-        std::process::Command::new(parts[0])
-            .args(&parts[1..])
+        std::process::Command::new("sh")
+            .args(["-c", &cmd_str])
             .spawn()?;
         Ok(())
     }
 
-    /// Run a command template replacing `{{filename}}`, `{{line}}`, and `{{column}}` with the given values.
+    /// Run a command template replacing `{{filename}}`, `{{line}}`, and
+    /// `{{column}}` with the given values. Non-blocking, like `run_template`.
     pub fn run_template_at_line(
         template: &str,
         filename: &str,
@@ -290,17 +288,10 @@ impl OsConfig {
         if template.is_empty() {
             anyhow::bail!("No command configured");
         }
-        let cmd_str = template
-            .replace("{{filename}}", filename)
-            .replace("{{line}}", &line.to_string())
-            .replace("{{column}}", &column.to_string());
-        let parts: Vec<&str> = cmd_str.split_whitespace().collect();
-        if parts.is_empty() {
-            anyhow::bail!("Empty command after template expansion");
-        }
+        let cmd_str = crate::os::editor::expand(template, filename, Some(line), column);
         crate::os::cmd::log_command(&cmd_str);
-        std::process::Command::new(parts[0])
-            .args(&parts[1..])
+        std::process::Command::new("sh")
+            .args(["-c", &cmd_str])
             .spawn()?;
         Ok(())
     }
@@ -344,4 +335,34 @@ pub struct CustomCommandPrompt {
     pub key: Option<String>,
     pub command: Option<String>,
     pub filter: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_template_rejects_an_empty_template() {
+        let err = OsConfig::run_template("", "/tmp/a.rs").unwrap_err();
+        assert!(
+            err.to_string().contains("No command configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_template_at_line_rejects_an_empty_template() {
+        let err = OsConfig::run_template_at_line("", "/tmp/a.rs", 3, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("No command configured"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn run_template_spawns_a_command_containing_a_space_in_the_path() {
+        // Regression: split_whitespace() used to shred this into wrong argv.
+        // `true` ignores its arguments, so success means the command line parsed.
+        assert!(OsConfig::run_template("true {{filename}}", "/my repo/a b.rs").is_ok());
+    }
 }
