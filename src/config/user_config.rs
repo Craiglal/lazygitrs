@@ -237,6 +237,13 @@ pub struct OsConfig {
     /// Command to copy text to clipboard (text is piped via stdin).
     #[serde(rename = "copyToClipboardCmd")]
     pub copy_to_clipboard_cmd: String,
+    /// Named editor preset, e.g. `"nvim"` or `"vscode"`. Empty means autodetect
+    /// from `$VISUAL` / `$EDITOR` / `git config core.editor`.
+    #[serde(rename = "editPreset")]
+    pub edit_preset: String,
+    /// Force terminal handover on or off, overriding the preset's own value.
+    #[serde(rename = "suspendOnEdit")]
+    pub suspend_on_edit: Option<bool>,
 }
 
 impl Default for OsConfig {
@@ -256,6 +263,8 @@ impl Default for OsConfig {
             open: open_cmd.to_string(),
             open_dir_in_editor: String::new(),
             copy_to_clipboard_cmd: copy_cmd.to_string(),
+            edit_preset: String::new(),
+            suspend_on_edit: None,
         }
     }
 }
@@ -376,5 +385,29 @@ mod tests {
         OsConfig::run_template("true {{filename}}", "/my repo/a b.rs").unwrap();
         let entries = log.lock().unwrap();
         assert_eq!(entries.last().unwrap().as_str(), "true '/my repo/a b.rs'");
+    }
+
+    #[test]
+    fn os_config_defaults_leave_the_editor_unconfigured() {
+        let os = OsConfig::default();
+        assert_eq!(os.edit_preset, "");
+        assert_eq!(os.suspend_on_edit, None);
+    }
+
+    #[test]
+    fn os_config_reads_lazygit_editor_keys() {
+        let yaml = "editPreset: nvim\nsuspendOnEdit: false\n";
+        let os: OsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(os.edit_preset, "nvim");
+        assert_eq!(os.suspend_on_edit, Some(false));
+    }
+
+    #[test]
+    fn os_config_tolerates_a_config_without_editor_keys() {
+        let yaml = "copyToClipboardCmd: pbcopy\n";
+        let os: OsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(os.edit_preset, "");
+        assert_eq!(os.suspend_on_edit, None);
+        assert_eq!(os.copy_to_clipboard_cmd, "pbcopy");
     }
 }
