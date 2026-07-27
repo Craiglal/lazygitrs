@@ -4,6 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::config::KeybindingConfig;
 use crate::config::keybindings::key_matches;
 use crate::gui::Gui;
+use crate::gui::interactive::{EditRequest, Interactive};
 use crate::gui::popup::{
     CommitInputFocus, MenuItem, PopupState, make_commit_body_textarea,
     make_commit_summary_textarea, make_textarea,
@@ -494,50 +495,33 @@ fn open_in_editor(gui: &mut Gui) -> Result<()> {
         return Ok(());
     };
     let model = gui.model.lock().unwrap();
-    if let Some(file) = model.files.get(file_idx) {
-        let rel_path = file.current_path().to_string();
-        drop(model);
+    let Some(file) = model.files.get(file_idx) else {
+        return Ok(());
+    };
+    let rel_path = file.current_path().to_string();
+    drop(model);
 
-        let abs_path = gui
-            .git
-            .repo_path()
-            .join(&rel_path)
-            .to_string_lossy()
-            .to_string();
-        let os = &gui.config.user_config.os;
-
-        // Jump to first changed hunk if the diff for this file is loaded.
-        let first_hunk_line = if gui.diff_view.filename == rel_path {
-            gui.diff_view.hunk_starts.first().and_then(|&idx| {
-                gui.diff_view
-                    .file_line_number(idx, DiffPanel::New)
-                    .or_else(|| gui.diff_view.file_line_number(idx, DiffPanel::Old))
-            })
-        } else {
-            None
-        };
-
-        if let Some(line) = first_hunk_line {
-            let tpl = if !os.edit_at_line.is_empty() {
-                &os.edit_at_line
-            } else {
-                &os.edit
-            };
-            if !tpl.is_empty() {
-                crate::config::user_config::OsConfig::run_template_at_line(
-                    tpl, &abs_path, line, 1,
-                )?;
-                return Ok(());
-            }
-        }
-
-        if !os.edit.is_empty() {
-            crate::config::user_config::OsConfig::run_template(&os.edit, &abs_path)?;
-        } else {
-            // Fallback: use $EDITOR or platform open
-            Platform::open_file(&abs_path)?;
-        }
+    let abs_path_buf = gui.git.repo_path().join(&rel_path);
+    if !abs_path_buf.exists() {
+        anyhow::bail!("file does not exist: {rel_path}");
     }
+    let abs_path = abs_path_buf.to_string_lossy().to_string();
+
+    // Jump to the first changed hunk if the diff for this file is loaded.
+    let first_hunk_line = if gui.diff_view.filename == rel_path {
+        gui.diff_view.hunk_starts.first().and_then(|&idx| {
+            gui.diff_view
+                .file_line_number(idx, DiffPanel::New)
+                .or_else(|| gui.diff_view.file_line_number(idx, DiffPanel::Old))
+        })
+    } else {
+        None
+    };
+
+    gui.pending_interactive = Some(Interactive::Edit(EditRequest::at(
+        abs_path,
+        first_hunk_line,
+    )));
     Ok(())
 }
 

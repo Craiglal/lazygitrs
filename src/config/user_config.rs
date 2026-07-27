@@ -293,28 +293,6 @@ impl OsConfig {
             .spawn()?;
         Ok(())
     }
-
-    /// Run a command template replacing `{{filename}}`, `{{line}}`, and
-    /// `{{column}}` with the given values. Non-blocking, like `run_template`.
-    pub fn run_template_at_line(
-        template: &str,
-        filename: &str,
-        line: usize,
-        column: usize,
-    ) -> anyhow::Result<()> {
-        if template.is_empty() {
-            anyhow::bail!("No command configured");
-        }
-        let cmd_str = crate::os::editor::expand(template, filename, Some(line), column);
-        if cmd_str.trim().is_empty() {
-            anyhow::bail!("Empty command after template expansion");
-        }
-        crate::os::cmd::log_command(&cmd_str);
-        std::process::Command::new("sh")
-            .args(["-c", &cmd_str])
-            .spawn()?;
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,15 +342,6 @@ mod tests {
     #[test]
     fn run_template_rejects_an_empty_template() {
         let err = OsConfig::run_template("", "/tmp/a.rs").unwrap_err();
-        assert!(
-            err.to_string().contains("No command configured"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn run_template_at_line_rejects_an_empty_template() {
-        let err = OsConfig::run_template_at_line("", "/tmp/a.rs", 3, 1).unwrap_err();
         assert!(
             err.to_string().contains("No command configured"),
             "unexpected error: {err}"

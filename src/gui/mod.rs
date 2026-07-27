@@ -2613,24 +2613,14 @@ impl Gui {
                     self.diff_view.selection = None;
                     let abs_path = self.git.repo_path().join(&filename);
                     if !filename.is_empty() && abs_path.exists() {
-                        let abs_path = abs_path.to_string_lossy().to_string();
-                        let os = &self.config.user_config.os;
-                        if let Some(ln) =
-                            line.or_else(|| self.diff_view.file_line_number(line_idx, line_panel))
-                        {
-                            let tpl = if !os.edit_at_line.is_empty() {
-                                &os.edit_at_line
-                            } else {
-                                &os.edit
-                            };
-                            let _ = crate::config::user_config::OsConfig::run_template_at_line(
-                                tpl, &abs_path, ln, column,
-                            );
-                        } else {
-                            let _ = crate::config::user_config::OsConfig::run_template(
-                                &os.edit, &abs_path,
-                            );
-                        }
+                        let line =
+                            line.or_else(|| self.diff_view.file_line_number(line_idx, line_panel));
+                        self.pending_interactive =
+                            Some(interactive::Interactive::Edit(interactive::EditRequest {
+                                path: abs_path.to_string_lossy().to_string(),
+                                line,
+                                column,
+                            }));
                     }
                     return Ok(());
                 }
@@ -2942,7 +2932,6 @@ impl Gui {
             return;
         }
         let abs_path = abs_path_buf.to_string_lossy().to_string();
-        let os = &self.config.user_config.os;
 
         // Pick the hunk currently at the top of the viewport (after `{`/`}`
         // navigation, scroll_offset sits on a hunk start). Fall back to the
@@ -2962,25 +2951,9 @@ impl Gui {
                 .or_else(|| self.diff_view.file_line_number(idx, DiffPanel::Old))
         });
 
-        if let Some(line) = active_hunk_line {
-            let tpl = if !os.edit_at_line.is_empty() {
-                &os.edit_at_line
-            } else {
-                &os.edit
-            };
-            if !tpl.is_empty() {
-                let _ = crate::config::user_config::OsConfig::run_template_at_line(
-                    tpl, &abs_path, line, 1,
-                );
-                return;
-            }
-        }
-
-        if !os.edit.is_empty() {
-            let _ = crate::config::user_config::OsConfig::run_template(&os.edit, &abs_path);
-        } else {
-            let _ = crate::os::platform::Platform::open_file(&abs_path);
-        }
+        self.pending_interactive = Some(interactive::Interactive::Edit(
+            interactive::EditRequest::at(abs_path, active_hunk_line),
+        ));
     }
 
     fn open_diff_file_in_default_program(&mut self) {
@@ -5082,13 +5055,9 @@ impl Gui {
         if !abs_path_buf.exists() {
             anyhow::bail!("file does not exist: {path}");
         }
-        let abs_path = abs_path_buf.to_string_lossy().to_string();
-        let os = &self.config.user_config.os;
-        if !os.edit.is_empty() {
-            crate::config::user_config::OsConfig::run_template(&os.edit, &abs_path)?;
-        } else {
-            crate::os::platform::Platform::open_file(&abs_path)?;
-        }
+        self.pending_interactive = Some(interactive::Interactive::Edit(
+            interactive::EditRequest::at(abs_path_buf.to_string_lossy().to_string(), None),
+        ));
         Ok(())
     }
 

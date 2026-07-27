@@ -5,6 +5,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::keybindings::key_matches;
+use crate::gui::interactive::{EditRequest, Interactive};
 use crate::gui::modes::diff_mode::{DiffModeFocus, DiffModeSelector};
 use crate::gui::popup::{HelpEntry, HelpSection, MenuItem, PopupState};
 use crate::gui::{DiffPayload, DiffResult, Gui, textarea_input};
@@ -514,23 +515,13 @@ fn handle_diff_exploration_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
                 gui.diff_view.selection = None;
                 let abs_path = gui.git.repo_path().join(&filename);
                 if !filename.is_empty() && abs_path.exists() {
-                    let abs_path = abs_path.to_string_lossy().to_string();
-                    let os = &gui.config.user_config.os;
-                    if let Some(ln) =
-                        line.or_else(|| gui.diff_view.file_line_number(line_idx, line_panel))
-                    {
-                        let tpl = if !os.edit_at_line.is_empty() {
-                            &os.edit_at_line
-                        } else {
-                            &os.edit
-                        };
-                        let _ = crate::config::user_config::OsConfig::run_template_at_line(
-                            tpl, &abs_path, ln, column,
-                        );
-                    } else {
-                        let _ =
-                            crate::config::user_config::OsConfig::run_template(&os.edit, &abs_path);
-                    }
+                    let line =
+                        line.or_else(|| gui.diff_view.file_line_number(line_idx, line_panel));
+                    gui.pending_interactive = Some(Interactive::Edit(EditRequest {
+                        path: abs_path.to_string_lossy().to_string(),
+                        line,
+                        column,
+                    }));
                 }
                 return Ok(());
             }
