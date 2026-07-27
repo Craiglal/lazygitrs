@@ -1500,6 +1500,13 @@ In `src/gui/mod.rs`, between the end of the event-handling block (`}` closing `i
                         }
                     }
                 }
+                // The terminal may have been resized while the editor owned it.
+                // `layout` is otherwise only set at startup (:654) and from a
+                // Resize event, and an editor consumes its own SIGWINCH, so
+                // re-sync explicitly rather than relying on an event arriving.
+                if let Ok(size) = terminal.size() {
+                    self.layout.update_size(size.width, size.height);
+                }
                 // The file may have changed on disk; refresh() also sets
                 // needs_diff_refresh, so the open diff reloads too.
                 self.needs_refresh = true;
