@@ -199,14 +199,23 @@ Behaviour:
 1. `restore_terminal(terminal, keyboard_enhanced)` — leaves the alternate screen, disables raw
    mode and mouse capture, pops keyboard-enhancement flags, drains pending input.
 2. Run `f()` inside `std::panic::catch_unwind` (with `AssertUnwindSafe`).
-3. Unconditionally rebuild the terminal via the `setup_terminal` sequence, then `terminal.clear()`
-   so ratatui's buffer diffing cannot leave stale cells from the editor's output.
-4. If `f` panicked, `resume_unwind` **after** step 3, so the terminal is whole first.
+3. On a **normal return only**, rebuild the terminal via the `setup_terminal` sequence, then
+   `terminal.clear()` so ratatui's buffer diffing cannot leave stale cells from the editor's output.
+4. If `f` panicked, `resume_unwind` **without rebuilding**. This is the opposite of the obvious
+   instinct and the reason is specific to this codebase: step 1 already restored the terminal, and
+   `main.rs`'s panic hook fires at the panic site *before* `catch_unwind` returns, so by the time we
+   see the payload the terminal is already clean and the message is already printed. Rebuilding
+   would re-arm raw mode plus the alternate screen and `clear()` would erase the message — and
+   nothing would undo it, because `run()`'s `restore_terminal` is a statement, not a `Drop` guard,
+   and is skipped while unwinding. The process would exit 101 with the user's shell inside the
+   alternate screen with mouse capture live, recoverable only via `reset`.
 5. Otherwise return `f`'s `Result` for the caller to turn into an error popup.
 
-Step 3 must run on every exit path. If the rebuild itself fails, that error is returned; the
-caller propagates it out of `main_loop`, and `run()` (`src/gui/mod.rs:658`) still executes its own
-`restore_terminal`.
+Step 3 runs on the normal-return path only. If the rebuild itself fails, that error is returned;
+the caller propagates it out of `main_loop`, and `run()` (`src/gui/mod.rs:658`) still executes its
+own `restore_terminal`. **Note for the tuicr integration:** because a panic inside the callback now
+leaves the terminal restored and does not rebuild, `run_review` panicking is safe by construction —
+which matters more there than here, since a review sub-loop is a whole TUI.
 
 ### 5. `src/gui/interactive.rs` (new) — deferred request
 

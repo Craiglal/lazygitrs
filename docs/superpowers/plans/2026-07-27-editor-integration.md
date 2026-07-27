@@ -1195,7 +1195,10 @@ mod tests {
             suspend: true,
         };
         let err = run_editor_blocking(&cmd, &req()).unwrap_err().to_string();
-        assert!(err.contains('3'), "exit code missing from: {err}");
+        // Not `contains('3')`: the expanded command line "exit 3" is echoed in
+        // every arm, so a bare digit check passes even if the code is dropped.
+        assert!(err.contains("status 3"), "exit code missing from: {err}");
+        assert!(!err.contains("127"), "wrong arm taken: {err}");
     }
 
     #[test]
@@ -1209,6 +1212,25 @@ mod tests {
         };
         let err = run_editor_blocking(&cmd, &req()).unwrap_err().to_string();
         assert!(err.contains("127"), "expected status 127 in: {err}");
+        assert!(err.contains("not found"), "127 arm not taken: {err}");
+    }
+
+    #[test]
+    fn run_editor_detached_does_not_wait_for_the_child() {
+        // Guards .spawn() against being changed to .status(): with .status()
+        // this would block for 5 seconds and freeze the whole TUI for a user
+        // with a GUI editor configured.
+        let cmd = EditorCmd {
+            template: "sleep 5".into(),
+            suspend: false,
+        };
+        let started = std::time::Instant::now();
+        assert!(run_editor_detached(&cmd, &req()).is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "run_editor_detached blocked for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1294,6 +1316,9 @@ pub enum Interactive {
 /// The returned `Result` reports only whether the *terminal* survived. `f`'s own
 /// outcome comes back as `R`, so a caller can tell "the editor failed" (worth a
 /// popup) from "the terminal is gone" (fatal).
+///
+/// On a panic in `f` the terminal is left restored and the panic is re-raised
+/// without rebuilding — see the comment on the unwind arm for why.
 pub fn run_with_terminal_suspended<F, R>(
     terminal: &mut Term,
     keyboard_enhanced: bool,
@@ -1304,25 +1329,24 @@ where
 {
     restore_terminal(terminal, keyboard_enhanced)?;
 
-    let outcome = panic::catch_unwind(AssertUnwindSafe(f));
-
-    // Rebuild before inspecting the outcome: a panic or an error must not be
-    // allowed to leave the terminal in raw mode. `clear()` is required because
-    // ratatui diffs against its own buffer and would otherwise keep cells the
-    // editor has since overwritten.
-    let rebuilt = (|| -> Result<()> {
-        enter_terminal_modes(Some(keyboard_enhanced))?;
-        terminal.clear()?;
-        Ok(())
-    })();
-
-    match outcome {
-        Ok(value) => {
-            rebuilt?;
-            Ok(value)
-        }
+    let value = match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        // Do NOT rebuild while unwinding. The terminal is already restored, and
+        // main.rs's panic hook has already run — hooks fire at the panic site,
+        // before catch_unwind returns — so rebuilding here would re-enter raw
+        // mode and the alternate screen, and terminal.clear() would erase the
+        // panic message. Nothing on the unwind path would undo it:
+        // gui/mod.rs's restore_terminal is a statement, not a Drop guard, and
+        // is skipped while unwinding, so the process would exit 101 with the
+        // terminal fully armed and the user's shell needing `reset`.
         Err(payload) => panic::resume_unwind(payload),
-    }
+    };
+
+    // Normal return only. `clear()` is required because ratatui diffs against
+    // its own back buffer and would otherwise keep cells the editor overwrote.
+    enter_terminal_modes(Some(keyboard_enhanced))?;
+    terminal.clear()?;
+    Ok(value)
 }
 
 /// Run a terminal editor to completion with inherited stdio, so it owns the TTY.
@@ -1394,7 +1418,7 @@ pub fn run_edit_request(
 - [ ] **Step 6: Run the tests and build**
 
 Run: `cargo test interactive:: && cargo build`
-Expected: 6 tests PASS, no errors. `run_edit_request`, `run_with_terminal_suspended`,
+Expected: 7 tests PASS, no errors. `run_edit_request`, `run_with_terminal_suspended`,
 `run_editor_detached`, `EditError`, and `Interactive` WILL each warn `never used` at this point:
 `lazygitrs` is a binary-only crate, so `pub` does **not** exempt an item from dead-code analysis
 the way it would in a lib crate. Measured: 48 warnings under `cargo test` at baseline, 53 after
@@ -1493,7 +1517,7 @@ Expected: `no errors`.
 - [ ] **Step 5: Run the full test suite**
 
 Run: `cargo test`
-Expected: PASS, 131 tests (125 after Task 5, plus Task 6's 6).
+Expected: PASS, 132 tests (125 after Task 5, plus Task 6's 7).
 
 - [ ] **Step 6: Commit**
 
