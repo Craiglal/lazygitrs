@@ -18,7 +18,11 @@
 - Editor commands run through `sh -c`. `{{filename}}` is always POSIX single-quote escaped; `{{line}}` and `{{column}}` are plain digits.
 - A non-zero editor exit status must surface as an error popup. `sh -c` turns *command not found* into a successful spawn with exit status 127, so swallowing non-zero statuses would hide a mistyped `os.edit` entirely.
 - Terminal rebuild after suspension must happen on **every** exit path, including panics, before the outcome is inspected.
-- Test command is plain `cargo test` (the `justfile` has no test target). Build check is `cargo build`.
+- Test command is plain `cargo test` — `lazygitrs` is a **binary-only** crate, so `cargo test --lib` fails with
+  "no library targets found". Filter with a module path instead: `cargo test editor::`.
+- The repo carries roughly 48 pre-existing warnings (dead code, unused imports) at baseline. Do **not** try to
+  fix them — they are out of scope. Build gates check for `error` only. A `never used` warning for a function
+  this task adds is expected until a later task wires it up.
 - Do not touch `os.editAtLineAndWait` or `os.openDirInEditor`. Both fields exist and are unread; they stay unread.
 - No README changes (the README documents no config keys). If that ever changes, `just sync_readme` is mandatory per `CLAUDE.md`.
 
@@ -117,7 +121,7 @@ mod tests {
 
 - [ ] **Step 3: Run the tests to verify they fail**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: FAIL to compile — `cannot find function shell_quote in this scope`.
 
 - [ ] **Step 4: Write the implementation**
@@ -161,7 +165,7 @@ pub fn expand(template: &str, path: &str, line: Option<usize>, column: usize) ->
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
@@ -223,7 +227,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify the third one is the meaningful check**
 
-Run: `cargo test --lib user_config::`
+Run: `cargo test user_config::`
 Expected: all three PASS already (the empty-template guards exist, and `true` tolerates bad argv). This test module is a regression net for the rewrite in Step 3 — it must keep passing.
 
 - [ ] **Step 3: Rewrite both methods**
@@ -271,7 +275,7 @@ impl OsConfig {
 
 - [ ] **Step 4: Run the tests and build**
 
-Run: `cargo test --lib user_config:: && cargo build`
+Run: `cargo test user_config:: && cargo build`
 Expected: 3 tests PASS, build succeeds with no warnings about the module.
 
 - [ ] **Step 5: Commit**
@@ -380,7 +384,7 @@ Add to the `mod tests` block in `src/os/editor.rs`:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: FAIL to compile — `cannot find function preset_by_name in this scope`.
 
 - [ ] **Step 3: Write the implementation**
@@ -576,7 +580,7 @@ pub fn preset_for_editor_string(value: &str) -> Option<&'static Preset> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: PASS, 19 tests.
 
 - [ ] **Step 5: Commit**
@@ -630,7 +634,7 @@ Add to the `mod tests` block in `src/config/user_config.rs`:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib user_config::`
+Run: `cargo test user_config::`
 Expected: FAIL to compile — `no field edit_preset on type OsConfig`.
 
 - [ ] **Step 3: Add the fields**
@@ -656,7 +660,7 @@ And in `impl Default for OsConfig` (after `copy_to_clipboard_cmd`, currently lin
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib user_config:: && cargo build`
+Run: `cargo test user_config:: && cargo build`
 Expected: 6 tests PASS, build succeeds.
 
 - [ ] **Step 5: Commit**
@@ -805,7 +809,7 @@ Add to the `mod tests` block in `src/os/editor.rs`:
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: FAIL to compile — `cannot find function resolve_with_candidates in this scope`.
 
 - [ ] **Step 3: Write the implementation**
@@ -930,7 +934,7 @@ pub fn resolve(os: &OsConfig, line: Option<usize>) -> Option<EditorCmd> {
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test --lib editor::`
+Run: `cargo test editor::`
 Expected: PASS, 30 tests.
 
 - [ ] **Step 5: Commit**
@@ -1115,7 +1119,7 @@ mod tests {
 
 - [ ] **Step 4: Run the tests to verify they fail**
 
-Run: `cargo test --lib interactive::`
+Run: `cargo test interactive::`
 Expected: FAIL to compile — `cannot find type EditRequest in this scope`.
 
 - [ ] **Step 5: Write the implementation**
@@ -1267,7 +1271,7 @@ pub fn run_edit_request(
 
 - [ ] **Step 6: Run the tests and build**
 
-Run: `cargo test --lib interactive:: && cargo build`
+Run: `cargo test interactive:: && cargo build`
 Expected: 6 tests PASS, build clean. `run_edit_request` has no caller yet, but it is `pub` in a
 `pub mod`, so no dead-code warning is expected.
 
@@ -1358,8 +1362,8 @@ In `src/gui/mod.rs`, between the end of the event-handling block (`}` closing `i
 
 - [ ] **Step 4: Build and verify no warnings**
 
-Run: `cargo build 2>&1 | grep -E "^(warning|error)" || echo "clean"`
-Expected: `clean`.
+Run: `cargo build 2>&1 | grep -E "^error" || echo "no errors"`
+Expected: `no errors`.
 
 - [ ] **Step 5: Run the full test suite**
 
@@ -1551,8 +1555,8 @@ Steps 1-5, so leaving it would be dead code.
 
 - [ ] **Step 7: Build and check for warnings**
 
-Run: `cargo build 2>&1 | grep -E "^(warning|error)" || echo "clean"`
-Expected: `clean`. If an unused-import warning appears for `DiffPanel` in `files.rs`, that means Step 1's hunk-line logic was dropped — restore it.
+Run: `cargo build 2>&1 | grep -E "^error" || echo "no errors"`
+Expected: `no errors`. If an unused-import warning appears for `DiffPanel` in `files.rs`, that means Step 1's hunk-line logic was dropped — restore it.
 
 - [ ] **Step 8: Run the full test suite**
 
@@ -1702,7 +1706,7 @@ git commit -m "feat(gui): open working-tree file from the commit files panel wit
 - [ ] **Full suite and clean build**
 
 ```bash
-cargo test && cargo build 2>&1 | grep -E "^(warning|error)" || echo "clean"
+cargo test && cargo build 2>&1 | grep -E "^error" || echo "no errors"
 ```
 
 - [ ] **Preset override path**
