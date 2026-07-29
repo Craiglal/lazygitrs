@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Generate a Conventional Commits message for a staged diff via the DeepSeek API.
+#
+# Contract with lazygitrs (git.commit.generateCommand):
+#   stdin  - output of `git diff --cached`, piped in by lazygitrs
+#   stdout - the commit message and nothing else
+#   stderr - human-readable reason on failure (lazygitrs shows this in the UI)
+#   exit   - 0 on success, non-zero on failure
+#
+# The diff arrives on stdin because GenerateInputMode::for_command
+# (src/git/ai_commit.rs) reserves repo-inspection mode for the agent CLIs
+# claude/codex/crabcode/opencode; any other command name gets StdinDiff.
+#
+# Environment:
+#   DEEPSEEK_API_KEY          required (unless AI_COMMIT_STUB_RESPONSE is set)
+#   AI_COMMIT_MODEL           default: deepseek-v4-flash
+#   AI_COMMIT_API_URL         default: https://api.deepseek.com/chat/completions
+#   AI_COMMIT_MAX_TOKENS      default: 3000
+#   AI_COMMIT_MAX_DIFF_CHARS  default: 120000
+#   AI_COMMIT_TIMEOUT         default: 120 (seconds)
+#
+# Test-only seams, used by contrib/test-ai-commit.sh:
+#   AI_COMMIT_STUB_RESPONSE   path to a JSON file used instead of calling the API
+#   AI_COMMIT_STUB_HTTP_CODE  HTTP status to simulate with the stub (default 200)
+
+set -uo pipefail
+
+MODEL="${AI_COMMIT_MODEL:-deepseek-v4-flash}"
+API_URL="${AI_COMMIT_API_URL:-https://api.deepseek.com/chat/completions}"
+MAX_TOKENS="${AI_COMMIT_MAX_TOKENS:-3000}"
+MAX_DIFF_CHARS="${AI_COMMIT_MAX_DIFF_CHARS:-120000}"
+TIMEOUT="${AI_COMMIT_TIMEOUT:-120}"
+STUB_RESPONSE="${AI_COMMIT_STUB_RESPONSE:-}"
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+command -v jq >/dev/null 2>&1 || die "jq is required but was not found on PATH."
+
+diff="$(cat)"
+printf '%s' "$diff" | grep -q '[^[:space:]]' || die "No staged changes to describe."
+
+# Keep very large diffs inside a sane request size; the tail of a big change is
+# usually its least informative part.
+if [ "${#diff}" -gt "$MAX_DIFF_CHARS" ]; then
+    diff="${diff:0:$MAX_DIFF_CHARS}"$'\n\n[diff truncated at '"$MAX_DIFF_CHARS"$' characters]'
+fi
+
+system_prompt='You write git commit messages. Follow the Conventional Commits specification.
+
+Rules:
+- First line: `<type>(<optional scope>): <summary>` in imperative mood, at most 72 characters, no trailing period.
+- Then one blank line, then a body of "- " bullet points explaining what changed and why.
+- Describe only what the diff actually shows. Never invent changes, issue numbers, or co-authors.
+- Output the raw commit message only: no markdown code fences, no preamble, no trailing commentary.'
+
+if [ -n "$STUB_RESPONSE" ]; then
+    [ -f "$STUB_RESPONSE" ] || die "AI_COMMIT_STUB_RESPONSE points at a missing file: $STUB_RESPONSE"
+    body="$(cat "$STUB_RESPONSE")"
+    http_code="${AI_COMMIT_STUB_HTTP_CODE:-200}"
+else
+    [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY is not set (expected it exported from ~/.zshenv)."
+    command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH."
+
+    payload="$(
+        jq -n \
+            --arg model "$MODEL" \
+            --arg system "$system_prompt" \
+            --arg user "Write a commit message for this staged diff:"$'\n\n'"$diff" \
+            --argjson max_tokens "$MAX_TOKENS" \
+            '{
+                model: $model,
+                stream: false,
+                max_tokens: $max_tokens,
+                messages: [
+                    {role: "system", content: $system},
+                    {role: "user", content: $user}
+                ]
+            }'
+    )" || die "Failed to build the request payload."
+
+    response="$(
+        printf '%s' "$payload" | curl -sS -X POST "$API_URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+            --max-time "$TIMEOUT" \
+            --data-binary @- \
+            -w $'\n%{http_code}'
+    )" || die "Request to the API failed (network error or timeout after ${TIMEOUT}s)."
+
+    http_code="${response##*$'\n'}"
+    body="${response%$'\n'*}"
+fi
+
+if [ "$http_code" != "200" ]; then
+    api_error="$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)"
+    [ -n "$api_error" ] || api_error="$(printf '%s' "$body" | head -c 500)"
+    die "API returned HTTP ${http_code}: ${api_error}"
+fi
+
+message="$(printf '%s' "$body" | jq -r '.choices[0].message.content // ""' 2>/dev/null)"
+finish_reason="$(printf '%s' "$body" | jq -r '.choices[0].finish_reason // ""' 2>/dev/null)"
+
+if ! printf '%s' "$message" | grep -q '[^[:space:]]'; then
+    # deepseek-v4-* are reasoning models: reasoning tokens are drawn from the
+    # same max_tokens budget, so too small a budget yields empty content.
+    if [ "$finish_reason" = "length" ]; then
+        die "Model used its entire ${MAX_TOKENS}-token budget on reasoning and returned no message. Raise AI_COMMIT_MAX_TOKENS."
+    fi
+    die "Model returned an empty commit message (finish_reason: ${finish_reason:-unknown})."
+fi
+
+# Trim surrounding blank lines; lazygitrs strips any stray markdown fences.
+printf '%s\n' "$(printf '%s' "$message" | sed -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
