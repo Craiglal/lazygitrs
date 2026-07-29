@@ -79,6 +79,9 @@ binary is wrapped so it always finds `git` on `PATH`.
       generateCommand: "opencode run 'Generate a conventional commit message for this diff.'"
       # Using codex
       generateCommand: "codex exec --ephemeral 'Generate a conventional commit message for this diff.'"
+      # DeepSeek via the bundled helper — see contrib/ai-commit.
+      # `make setup` installs it and points the config here for you.
+      generateCommand: "$HOME/.local/bin/ai-lazygitrs-commit"
       # Using modelcli
       generateCommand: 'DIFF=$(git diff --cached) && modelcli "Generate a conventional commit message for this diff. Always provide a bulletpoint body. $DIFF"'
   ```
@@ -105,6 +108,11 @@ Persisted State lives at `~/.local/state/lazygitrs/state.yml` and `~/.local/stat
 **New config properties:**
 
 - `git.commit.generateCommand` — shell command for AI-generated commit messages. See [What's different](#whats-different) for examples.
+
+  Run `make setup` to symlink the bundled helper and config into place, then
+  `make doctor` to verify the installation (it checks that `generateCommand`
+  actually resolves to an executable). `make setup-deps` installs the optional
+  tools the config references.
 - `~/.config/lazygitrs/themes/*.json` — drop custom theme files here. See [Themes](#themes).
 
 ### Themes
