@@ -126,14 +126,19 @@ Read-only; changes nothing; exits non-zero if any required check fails (so it ca
   would have diagnosed the original bug in one shot.
 - Required deps present: `jq`, `curl`.
 - Optional deps present: `delta`, `lazyworktree`.
-- `DEEPSEEK_API_KEY` is set — **presence only, never printed**.
+- `DEEPSEEK_API_KEY` is set — **presence only, never printed**. Checked only when
+  `generateCommand` resolves to the bundled helper. **Amended after the final
+  review:** the original wording made this required for *any* configured
+  `generateCommand`, which hard-failed the `claude`, `opencode`, `codex exec`, and
+  `modelcli` options the README advertises. A DeepSeek key is irrelevant to those,
+  so gating on the bundled helper is the correct condition.
 
 Exit-code classification, stated explicitly to avoid two readings:
 
 | Check | Missing → |
 |---|---|
 | `lazygitrs`, `config.yml`, `generateCommand` resolves, `jq`, `curl` | failure (non-zero) |
-| `DEEPSEEK_API_KEY` | failure **only if** `generateCommand` is configured; otherwise skipped |
+| `DEEPSEEK_API_KEY` | failure **only if** `generateCommand` resolves to the bundled helper (`…ai-lazygitrs-commit`); otherwise skipped |
 | `delta`, `lazyworktree` | warning (still exits 0) |
 
 ### `make doctor-ai`
