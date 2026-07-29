@@ -10,9 +10,15 @@
 set -euo pipefail
 
 DRY_RUN=0
-if [ "${1:-}" = "--dry-run" ]; then
-    DRY_RUN=1
-fi
+for arg in "$@"; do
+    if [ "$arg" = "--dry-run" ]; then
+        DRY_RUN=1
+    else
+        printf '  \033[31m✗\033[0m unrecognised argument: %s\n' "$arg" >&2
+        printf '  usage: %s [--dry-run]\n' "$0" >&2
+        exit 2
+    fi
+done
 
 run() {
     if [ "$DRY_RUN" -eq 1 ]; then
