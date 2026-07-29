@@ -45,14 +45,32 @@ link_into_place() { # target linkpath
 printf '\n  lazygitrs setup\n\n'
 
 mkdir -p "$BIN_DIR" "$CONFIG_DIR"
+
+# Explicit and load-bearing: without this, a missing doctor.sh would fail the
+# chmod below with a raw, localized error and leave no symlinks in place.
+# Failing closed here is correct — it just needs to say why.
+if [ ! -f "$HERE/doctor.sh" ]; then
+    printf '  \033[31m✗\033[0m %s is missing — this checkout is incomplete; re-clone or restore contrib/doctor.sh\n' "$HERE/doctor.sh" >&2
+    exit 1
+fi
+
 chmod +x "$HERE/ai-commit" "$HERE/doctor.sh"
 
 link_into_place "$HERE/ai-commit" "$BIN_DIR/ai-lazygitrs-commit"
 link_into_place "$HERE/config.yml" "$CONFIG_DIR/config.yml"
 
+# config_dir_candidates() (src/config/mod.rs) checks .../lazygitrs before
+# .../lazygit and AppConfig::load uses the first one that has a config.yml,
+# with no merging. So a pre-existing lazygit config is now shadowed, not
+# combined — warn about it, but don't touch it: nothing is deleted or moved.
+LEGACY_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/lazygit/config.yml"
+if [ -e "$LEGACY_CONFIG" ]; then
+    printf '  ! found an existing lazygit config at %s — lazygitrs will now read the lazygitrs config instead, and the legacy file is no longer in effect (nothing was deleted or moved)\n' "$LEGACY_CONFIG"
+fi
+
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
-    *) printf '  ! %s is not on PATH — add it so generateCommand resolves\n' "$BIN_DIR" ;;
+    *) printf '  ! %s is not on PATH — invoking `ai-lazygitrs-commit` by name from a shell will not work (generateCommand uses an absolute path and is unaffected)\n' "$BIN_DIR" ;;
 esac
 
 # The report is informational; a missing optional tool must not fail setup.

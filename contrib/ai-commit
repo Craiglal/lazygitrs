@@ -37,9 +37,14 @@ die() {
     exit 1
 }
 
+diff="$(cat)"
+
+# Checked after draining stdin: if this exits before the cat above runs, a
+# large diff can overflow the pipe buffer and lazygitrs sees a broken-pipe
+# error instead of this message (src/git/ai_commit.rs writes stdin before
+# reading stderr).
 command -v jq >/dev/null 2>&1 || die "jq is required but was not found on PATH."
 
-diff="$(cat)"
 printf '%s' "$diff" | grep -q '[^[:space:]]' || die "No staged changes to describe."
 
 # Keep very large diffs inside a sane request size; the tail of a big change is
@@ -61,7 +66,7 @@ if [ -n "$STUB_RESPONSE" ]; then
     body="$(cat "$STUB_RESPONSE")"
     http_code="${AI_COMMIT_STUB_HTTP_CODE:-200}"
 else
-    [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY is not set (expected it exported from ~/.zshenv)."
+    [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY is not set (expected it exported from your shell's env file, e.g. ~/.zshenv)."
     command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH."
 
     payload="$(

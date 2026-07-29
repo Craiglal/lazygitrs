@@ -62,6 +62,29 @@ assert_contains "the first backup survives a second real file" \
 assert_contains "the second backup gets a distinct name" \
     "$(cat "$COLLIDE/.config/lazygitrs/config.yml.bak.1")" "REPLACEMENT-B"
 
+# --- warns when an existing lazygit config would be shadowed --------------
+# config_dir_candidates() (src/config/mod.rs) checks .../lazygitrs before
+# .../lazygit with no merging, so linking the lazygitrs config silently stops
+# an existing lazygit config.yml from being read. Warning only — nothing is
+# deleted or moved, and it must not affect setup's exit code.
+LEGACY="$TMP/legacy"
+mkdir -p "$LEGACY/.config/lazygit"
+printf 'gui:\n  showFileTree: true\n' >"$LEGACY/.config/lazygit/config.yml"
+out="$(in_home "$LEGACY" "$HERE/setup.sh")"
+status=$?
+assert_eq "setup still exits 0 when warning about a legacy config" 0 "$status"
+assert_contains "setup warns about a shadowed legacy lazygit config" "$out" \
+    "lazygitrs will now read the lazygitrs config instead"
+
+NO_LEGACY="$TMP/no-legacy"
+mkdir -p "$NO_LEGACY"
+out="$(in_home "$NO_LEGACY" "$HERE/setup.sh")"
+case "$out" in
+    *"lazygitrs will now read the lazygitrs config instead"*) shadow_warning="present" ;;
+    *) shadow_warning="absent" ;;
+esac
+assert_eq "no shadow warning without a legacy lazygit config" "absent" "$shadow_warning"
+
 printf '\n  doctor\n\n'
 
 # Assertions below check messages rather than exit codes: doctor's exit status
@@ -122,5 +145,51 @@ printf 'git:\n  commit:\n    generateCommand: %s/my bin/helper --flag\n' "\$HOME
 out="$(in_home "$UNQUOTED" "$HERE/doctor.sh")"
 assert_contains "doctor still fails a bare unquoted spaced path" "$out" \
     "does not exist or is not executable"
+
+# --- DEEPSEEK_API_KEY is required only for the bundled helper -------------
+# Assertions check messages, not exit codes: doctor's exit status also
+# depends on lazygitrs/jq/curl presence in the test environment.
+
+# A non-DeepSeek generateCommand that resolves must not fail on the key.
+NO_DEEPSEEK="$TMP/no-deepseek"
+mkdir -p "$NO_DEEPSEEK/.config/lazygitrs"
+printf "git:\n  commit:\n    generateCommand: '/bin/sh'\n" \
+    >"$NO_DEEPSEEK/.config/lazygitrs/config.yml"
+out="$(in_home "$NO_DEEPSEEK" env -u DEEPSEEK_API_KEY "$HERE/doctor.sh")"
+case "$out" in
+    *"DEEPSEEK_API_KEY is not set"*) key_failure="present" ;;
+    *) key_failure="absent" ;;
+esac
+assert_eq "non-bundled generateCommand does not require the key" "absent" "$key_failure"
+
+# A generateCommand resolving to the bundled helper must still require it.
+BUNDLED="$TMP/bundled-helper"
+mkdir -p "$BUNDLED/.config/lazygitrs" "$BUNDLED/.local/bin"
+printf '#!/bin/sh\ntrue\n' >"$BUNDLED/.local/bin/ai-lazygitrs-commit"
+chmod +x "$BUNDLED/.local/bin/ai-lazygitrs-commit"
+printf "git:\n  commit:\n    generateCommand: '\$HOME/.local/bin/ai-lazygitrs-commit'\n" \
+    >"$BUNDLED/.config/lazygitrs/config.yml"
+out="$(in_home "$BUNDLED" env -u DEEPSEEK_API_KEY "$HERE/doctor.sh")"
+assert_contains "bundled helper still requires the key" "$out" \
+    "DEEPSEEK_API_KEY is not set (required by generateCommand)"
+
+printf '\n  config sanity\n\n'
+
+# --- Global Constraint: no machine-specific absolute path in the tracked
+# config. A literal /home/<user> is what silently broke AI commit after a
+# machine move (see the header comment in contrib/config.yml); this makes the
+# constraint structural rather than comment-only.
+CONFIG_CONTENTS="$(cat "$HERE/config.yml")"
+case "$CONFIG_CONTENTS" in
+    *"/home/"*) home_literal="present" ;;
+    *) home_literal="absent" ;;
+esac
+assert_eq "tracked config.yml has no /home/ literal" "absent" "$home_literal"
+
+case "$CONFIG_CONTENTS" in
+    *"/Users/"*) users_literal="present" ;;
+    *) users_literal="absent" ;;
+esac
+assert_eq "tracked config.yml has no /Users/ literal" "absent" "$users_literal"
 
 test_summary

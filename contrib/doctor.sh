@@ -6,7 +6,8 @@
 #   1  at least one required check failed
 #
 # Required : lazygitrs on PATH, config.yml present, generateCommand resolves,
-#            jq, curl, and DEEPSEEK_API_KEY when generateCommand is configured
+#            jq, curl, and DEEPSEEK_API_KEY when generateCommand resolves to
+#            the bundled ai-lazygitrs-commit helper specifically
 # Optional : delta, lazyworktree
 
 set -uo pipefail
@@ -56,6 +57,11 @@ if [ -e "$CONFIG_FILE" ]; then
     gen_cmd="$(extract_generate_command "$CONFIG_FILE")"
 fi
 
+# Set only when the resolved first word names the bundled helper; gates
+# whether DEEPSEEK_API_KEY is required below. Every other generateCommand
+# (claude, opencode, codex exec, modelcli, ...) manages its own credentials.
+is_bundled_helper=0
+
 if [ -z "$gen_cmd" ]; then
     warn "no generateCommand configured — AI commit is disabled"
 else
@@ -94,6 +100,9 @@ else
                     warn "generateCommand starts with an env assignment; skipping the executable check"
                     ;;
                 *)
+                    case "$first_word" in
+                        *ai-lazygitrs-commit) is_bundled_helper=1 ;;
+                    esac
                     if command -v "$first_word" >/dev/null 2>&1; then
                         ok "generateCommand → $first_word"
                     else
@@ -123,16 +132,18 @@ fi
 if command -v lazyworktree >/dev/null 2>&1; then
     ok "lazyworktree found"
 else
-    warn "lazyworktree missing (optional) — used by the W custom command; run: make setup-deps"
+    warn "lazyworktree missing (optional) — used by the K custom command; run: make setup-deps"
 fi
 
 # --- the API key ----------------------------------------------------------
-# Presence only. The value is never printed.
-if [ -n "$gen_cmd" ]; then
+# Presence only. The value is never printed. Only the bundled helper
+# (ai-lazygitrs-commit) needs this key; other generateCommand options
+# (claude, opencode, codex exec, modelcli, ...) manage their own credentials.
+if [ "$is_bundled_helper" -eq 1 ]; then
     if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
         ok "DEEPSEEK_API_KEY is set"
     else
-        bad "DEEPSEEK_API_KEY is not set (required by generateCommand) — add to ~/.zshenv: export DEEPSEEK_API_KEY=<key>"
+        bad "DEEPSEEK_API_KEY is not set (required by generateCommand) — add to your shell's env file (e.g. ~/.zshenv): export DEEPSEEK_API_KEY=<key>"
     fi
 fi
 

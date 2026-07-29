@@ -21,7 +21,10 @@ git:
     generateCommand: '$HOME/.local/bin/ai-lazygitrs-commit'
 
 customCommands:
-  - key: "W"
+  # W is claimed by lazygitrs' built-in diff/compare mode (src/gui/mod.rs)
+  # and is handled before custom commands are dispatched, so it can never
+  # fire here. K is unclaimed.
+  - key: "K"
     context: "global"
     description: "Create worktree"
     command: 'lazyworktree create "{{index .PromptResponses 0}}" --from-branch "{{.CheckedOutBranch.Name}}"'
