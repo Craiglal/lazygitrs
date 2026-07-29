@@ -3130,7 +3130,7 @@ impl Gui {
             }
             PopupState::Menu {
                 items,
-                selected,
+                selected: _,
                 loading_index,
                 ..
             } => {
@@ -3754,7 +3754,7 @@ impl Gui {
             }
             PopupState::Checklist {
                 items,
-                selected,
+                selected: _,
                 search,
                 ..
             } => {
