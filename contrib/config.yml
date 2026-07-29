@@ -1,0 +1,32 @@
+# Canonical lazygitrs configuration, tracked in git.
+#
+# `make setup` symlinks ~/.config/lazygitrs/config.yml to this file, so edits
+# here are version-controlled and reach every machine on clone.
+#
+# Never put a machine-specific absolute path in this file. A path containing a
+# username is what silently broke AI commit after a machine move; use $HOME,
+# which lazygitrs expands because it runs generateCommand through `sh -c`.
+
+gui:
+  showCommandLog: true
+  showFileTree: true
+
+git:
+  autoFetch: true
+  autoRefresh: true
+  pagers:
+    - colorArg: always
+      pager: 'delta --dark --paging=never --line-numbers --hyperlinks --hyperlinks-file-link-format="lazygit-edit://{path}:{line}"'
+  commit:
+    generateCommand: '$HOME/.local/bin/ai-lazygitrs-commit'
+
+customCommands:
+  - key: "W"
+    context: "global"
+    description: "Create worktree"
+    command: 'lazyworktree create "{{index .PromptResponses 0}}" --from-branch "{{.CheckedOutBranch.Name}}"'
+    showOutput: true
+    prompts:
+      - type: "input"
+        title: "Worktree name"
+        key: "WorktreeName"
