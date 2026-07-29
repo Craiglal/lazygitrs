@@ -8,6 +8,28 @@
 
 **Tech Stack:** Bash, `jq`, `curl`, GNU Make, the DeepSeek chat-completions API.
 
+> **Amended during execution.** Task reviews found three defects in this plan's
+> own code blocks, each ruled on by the human and fixed in the shipped code. The
+> code blocks below are NOT updated — treat `contrib/` in git as the truth, and
+> see `.superpowers/sdd/2026-07-29-reproducible-lazygitrs-setup/progress.md` for
+> the rulings:
+>
+> 1. **Task 3** — `first_word="${gen_cmd%% *}"` truncated a quoted `generateCommand`
+>    path containing spaces, reporting a working install broken. Fixed by
+>    quote-stripping. An `eval`-based fix was rejected: it would let a config value
+>    execute commands and write files, breaking the read-only guarantee.
+> 2. **Task 4** — `mv "$linkpath" "$linkpath.bak"` overwrote an existing backup,
+>    destroying it. Fixed with a free-name search (`.bak`, `.bak.1`, …).
+> 3. **Task 5** — argument handling checked only `$1`, so a typo such as `--dryrun`
+>    silently performed a real `--noconfirm` install. Fixed by validating every
+>    argument. Step 3's verification command was also corrected: `PATH=/nonexistent`
+>    stops `#!/usr/bin/env bash` from resolving `bash`, so it exited 127 without
+>    ever running the script.
+>
+> Also note: `lazyworktree` is an AUR package and this machine has `pacman` only,
+> so Task 8 Step 5's expectation of zero warnings is unreachable without `paru`
+> or `yay`.
+
 ## Global Constraints
 
 Every task's requirements implicitly include these. Values are copied verbatim from the spec.
@@ -830,7 +852,7 @@ Expected: a `would run:` line naming `paru`, `yay`, or `sudo pacman`, and `exit=
 
 Run:
 ```bash
-env PATH=/nonexistent contrib/setup-deps.sh --dry-run; echo "exit=$?"
+env PATH="$(mktemp -d)" /usr/bin/bash contrib/setup-deps.sh --dry-run; echo "exit=$?"
 ```
 Expected: the `no supported package manager found` message and `exit=1`.
 
