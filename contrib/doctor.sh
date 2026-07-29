@@ -64,7 +64,25 @@ else
             warn "generateCommand is a shell expression; skipping the executable check"
             ;;
         *)
-            first_word="${gen_cmd%% *}"
+            # A leading quote means the intended token can contain spaces
+            # (e.g. `"/path with spaces/cmd" --flag`); strip one layer of
+            # quotes and take everything up to the matching closing quote
+            # rather than splitting on the first space, which would truncate
+            # the path mid-token. Unquoted values keep the plain first-word
+            # split, matching how sh -c would word-split them too.
+            case "$gen_cmd" in
+                '"'*)
+                    rest="${gen_cmd#\"}"
+                    first_word="${rest%%\"*}"
+                    ;;
+                "'"*)
+                    rest="${gen_cmd#\'}"
+                    first_word="${rest%%\'*}"
+                    ;;
+                *)
+                    first_word="${gen_cmd%% *}"
+                    ;;
+            esac
             case "$first_word" in
                 '$HOME'*)   first_word="$HOME${first_word#\$HOME}" ;;
                 '${HOME}'*) first_word="$HOME${first_word#\$\{HOME\}}" ;;
