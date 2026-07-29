@@ -71,6 +71,24 @@ uninstall: ## Remove the cargo-installed lazygitrs
 clean: ## Remove target/
 	$(CARGO) clean
 
+##@ Setup
+
+.PHONY: setup
+setup: ## Symlink contrib/ai-commit and contrib/config.yml into place (idempotent, no sudo)
+	@contrib/setup.sh
+
+.PHONY: doctor
+doctor: ## Diagnose the installation, read-only (non-zero exit if a required check fails)
+	@contrib/doctor.sh
+
+.PHONY: doctor-ai
+doctor-ai: ## Prove AI commit works end to end with one real API call
+	@printf 'diff --git a/demo.txt b/demo.txt\nnew file mode 100644\n--- /dev/null\n+++ b/demo.txt\n@@ -0,0 +1 @@\n+hello\n' | contrib/ai-commit
+
+.PHONY: setup-deps
+setup-deps: ## Install optional deps (jq, git-delta, lazyworktree) via paru/yay/pacman
+	@contrib/setup-deps.sh
+
 ##@ Run
 
 .PHONY: run
@@ -97,6 +115,11 @@ $(RELEASE_BIN):
 test: ## Run the test suite
 	$(CARGO) test $(CARGO_ARGS)
 
+.PHONY: test-contrib
+test-contrib: ## Run the contrib/ shell tests
+	@contrib/test-ai-commit.sh
+	@contrib/test-setup.sh
+
 .PHONY: fmt
 fmt: ## Format the source tree in place
 	$(CARGO) fmt --all
@@ -120,7 +143,7 @@ clippy-strict: ## Lint with clippy treating warnings as errors (currently fails)
 lint: fmt-check clippy ## fmt-check + advisory clippy
 
 .PHONY: ci
-ci: lint test build-release ## Everything CI would gate a release on
+ci: lint test test-contrib build-release ## Everything CI would gate a release on
 
 ##@ Release
 
