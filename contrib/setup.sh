@@ -29,8 +29,13 @@ link_into_place() { # target linkpath
         fi
         rm -f "$linkpath"
     elif [ -e "$linkpath" ]; then
-        mv "$linkpath" "$linkpath.bak"
-        printf '  ! existing file backed up: %s -> %s.bak\n' "$linkpath" "$linkpath"
+        local backup="$linkpath.bak" n=1
+        while [ -e "$backup" ]; do
+            backup="$linkpath.bak.$n"
+            n=$((n + 1))
+        done
+        mv "$linkpath" "$backup"
+        printf '  ! existing file backed up: %s -> %s\n' "$linkpath" "$backup"
     fi
 
     ln -s "$target" "$linkpath"

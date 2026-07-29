@@ -46,6 +46,22 @@ assert_contains "the backup keeps the original content" \
 assert_eq "the config is now the tracked symlink" "$HERE/config.yml" \
     "$(readlink "$OCCUPIED/.config/lazygitrs/config.yml")"
 
+# --- a second distinct real file must not clobber the first backup --------
+# Regression: mv previously overwrote <name>.bak unconditionally, so if a real
+# file reappeared at the link path after a first backup was already made, the
+# second run silently destroyed the first backup's content.
+COLLIDE="$TMP/collide"
+mkdir -p "$COLLIDE/.config/lazygitrs"
+printf 'ORIGINAL-A\n' >"$COLLIDE/.config/lazygitrs/config.yml"
+in_home "$COLLIDE" "$HERE/setup.sh" >/dev/null
+rm -f "$COLLIDE/.config/lazygitrs/config.yml"
+printf 'REPLACEMENT-B\n' >"$COLLIDE/.config/lazygitrs/config.yml"
+in_home "$COLLIDE" "$HERE/setup.sh" >/dev/null
+assert_contains "the first backup survives a second real file" \
+    "$(cat "$COLLIDE/.config/lazygitrs/config.yml.bak")" "ORIGINAL-A"
+assert_contains "the second backup gets a distinct name" \
+    "$(cat "$COLLIDE/.config/lazygitrs/config.yml.bak.1")" "REPLACEMENT-B"
+
 printf '\n  doctor\n\n'
 
 # Assertions below check messages rather than exit codes: doctor's exit status
