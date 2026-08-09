@@ -1,5 +1,6 @@
 pub mod context;
 pub mod controller;
+pub mod input;
 pub mod interactive;
 pub mod layout;
 pub mod modes;
@@ -8,7 +9,7 @@ pub mod presentation;
 pub mod scroll;
 pub mod views;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,9 +17,9 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{cursor, execute};
+use crossterm::{Command, cursor, execute};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
@@ -30,16 +31,17 @@ use crate::model::Model;
 use crate::model::file_tree::{CommitFileTreeNode, FileTreeNode, build_file_tree};
 use crate::os::platform::Platform;
 use crate::pager::side_by_side::{
-    DiffPanel, DiffPanelLayout, DiffViewLayout, DiffViewState, TextSelection,
+    DiffPanel, DiffPanelLayout, DiffViewLayout, DiffViewState, TextSelection, is_rename_only_diff,
 };
 
 use self::context::{ContextId, ContextManager, SideWindow};
+use self::input::InputReader;
 use self::layout::LayoutState;
 use self::modes::conflict_mode::ConflictModeState;
 use self::modes::diff_mode::DiffModeState;
 use self::modes::patch_building::PatchBuildingState;
 use self::modes::rebase_mode::{EntryStatus, RebaseModeState, RebasePhase};
-use self::popup::{HelpEntry, HelpSection};
+use self::popup::{CommandAction, CommandEntry, CommandSection};
 use self::popup::{ListPickerItem, MessageKind, PopupState};
 
 /// Compute the display row index for a given item selection,
@@ -98,7 +100,7 @@ fn update_ref_picker_search(
     allow_freeform: bool,
     list_height: usize,
 ) {
-    if !core.items.is_empty() && core.items[0].category == "[ref]" {
+    if !core.items.is_empty() && core.items[0].category == popup::REF_FREE_ENTRY_CATEGORY {
         core.items.remove(0);
     }
 
@@ -110,7 +112,7 @@ fn update_ref_picker_search(
                 ListPickerItem {
                     value: new_search.trim().to_string(),
                     label: new_search.trim().to_string(),
-                    category: "[ref]".to_string(),
+                    category: popup::REF_FREE_ENTRY_CATEGORY.to_string(),
                 },
             );
             1
@@ -142,7 +144,7 @@ fn update_ref_picker_search(
 #[cfg(test)]
 mod ref_picker_tests {
     use super::*;
-    use crate::gui::popup::{ListPickerCore, make_help_search_textarea};
+    use crate::gui::popup::{ListPickerCore, make_command_palette_search_textarea};
 
     fn picker_core() -> ListPickerCore {
         ListPickerCore {
@@ -152,7 +154,7 @@ mod ref_picker_tests {
                 category: "Local Branches".to_string(),
             }],
             selected: 0,
-            search_textarea: make_help_search_textarea(),
+            search_textarea: make_command_palette_search_textarea(),
             scroll_offset: 0,
         }
     }
@@ -194,8 +196,110 @@ mod ref_picker_tests {
     }
 }
 
+/// Shared mouse scroll/click handling for free-entry list pickers (RefPicker, ListPicker).
+fn handle_list_picker_mouse(
+    core: &mut crate::gui::popup::ListPickerCore,
+    mouse: crossterm::event::MouseEvent,
+    layout_width: u16,
+    layout_height: u16,
+) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let total = core.items.len();
+    let h = layout_height as usize;
+    let lh = list_picker_visible_height(h);
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            core.selected = core.selected.saturating_sub(1);
+            if core.selected < core.scroll_offset {
+                core.scroll_offset = core.selected;
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            core.selected = (core.selected + 1).min(total.saturating_sub(1));
+            let di = list_picker_display_idx(&core.items, core.selected);
+            if di >= core.scroll_offset + lh {
+                core.scroll_offset = di.saturating_sub(lh - 1);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Click to select an item in the list picker
+            let area = ratatui::layout::Rect::new(0, 0, layout_width, layout_height);
+            let popup_width = (area.width * 60 / 100).min(60).max(30);
+            let max_popup = (area.height * 60 / 100).max(10);
+            let popup_height = max_popup.min(area.height.saturating_sub(4));
+            let x = (area.width.saturating_sub(popup_width)) / 2;
+            let y = (area.height.saturating_sub(popup_height)) / 2;
+            let inner_y = y + 1;
+            let list_start = inner_y + 2;
+            let inner_height = popup_height.saturating_sub(2);
+            let list_height = inner_height.saturating_sub(3) as usize;
+
+            if mouse.row >= list_start
+                && mouse.row < list_start + list_height as u16
+                && mouse.column >= x
+                && mouse.column < x + popup_width
+            {
+                let row_in_list = (mouse.row - list_start) as usize;
+                // Map display row to entry index, accounting for category headers
+                let has_categories = core.items.iter().any(|i| !i.category.is_empty());
+                let effective_scroll = core.scroll_offset.min(if has_categories {
+                    // display length includes headers
+                    let display_len =
+                        list_picker_display_idx(&core.items, total.saturating_sub(1)) + 1;
+                    display_len.saturating_sub(list_height)
+                } else {
+                    total.saturating_sub(list_height)
+                });
+                let display_idx = effective_scroll + row_in_list;
+
+                if has_categories {
+                    // Walk through display rows to find which entry was clicked
+                    let mut di = 0usize;
+                    let mut ei = 0usize;
+                    let mut last_cat = String::new();
+                    for item in core.items.iter() {
+                        if !item.category.is_empty() && item.category != last_cat {
+                            if di == display_idx {
+                                break; // clicked on header
+                            }
+                            di += 1;
+                            last_cat = item.category.clone();
+                        }
+                        if di == display_idx {
+                            core.selected = ei;
+                            break;
+                        }
+                        di += 1;
+                        ei += 1;
+                    }
+                } else {
+                    let clicked_idx = effective_scroll + row_in_list;
+                    if clicked_idx < total {
+                        core.selected = clicked_idx;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
-const EVENT_DRAIN_LIMIT: usize = 256;
+const COMMIT_DETAILS_DEBOUNCE: Duration = Duration::from_millis(120);
+const MAX_CONCURRENT_DIFF_JOBS: usize = 2;
+const DIFF_PREVIEW_CACHE_ENTRIES: usize = 8;
+const DIFF_PREVIEW_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CACHED_DIFF_BYTES: usize = 8 * 1024 * 1024;
+
+fn plain_char_key(key: KeyEvent, expected: char) -> bool {
+    let modifiers = if expected.is_uppercase() {
+        KeyModifiers::SHIFT
+    } else {
+        KeyModifiers::NONE
+    };
+    key.code == KeyCode::Char(expected) && key.modifiers == modifiers
+}
 
 fn has_command_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::SUPER | KeyModifiers::META)
@@ -205,29 +309,68 @@ pub(crate) fn textarea_input(
     textarea: &mut tui_textarea::TextArea<'static>,
     key: KeyEvent,
 ) -> bool {
+    use tui_textarea::CursorMove;
+
     let cmd = has_command_modifier(key.modifiers);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        KeyCode::Left if cmd => textarea.move_cursor(tui_textarea::CursorMove::Head),
-        KeyCode::Right if cmd => textarea.move_cursor(tui_textarea::CursorMove::End),
+        // Cmd+Left/Right (and Ctrl+Left/Right): line head/end.
+        // Many macOS terminals remap Cmd+arrows to Home/End, so handle those too.
+        KeyCode::Left if cmd || ctrl => textarea.move_cursor(CursorMove::Head),
+        KeyCode::Right if cmd || ctrl => textarea.move_cursor(CursorMove::End),
+        KeyCode::Home => textarea.move_cursor(CursorMove::Head),
+        KeyCode::End => textarea.move_cursor(CursorMove::End),
+        // Cmd/Ctrl+Backspace: delete to start of line
         KeyCode::Backspace if cmd => {
             textarea.delete_line_by_head();
         }
-        KeyCode::Char('a') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::Head),
-        KeyCode::Char('e') if ctrl => textarea.move_cursor(tui_textarea::CursorMove::End),
+        // Option/Alt+Left/Right: move by word
+        KeyCode::Left if alt => textarea.move_cursor(CursorMove::WordBack),
+        KeyCode::Right if alt => textarea.move_cursor(CursorMove::WordForward),
+        // Option/Alt+Backspace: delete previous word
+        KeyCode::Backspace if alt => {
+            let (row, col) = textarea.cursor();
+            textarea.move_cursor(CursorMove::WordBack);
+            let (new_row, new_col) = textarea.cursor();
+            if new_row == row {
+                for _ in new_col..col {
+                    textarea.delete_next_char();
+                }
+            } else {
+                textarea.move_cursor(CursorMove::Jump(row as u16, col as u16));
+                for _ in 0..=col {
+                    textarea.delete_char();
+                }
+            }
+        }
+        KeyCode::Char(_) if cmd => return false,
+        KeyCode::Char('a') if ctrl => textarea.move_cursor(CursorMove::Head),
+        KeyCode::Char('e') if ctrl => textarea.move_cursor(CursorMove::End),
         KeyCode::Char('u') if ctrl => {
             textarea.delete_line_by_head();
         }
+        // Fall through: tui-textarea handles Alt+b/f/h/l and plain chars
         _ => return textarea.input(key),
     };
     true
 }
 
+/// Upper bound on events consumed by one drain, so a terminal that keeps
+/// producing input cannot spin here forever.
+const EVENT_DRAIN_LIMIT: usize = 256;
+
+/// Best-effort drain of buffered terminal input.
+///
+/// Used by [`interactive`] after an editor has owned the terminal, so leftover
+/// keystrokes are not parsed as application keys. While [`input::InputReader`]
+/// is running this may no-op: crossterm guards its reader with a process-wide
+/// mutex that the reader thread holds across its blocking read.
 pub(crate) fn drain_pending_terminal_events(idle_timeout: Duration) {
     for _ in 0..EVENT_DRAIN_LIMIT {
-        match event::poll(idle_timeout) {
+        match crossterm::event::poll(idle_timeout) {
             Ok(true) => {
-                if event::read().is_err() {
+                if crossterm::event::read().is_err() {
                     break;
                 }
             }
@@ -264,6 +407,193 @@ pub(crate) enum DiffPayload {
     Empty,
 }
 
+struct DiffJob {
+    generation: u64,
+    diff_key: String,
+    load: Box<dyn FnOnce() -> DiffPayload + Send>,
+}
+
+enum DiffSchedulerEvent {
+    Job(DiffJob),
+    Complete,
+}
+
+struct CachedDiffPreview {
+    key: String,
+    view: DiffViewState,
+    estimated_bytes: usize,
+}
+
+#[derive(Default)]
+struct DiffPreviewCache {
+    entries: VecDeque<CachedDiffPreview>,
+    estimated_bytes: usize,
+}
+
+impl DiffPreviewCache {
+    fn insert(&mut self, key: String, view: DiffViewState) {
+        self.remove(&key);
+        let estimated_bytes = estimate_diff_view_bytes(&view);
+        if estimated_bytes > MAX_CACHED_DIFF_BYTES {
+            return;
+        }
+
+        while self.entries.len() >= DIFF_PREVIEW_CACHE_ENTRIES
+            || self.estimated_bytes.saturating_add(estimated_bytes) > DIFF_PREVIEW_CACHE_BYTES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.estimated_bytes = self.estimated_bytes.saturating_sub(evicted.estimated_bytes);
+        }
+
+        self.estimated_bytes = self.estimated_bytes.saturating_add(estimated_bytes);
+        self.entries.push_back(CachedDiffPreview {
+            key,
+            view,
+            estimated_bytes,
+        });
+    }
+
+    fn take(&mut self, key: &str) -> Option<DiffViewState> {
+        let index = self.entries.iter().position(|entry| entry.key == key)?;
+        let entry = self.entries.remove(index)?;
+        self.estimated_bytes = self.estimated_bytes.saturating_sub(entry.estimated_bytes);
+        Some(entry.view)
+    }
+
+    fn remove(&mut self, key: &str) {
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            if let Some(entry) = self.entries.remove(index) {
+                self.estimated_bytes = self.estimated_bytes.saturating_sub(entry.estimated_bytes);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.estimated_bytes = 0;
+    }
+}
+
+fn estimate_diff_view_bytes(view: &DiffViewState) -> usize {
+    let line_bytes = view.lines.iter().fold(0usize, |total, line| {
+        let text_bytes = line
+            .old_line
+            .as_ref()
+            .map(|(_, text)| text.len())
+            .unwrap_or(0)
+            .saturating_add(
+                line.new_line
+                    .as_ref()
+                    .map(|(_, text)| text.len())
+                    .unwrap_or(0),
+            );
+        let segment_bytes = line
+            .old_segments
+            .iter()
+            .chain(line.new_segments.iter())
+            .flatten()
+            .map(|segment| segment.text.len())
+            .sum::<usize>();
+        total
+            .saturating_add(text_bytes)
+            .saturating_add(segment_bytes)
+    });
+
+    view.filename
+        .len()
+        .saturating_add(view.old_content.len())
+        .saturating_add(view.new_content.len())
+        .saturating_add(line_bytes)
+        .saturating_mul(2)
+}
+
+type BackgroundJob = Box<dyn FnOnce() + Send>;
+
+fn spawn_diff_scheduler(
+    rx: mpsc::Receiver<DiffSchedulerEvent>,
+    scheduler_tx: mpsc::Sender<DiffSchedulerEvent>,
+    result_tx: mpsc::Sender<DiffResult>,
+    generation: Arc<AtomicU64>,
+) {
+    std::thread::spawn(move || {
+        let mut active_jobs = 0usize;
+        let mut pending_job: Option<DiffJob> = None;
+
+        while let Ok(event) = rx.recv() {
+            match event {
+                DiffSchedulerEvent::Job(job) => {
+                    if generation.load(Ordering::Relaxed) != job.generation {
+                        continue;
+                    }
+                    if active_jobs < MAX_CONCURRENT_DIFF_JOBS {
+                        active_jobs += 1;
+                        spawn_diff_job(
+                            job,
+                            result_tx.clone(),
+                            scheduler_tx.clone(),
+                            Arc::clone(&generation),
+                        );
+                    } else {
+                        pending_job = Some(job);
+                    }
+                }
+                DiffSchedulerEvent::Complete => {
+                    active_jobs = active_jobs.saturating_sub(1);
+                    if let Some(job) = pending_job.take() {
+                        if generation.load(Ordering::Relaxed) == job.generation {
+                            active_jobs += 1;
+                            spawn_diff_job(
+                                job,
+                                result_tx.clone(),
+                                scheduler_tx.clone(),
+                                Arc::clone(&generation),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_diff_job(
+    job: DiffJob,
+    result_tx: mpsc::Sender<DiffResult>,
+    scheduler_tx: mpsc::Sender<DiffSchedulerEvent>,
+    generation: Arc<AtomicU64>,
+) {
+    std::thread::spawn(move || {
+        if generation.load(Ordering::Relaxed) == job.generation {
+            let payload = (job.load)();
+            if generation.load(Ordering::Relaxed) == job.generation {
+                let _ = result_tx.send(DiffResult {
+                    generation: job.generation,
+                    diff_key: job.diff_key,
+                    payload,
+                });
+            }
+        }
+        let _ = scheduler_tx.send(DiffSchedulerEvent::Complete);
+    });
+}
+
+fn spawn_latest_background_worker(rx: mpsc::Receiver<BackgroundJob>) {
+    std::thread::spawn(move || {
+        while let Ok(mut job) = rx.recv() {
+            loop {
+                match rx.recv_timeout(COMMIT_DETAILS_DEBOUNCE) {
+                    Ok(newer_job) => job = newer_job,
+                    Err(mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+            job();
+        }
+    });
+}
+
 struct AiCommitJob {
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -273,6 +603,12 @@ struct AiCommitJob {
 struct AiCommitResult {
     generation: u64,
     result: Result<Option<String>>,
+}
+
+#[derive(Debug, Clone)]
+enum AiCommitSource {
+    Staged,
+    Commit(String),
 }
 
 struct CommitPageResult {
@@ -290,6 +626,8 @@ pub struct Gui {
     pub layout: LayoutState,
     pub popup: PopupState,
     pub diff_view: DiffViewState,
+    /// Cached graph layouts used to render only the visible commit rows.
+    commit_list_cache: presentation::commits::CommitListCache,
     pub command_log: crate::os::cmd::CommandLog,
     pub show_command_log: bool,
     pub should_quit: bool,
@@ -310,6 +648,12 @@ pub struct Gui {
     /// Current position within search_matches.
     pub search_match_idx: usize,
     pub screen_mode: ScreenMode,
+    /// True while the user is dragging the sidebar divider with the mouse.
+    sidebar_resizing: bool,
+    /// Portrait-only: add this to the mouse row when mapping to side height so
+    /// grabs on the expanded panel bottom (above trailing collapsed rows) and
+    /// the main/diff top border share one continuous drag.
+    sidebar_resize_row_offset: u16,
     pub show_file_tree: bool,
     /// Cached file tree nodes — rebuilt on refresh when tree view is active.
     pub file_tree_nodes: Vec<FileTreeNode>,
@@ -327,8 +671,11 @@ pub struct Gui {
     pub(crate) diff_generation: Arc<AtomicU64>,
     /// Sender for background diff loading.
     diff_rx: mpsc::Receiver<DiffResult>,
-    /// Keep sender around so we can clone it for background threads.
-    pub(crate) diff_tx: mpsc::Sender<DiffResult>,
+    /// Bounded scheduler: starts immediately, caps parallelism, and retains
+    /// only the newest overflow request while navigation is rapid.
+    diff_scheduler_tx: mpsc::Sender<DiffSchedulerEvent>,
+    /// Recently completed parsed previews, moved in and out for instant revisits.
+    diff_preview_cache: DiffPreviewCache,
     /// Receiver for AI commit message generation results.
     ai_commit_rx: mpsc::Receiver<AiCommitResult>,
     /// Sender cloned into background threads for AI commit generation.
@@ -347,16 +694,21 @@ pub struct Gui {
     ai_commit_job: Option<AiCommitJob>,
     /// Generation counter used to discard stale AI results after cancellation.
     ai_commit_generation: u64,
+    /// Diff source for the next AI commit message generation.
+    ai_commit_source: AiCommitSource,
     /// Receiver for background remote operations (push, pull, fetch).
     remote_op_rx: mpsc::Receiver<Result<()>>,
     /// Sender cloned into background threads for remote operations.
     remote_op_tx: mpsc::Sender<Result<()>>,
+    /// Async light files refresh (status-only) so Space-spam doesn't freeze.
+    files_refresh_rx: Option<mpsc::Receiver<Result<Vec<crate::model::File>>>>,
+    files_refresh_in_progress: bool,
     /// Receiver for silent auto-fetch results. Kept separate from remote_op
     /// so auto-fetch failures don't show error popups or clobber a
     /// user-initiated push/pull.
-    auto_fetch_rx: mpsc::Receiver<Result<()>>,
+    auto_fetch_rx: mpsc::Receiver<Result<bool>>,
     /// Sender cloned into background threads for auto-fetch.
-    auto_fetch_tx: mpsc::Sender<Result<()>>,
+    auto_fetch_tx: mpsc::Sender<Result<bool>>,
     /// When the last auto-fetch started. `None` means we haven't fetched yet;
     /// the main loop kicks off an immediate fetch on startup.
     last_auto_fetch_at: Option<Instant>,
@@ -389,6 +741,10 @@ pub struct Gui {
     last_refresh_at: Instant,
     /// Active branch filter for commits panel. When non-empty, only commits from these branches are shown.
     pub commit_branch_filter: Vec<String>,
+    /// Optional path used to filter the main commits panel.
+    pub commit_path_filter: Option<String>,
+    /// Optional author identity used to filter the main commits panel.
+    pub commit_author_filter: Vec<String>,
     /// Hash of the commit whose files are being viewed in CommitFiles context.
     pub commit_files_hash: String,
     /// First line of the commit message for the commit being viewed.
@@ -407,12 +763,15 @@ pub struct Gui {
     pub sub_commits_parent_context: context::ContextId,
     /// Parent context to return to when pressing Esc from CommitFiles.
     pub commit_files_parent_context: Option<context::ContextId>,
-    /// Receiver for streamed model parts during initial load. Each git data
-    /// type arrives independently so the UI can waterfall-display results.
-    /// Set to `None` once all parts have been received.
+    /// Receiver for streamed model parts during initial load or background
+    /// refresh. Each git data type arrives independently so the UI can
+    /// waterfall-display results. Set to `None` once all parts received.
     initial_load_rx: Option<mpsc::Receiver<ModelPart>>,
     /// How many model parts have arrived so far (out of MODEL_PART_COUNT).
     initial_load_received: usize,
+    /// True while a background `load_model_streaming` refresh is in flight.
+    /// Prevents stacking concurrent full refreshes on the UI thread.
+    refresh_in_progress: bool,
     /// Frame counter for the loading spinner animation.
     spinner_frame: usize,
     /// Label shown on the head branch during a remote operation (e.g. "Pushing", "Pulling").
@@ -435,14 +794,15 @@ pub struct Gui {
     /// by background threads so the render path never blocks on git.
     pub commit_stats_cache:
         std::sync::Arc<std::sync::Mutex<HashMap<String, crate::model::commit::CommitStat>>>,
-    /// Set of commit hashes with an in-flight stat fetch, so we don't spawn
-    /// duplicate workers on each frame.
-    pub commit_stats_inflight: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
     /// Cache of full commit messages (subject + body) per hash, fetched
     /// asynchronously so the details panel can render the full description.
     pub commit_messages_cache: std::sync::Arc<std::sync::Mutex<HashMap<String, String>>>,
-    /// In-flight guard for full-message fetches.
-    pub commit_messages_inflight: std::sync::Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Latest-only queue for commit metadata shown below the commit list.
+    commit_details_job_tx: mpsc::Sender<BackgroundJob>,
+    /// Invalidates commit-detail jobs when selection changes while one is running.
+    commit_details_generation: Arc<AtomicU64>,
+    /// Commit hash most recently considered for details loading.
+    last_commit_details_key: String,
     /// Vertical scroll offset (rows) for the commit-details box.  Reset
     /// whenever the selected commit hash changes.
     pub commit_details_scroll: u16,
@@ -452,9 +812,6 @@ pub struct Gui {
     /// Whether the commit-details box is visible.  Toggled with `.` in any
     /// commit-related context.
     pub show_commit_details: bool,
-    /// Whether the mouse is currently hovering the AI-generate button (✦)
-    /// in the commit message popup. Drives tooltip visibility.
-    pub commit_ai_button_hovered: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +819,19 @@ pub enum ScreenMode {
     Normal,
     Half,
     Full,
+}
+
+/// Pathspec for a tree-node path: root (".") => empty (whole tree), dirs get a
+/// trailing slash so git matches the directory contents.
+fn pathspec_for_tree_path(path: &str) -> Option<String> {
+    if path.is_empty() || path == "." {
+        return None; // whole tree / no path filter
+    }
+    if path.ends_with('/') {
+        Some(path.to_string())
+    } else {
+        Some(format!("{}/", path))
+    }
 }
 
 /// Synthesize a unified diff for a new (untracked) file from its raw content.
@@ -483,6 +853,72 @@ fn synthesize_new_file_diff(filename: &str, content: &str) -> String {
     diff
 }
 
+/// Placeholder so the pager shows "Binary file (not viewable)".
+fn synthesize_binary_file_diff(filename: &str) -> String {
+    format!(
+        "diff --git a/{f} b/{f}\n\
+         new file mode 100644\n\
+         index 0000000..1111111\n\
+         Binary files /dev/null and b/{f} differ\n",
+        f = filename
+    )
+}
+
+/// Pure renames have no hunks; show file content instead of only path lines.
+fn parse_file_diff_payload(
+    git: &GitCommands,
+    name: &str,
+    current_path: &str,
+    diff: &str,
+    exists: bool,
+    prefer_staged: bool,
+) -> DiffPayload {
+    if is_rename_only_diff(diff) {
+        let content = if prefer_staged {
+            git.file_content_staged(current_path)
+                .or_else(|_| git.file_content(current_path))
+        } else {
+            git.file_content(current_path)
+                .or_else(|_| git.file_content_staged(current_path))
+        };
+        if let Ok(content) = content {
+            if !content.is_empty() {
+                return DiffPayload::Parsed(DiffViewState::parse_content(
+                    current_path,
+                    &content,
+                    &content,
+                    4,
+                    exists,
+                ));
+            }
+        }
+    }
+    DiffPayload::Parsed(DiffViewState::parse_diff_output(name, diff, 4, exists))
+}
+
+fn parse_commit_file_diff_payload(
+    git: &GitCommands,
+    hash: &str,
+    name: &str,
+    current_path: &str,
+    diff: &str,
+) -> DiffPayload {
+    if is_rename_only_diff(diff) {
+        if let Ok(content) = git.file_content_at_commit(hash, current_path) {
+            if !content.is_empty() {
+                return DiffPayload::Parsed(DiffViewState::parse_content(
+                    current_path,
+                    &content,
+                    &content,
+                    4,
+                    false,
+                ));
+            }
+        }
+    }
+    DiffPayload::Parsed(DiffViewState::parse_diff_output(name, diff, 4, false))
+}
+
 impl Gui {
     fn show_error(&mut self, title: &str, err: anyhow::Error) {
         self.popup = PopupState::Message {
@@ -494,6 +930,8 @@ impl Gui {
 
     pub fn new(config: AppConfig, git: GitCommands) -> Result<Self> {
         let (diff_tx, diff_rx) = mpsc::channel();
+        let (diff_scheduler_tx, diff_scheduler_rx) = mpsc::channel();
+        let (commit_details_job_tx, commit_details_job_rx) = mpsc::channel();
         let (ai_commit_tx, ai_commit_rx) = mpsc::channel();
         let (commit_page_tx, commit_page_rx) = mpsc::channel();
         let (remote_op_tx, remote_op_rx) = mpsc::channel();
@@ -522,6 +960,15 @@ impl Gui {
         // background and streams in as it becomes ready, so the UI can
         // paint immediately and waterfall-display results.
         let git = Arc::new(git);
+        let diff_generation = Arc::new(AtomicU64::new(0));
+        let commit_details_generation = Arc::new(AtomicU64::new(0));
+        spawn_diff_scheduler(
+            diff_scheduler_rx,
+            diff_scheduler_tx.clone(),
+            diff_tx.clone(),
+            Arc::clone(&diff_generation),
+        );
+        spawn_latest_background_worker(commit_details_job_rx);
         let mut model = Model::default();
         model.repo_name = git.repo_name();
         model.head_hash = git.head_hash().unwrap_or_default();
@@ -546,6 +993,7 @@ impl Gui {
             model: Arc::new(Mutex::new(model)),
             initial_load_rx: Some(initial_load_rx),
             initial_load_received: 0,
+            refresh_in_progress: false,
             context_mgr: ContextManager::new(),
             layout: LayoutState::default(),
             popup: PopupState::None,
@@ -555,6 +1003,7 @@ impl Gui {
                 dv.view_layout = diff_view_layout;
                 dv
             },
+            commit_list_cache: presentation::commits::CommitListCache::default(),
             command_log,
             show_command_log: show_command_log_default,
             should_quit: false,
@@ -569,6 +1018,8 @@ impl Gui {
             search_matches: Vec::new(),
             search_match_idx: 0,
             screen_mode: ScreenMode::Normal,
+            sidebar_resizing: false,
+            sidebar_resize_row_offset: 0,
             show_file_tree,
             file_tree_nodes: Vec::new(),
             collapsed_dirs: HashSet::new(),
@@ -576,9 +1027,10 @@ impl Gui {
             diff_loading: false,
             diff_loading_since: None,
             last_diff_key: String::new(),
-            diff_generation: Arc::new(AtomicU64::new(0)),
+            diff_generation,
             diff_rx,
-            diff_tx,
+            diff_scheduler_tx,
+            diff_preview_cache: DiffPreviewCache::default(),
             ai_commit_rx,
             ai_commit_tx,
             commit_page_rx,
@@ -588,8 +1040,11 @@ impl Gui {
             commit_page_generation: 0,
             ai_commit_job: None,
             ai_commit_generation: 0,
+            ai_commit_source: AiCommitSource::Staged,
             remote_op_rx,
             remote_op_tx,
+            files_refresh_rx: None,
+            files_refresh_in_progress: false,
             auto_fetch_rx,
             auto_fetch_tx,
             last_auto_fetch_at: None,
@@ -607,6 +1062,8 @@ impl Gui {
             search_textarea: None,
             last_refresh_at: Instant::now(),
             commit_branch_filter: Vec::new(),
+            commit_path_filter: None,
+            commit_author_filter: Vec::new(),
             commit_files_hash: String::new(),
             commit_files_message: String::new(),
             commit_file_tree_nodes: Vec::new(),
@@ -626,13 +1083,13 @@ impl Gui {
             commit_history_draft: String::new(),
             current_theme_index,
             commit_stats_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            commit_stats_inflight: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
             commit_messages_cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            commit_messages_inflight: std::sync::Arc::new(std::sync::Mutex::new(HashSet::new())),
+            commit_details_job_tx,
+            commit_details_generation,
+            last_commit_details_key: String::new(),
             commit_details_scroll: 0,
             commit_details_scroll_hash: String::new(),
             show_commit_details,
-            commit_ai_button_hovered: false,
         })
     }
 
@@ -655,19 +1112,27 @@ impl Gui {
 
     pub fn run(&mut self) -> Result<()> {
         let (mut terminal, keyboard_enhanced) = setup_terminal()?;
+        // Continuous reader thread: reassembly needs reads between frames
+        // (see `input` module). One event-per-frame is what leaked ↑ as 'A'.
+        let input = InputReader::spawn();
 
         // Sync layout dimensions with actual terminal size so mouse handling
         // uses the correct geometry from the very first frame.
         let size = terminal.size()?;
         self.layout.update_size(size.width, size.height);
 
-        let result = self.main_loop(&mut terminal, keyboard_enhanced);
+        let result = self.main_loop(&mut terminal, &input, keyboard_enhanced);
 
         restore_terminal(&mut terminal, keyboard_enhanced)?;
         result
     }
 
-    fn main_loop(&mut self, terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
+    fn main_loop(
+        &mut self,
+        terminal: &mut Term,
+        input: &InputReader,
+        keyboard_enhanced: bool,
+    ) -> Result<()> {
         loop {
             // Drain any model parts that have arrived from the background load.
             if let Some(rx) = &self.initial_load_rx {
@@ -682,8 +1147,15 @@ impl Gui {
                         }
                         ModelPart::Branches(v) => model.branches = v,
                         ModelPart::Commits(v) => {
-                            self.commit_history_complete = v.len() < DEFAULT_COMMIT_LIMIT;
-                            model.commits = v;
+                            // Keep filtered commits visible during streaming refresh;
+                            // after_model_refresh reloads the filtered set when done.
+                            let has_commit_filter = self.commit_path_filter.is_some()
+                                || !self.commit_author_filter.is_empty()
+                                || !self.commit_branch_filter.is_empty();
+                            if !has_commit_filter {
+                                self.commit_history_complete = v.len() < DEFAULT_COMMIT_LIMIT;
+                                model.set_commits(v);
+                            }
                         }
                         ModelPart::Stash(v) => model.stash_entries = v,
                         ModelPart::Remotes(v) => model.remotes = v,
@@ -710,6 +1182,10 @@ impl Gui {
                             if is_rebasing {
                                 got_rebase_in_progress = true;
                             }
+                        }
+                        ModelPart::Head { hash, branch_name } => {
+                            model.head_hash = hash;
+                            model.head_branch_name = branch_name;
                         }
                         ModelPart::RepoUrl(url) => model.repo_url = url,
                         ModelPart::Contributors(c) => model.contributors = c,
@@ -739,6 +1215,18 @@ impl Gui {
                 // All parts received — done loading.
                 if self.initial_load_received >= MODEL_PART_COUNT {
                     self.initial_load_rx = None;
+                    if self.refresh_in_progress {
+                        self.refresh_in_progress = false;
+                        // Leave needs_refresh alone: if another mutation arrived
+                        // mid-refresh it will re-queue on the next frame.
+                        self.needs_files_refresh = false;
+                        self.needs_diff_refresh = true;
+                        self.last_refresh_at = Instant::now();
+                        // Re-apply selection-dependent views after stream completes.
+                        if let Err(err) = self.after_model_refresh() {
+                            self.show_error("Refresh failed", err);
+                        }
+                    }
                 }
             }
 
@@ -747,6 +1235,9 @@ impl Gui {
 
             // Check for completed background diff results
             self.receive_diff_results();
+
+            // Queue details for only the commit where navigation has settled.
+            self.maybe_request_commit_details();
 
             // Check for AI commit message generation results
             self.receive_ai_commit_results();
@@ -780,7 +1271,7 @@ impl Gui {
                             frame.area(),
                             self.spinner_frame,
                             &theme,
-                            self.commit_ai_button_hovered,
+                            false,
                             !self
                                 .config
                                 .user_config
@@ -801,7 +1292,7 @@ impl Gui {
                             frame.area(),
                             self.spinner_frame,
                             &theme,
-                            self.commit_ai_button_hovered,
+                            false,
                             !self
                                 .config
                                 .user_config
@@ -820,6 +1311,16 @@ impl Gui {
                             "AI Commit",
                             "Generating commit message...",
                             Some(("Esc esc", "cancel")),
+                        );
+                    } else if let Some(label) = self.remote_op_label.as_deref() {
+                        views::render_loading_overlay(
+                            frame,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            label,
+                            "",
+                            None,
                         );
                     }
                 } else if self.diff_mode.active {
@@ -844,7 +1345,7 @@ impl Gui {
                             frame.area(),
                             self.spinner_frame,
                             &theme,
-                            self.commit_ai_button_hovered,
+                            false,
                             !self
                                 .config
                                 .user_config
@@ -864,6 +1365,16 @@ impl Gui {
                             "Generating commit message...",
                             Some(("Esc esc", "cancel")),
                         );
+                    } else if let Some(label) = self.remote_op_label.as_deref() {
+                        views::render_loading_overlay(
+                            frame,
+                            frame.area(),
+                            self.spinner_frame,
+                            &theme,
+                            label,
+                            "",
+                            None,
+                        );
                     }
                 } else {
                     let model = self.model.lock().unwrap();
@@ -877,6 +1388,18 @@ impl Gui {
                         None
                     };
                     let cmd_log = self.command_log.lock().unwrap();
+                    let mut active_commit_filters: Vec<String> = self
+                        .commit_branch_filter
+                        .iter()
+                        .map(|branch| format!("branch: {branch}"))
+                        .collect();
+                    if let Some(path) = self.commit_path_filter.as_deref() {
+                        active_commit_filters.push(format!("path: {path}"));
+                    }
+                    if !self.commit_author_filter.is_empty() {
+                        active_commit_filters
+                            .push(format!("author: {}", self.commit_author_filter.join(", ")));
+                    }
                     views::render(
                         frame,
                         &model,
@@ -886,6 +1409,7 @@ impl Gui {
                         &self.config,
                         &theme,
                         &mut self.diff_view,
+                        &mut self.commit_list_cache,
                         self.screen_mode,
                         self.show_file_tree,
                         &self.file_tree_nodes,
@@ -895,7 +1419,7 @@ impl Gui {
                         self.search_textarea.as_ref(),
                         &cmd_log,
                         self.show_command_log,
-                        &self.commit_branch_filter,
+                        &active_commit_filters,
                         self.show_commit_file_tree,
                         &self.commit_file_tree_nodes,
                         &self.commit_files_collapsed_dirs,
@@ -919,14 +1443,11 @@ impl Gui {
                                 .map(|t| t.elapsed() >= std::time::Duration::from_millis(50))
                                 .unwrap_or(false),
                         &self.commit_stats_cache,
-                        &self.commit_stats_inflight,
                         &self.commit_messages_cache,
-                        &self.commit_messages_inflight,
-                        &self.git,
                         &mut self.commit_details_scroll,
                         &mut self.commit_details_scroll_hash,
                         self.show_commit_details,
-                        self.commit_ai_button_hovered,
+                        false,
                         !self
                             .config
                             .user_config
@@ -936,85 +1457,52 @@ impl Gui {
                             .trim()
                             .is_empty(),
                     );
-                    if self.popup == PopupState::None && self.ai_commit_generation_active() {
-                        views::render_loading_overlay(
-                            frame,
-                            frame.area(),
-                            self.spinner_frame,
-                            &theme,
-                            "AI Commit",
-                            "Generating commit message...",
-                            Some(("Esc esc", "cancel")),
-                        );
+                    if self.popup == PopupState::None {
+                        if self.ai_commit_generation_active() {
+                            views::render_loading_overlay(
+                                frame,
+                                frame.area(),
+                                self.spinner_frame,
+                                &theme,
+                                "AI Commit",
+                                "Generating commit message...",
+                                Some(("Esc esc", "cancel")),
+                            );
+                        } else if let Some(label) = self.remote_op_label.as_deref() {
+                            views::render_loading_overlay(
+                                frame,
+                                frame.area(),
+                                self.spinner_frame,
+                                &theme,
+                                label,
+                                "",
+                                None,
+                            );
+                        }
                     }
                 }
             })?;
 
-            // Handle events
-            if event::poll(std::time::Duration::from_millis(16))? {
-                match event::read()? {
-                    Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
-                        if let Err(err) = self.handle_key(key) {
-                            self.show_error("Command failed", err);
-                        }
-                    }
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
-                    Event::Resize(w, h) => {
-                        self.layout.update_size(w, h);
-                        // Re-flow any active commit-message textarea to the new width so
-                        // wrapping stays consistent with what the user sees.
-                        let popup_width = (w * 60 / 100).min(60).max(30).min(w);
-                        let popup_inner = popup_width.saturating_sub(4) as usize;
-                        let config_width = self.config.user_config.git.commit.auto_wrap_width;
-                        let effective_width = if config_width > 0 {
-                            popup_inner.min(config_width)
-                        } else {
-                            popup_inner
-                        };
-                        match &mut self.popup {
-                            PopupState::Input {
-                                textarea,
-                                is_commit: true,
-                                ..
-                            } => {
-                                if effective_width > 0 {
-                                    auto_wrap_textarea(textarea, effective_width);
-                                }
-                            }
-                            PopupState::Input {
-                                textarea,
-                                is_commit: false,
-                                ..
-                            } => {
-                                // Single-line input: re-flow the soft wrap to the new width.
-                                let raw: String = textarea.lines().join("");
-                                if popup_inner > 0 && !raw.is_empty() {
-                                    let mut new_ta = popup::make_textarea("");
-                                    new_ta.insert_str(&raw);
-                                    soft_wrap_textarea(&mut new_ta, popup_inner);
-                                    *textarea = new_ta;
-                                }
-                            }
-                            PopupState::CommitInput {
-                                body_textarea,
-                                body_state,
-                                ..
-                            } => {
-                                if effective_width > 0 {
-                                    body_state.render_into(body_textarea, effective_width);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Event::FocusGained if self.config.user_config.git.auto_refresh => {
-                        self.needs_refresh = true;
-                    }
-                    Event::Paste(data) => {
-                        self.handle_paste(data);
-                    }
-                    _ => {}
-                }
+            // One batch per frame. Reassembly lives on the reader thread so a
+            // split ESC [ A cannot leak as Char('A') → amend between frames.
+            // Keep the frame budget tight while anything animated/async is up.
+            let timeout = if self.ai_commit_generation_active()
+                || self.remote_op_label.is_some()
+                || self.diff_loading
+                || self.initial_load_rx.is_some()
+                || self.refresh_in_progress
+            {
+                Duration::from_millis(16)
+            } else if self.config.user_config.git.auto_refresh {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_millis(200)
+            };
+            let events = input.wait_batch(timeout);
+            self.handle_event_batch(events);
+
+            if self.should_quit {
+                break;
             }
 
             // Reap a detached GUI editor, surfacing a prompt failure (e.g. the
@@ -1071,35 +1559,98 @@ impl Gui {
                 self.needs_refresh = true;
             }
 
-            // Refresh data if needed
-            if self.needs_refresh {
-                match self.refresh() {
-                    Ok(()) => {
-                        self.needs_refresh = false;
-                        self.needs_files_refresh = false;
-                        self.needs_diff_refresh = true;
-                        self.last_refresh_at = Instant::now();
-                    }
-                    Err(err) => {
-                        self.needs_refresh = false;
-                        self.show_error("Refresh failed", err);
-                    }
-                }
-            } else if self.needs_files_refresh {
-                match self.refresh_files_only() {
-                    Ok(()) => {
-                        self.needs_files_refresh = false;
-                        self.needs_diff_refresh = true;
-                    }
-                    Err(err) => {
-                        self.needs_files_refresh = false;
-                        self.show_error("Refresh failed", err);
-                    }
-                }
+            // Kick off a non-blocking full refresh (same streaming path as
+            // initial load). Avoids freezing the UI for ~1s on commit/reword.
+            if self.needs_refresh && !self.refresh_in_progress && self.initial_load_rx.is_none() {
+                self.start_background_refresh();
+            } else if self.needs_files_refresh
+                && !self.refresh_in_progress
+                && !self.files_refresh_in_progress
+            {
+                // Status-only async refresh — Space spam stays responsive.
+                self.start_files_refresh_async();
+            }
+
+            // Apply completed light files refresh without blocking input.
+            self.receive_files_refresh();
+
+            if self.should_quit {
+                break;
             }
         }
 
         Ok(())
+    }
+
+    /// Apply one batch of terminal events before the next paint.
+    fn handle_event_batch(&mut self, events: Vec<Event>) {
+        for event in events {
+            match event {
+                Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
+                    if let Err(err) = self.handle_key(key) {
+                        self.show_error("Command failed", err);
+                    }
+                }
+                Event::Mouse(mouse) => self.handle_mouse(mouse),
+                Event::Resize(w, h) => self.handle_resize(w, h),
+                Event::FocusGained if self.config.user_config.git.auto_refresh => {
+                    self.needs_refresh = true;
+                }
+                Event::Paste(data) => self.handle_paste(data),
+                _ => {}
+            }
+            if self.should_quit {
+                break;
+            }
+        }
+    }
+
+    fn handle_resize(&mut self, w: u16, h: u16) {
+        self.layout.update_size(w, h);
+        // Re-flow any active commit-message textarea to the new width so
+        // wrapping stays consistent with what the user sees.
+        let popup_width = (w * 60 / 100).min(60).max(30).min(w);
+        let popup_inner = popup_width.saturating_sub(4) as usize;
+        let config_width = self.config.user_config.git.commit.auto_wrap_width;
+        let effective_width = if config_width > 0 {
+            popup_inner.min(config_width)
+        } else {
+            popup_inner
+        };
+        match &mut self.popup {
+            PopupState::Input {
+                textarea,
+                is_commit: true,
+                ..
+            } => {
+                if effective_width > 0 {
+                    auto_wrap_textarea(textarea, effective_width);
+                }
+            }
+            PopupState::Input {
+                textarea,
+                is_commit: false,
+                ..
+            } => {
+                let raw: String = textarea.lines().join("");
+                if popup_inner > 0 && !raw.is_empty() {
+                    let mut new_ta = popup::make_textarea("");
+                    new_ta.insert_str(&raw);
+                    soft_wrap_textarea(&mut new_ta, popup_inner);
+                    *textarea = new_ta;
+                }
+            }
+            PopupState::CommitInput {
+                body_textarea,
+                body_state,
+                ..
+            } => {
+                if effective_width > 0 {
+                    body_state.render_into(body_textarea, effective_width);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Receive completed diff results from the background thread (non-blocking).
@@ -1108,7 +1659,7 @@ impl Gui {
         let current_gen = self.diff_generation.load(Ordering::Relaxed);
         while let Ok(result) = self.diff_rx.try_recv() {
             // Discard stale results from older generations
-            if result.generation != current_gen {
+            if result.generation != current_gen || result.diff_key != self.last_diff_key {
                 continue;
             }
             self.diff_loading = false;
@@ -1136,6 +1687,254 @@ impl Gui {
                 }
             }
         }
+    }
+
+    fn current_diff_key(&self) -> String {
+        if self.diff_mode.active {
+            let item_key = if self.diff_mode.show_tree {
+                self.diff_mode
+                    .tree_nodes
+                    .get(self.diff_mode.diff_files_selected)
+                    .map(|node| {
+                        node.file_index
+                            .and_then(|index| self.diff_mode.diff_files.get(index))
+                            .map(|file| format!("file:{}", file.name))
+                            .unwrap_or_else(|| format!("dir:{}", node.path))
+                    })
+                    .unwrap_or_else(|| "none".to_string())
+            } else {
+                self.diff_mode
+                    .diff_files
+                    .get(self.diff_mode.diff_files_selected)
+                    .map(|file| format!("file:{}", file.name))
+                    .unwrap_or_else(|| "none".to_string())
+            };
+            return format!(
+                "DiffMode:{}..{}:{}",
+                self.diff_mode.ref_a, self.diff_mode.ref_b, item_key
+            );
+        }
+
+        let active = self.context_mgr.active();
+        let selected = self.context_mgr.selected_active();
+        let model = self.model.lock().unwrap();
+        match active {
+            ContextId::Files => {
+                if self.show_file_tree {
+                    self.file_tree_nodes
+                        .get(selected)
+                        .map(|node| {
+                            node.file_index
+                                .and_then(|index| model.files.get(index))
+                                .map(|file| format!("Files:file:{}", file.name))
+                                .unwrap_or_else(|| format!("Files:dir:{}", node.path))
+                        })
+                        .unwrap_or_else(|| "Files:none".to_string())
+                } else {
+                    model
+                        .files
+                        .get(selected)
+                        .map(|file| format!("Files:file:{}", file.name))
+                        .unwrap_or_else(|| "Files:none".to_string())
+                }
+            }
+            ContextId::Commits => model
+                .commits
+                .get(selected)
+                .map(|commit| format!("Commits:{}", commit.hash))
+                .unwrap_or_else(|| "Commits:none".to_string()),
+            ContextId::Reflog => model
+                .reflog_commits
+                .get(selected)
+                .map(|commit| format!("Reflog:{}", commit.hash))
+                .unwrap_or_else(|| "Reflog:none".to_string()),
+            ContextId::Stash => model
+                .stash_entries
+                .get(selected)
+                .map(|entry| format!("Stash:{}", entry.hash))
+                .unwrap_or_else(|| "Stash:none".to_string()),
+            ContextId::BranchCommits => model
+                .sub_commits
+                .get(selected)
+                .map(|commit| format!("BranchCommits:{}", commit.hash))
+                .unwrap_or_else(|| "BranchCommits:none".to_string()),
+            ContextId::CommitFiles | ContextId::StashFiles | ContextId::BranchCommitFiles => {
+                let prefix = format!("{:?}:{}", active, self.commit_files_hash);
+                if self.show_commit_file_tree {
+                    self.commit_file_tree_nodes
+                        .get(selected)
+                        .map(|node| {
+                            node.file_index
+                                .and_then(|index| model.commit_files.get(index))
+                                .map(|file| format!("{}:file:{}", prefix, file.name))
+                                .unwrap_or_else(|| format!("{}:dir:{}", prefix, node.path))
+                        })
+                        .unwrap_or_else(|| format!("{}:none", prefix))
+                } else {
+                    model
+                        .commit_files
+                        .get(selected)
+                        .map(|file| format!("{}:file:{}", prefix, file.name))
+                        .unwrap_or_else(|| format!("{}:none", prefix))
+                }
+            }
+            _ => format!("{:?}:{}", active, selected),
+        }
+    }
+
+    fn begin_diff_request(&mut self, diff_key: String) -> Option<u64> {
+        if diff_key == self.last_diff_key && !self.needs_diff_refresh {
+            return None;
+        }
+
+        let selection_changed = diff_key != self.last_diff_key;
+        if selection_changed {
+            self.cache_current_diff_for_revisit();
+        }
+        self.last_diff_key = diff_key.clone();
+        self.needs_diff_refresh = false;
+
+        let generation = self.diff_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if selection_changed {
+            if let Some(mut cached) = self.diff_preview_cache.take(&diff_key) {
+                cached.wrap = self.diff_view.wrap;
+                cached.view_layout = self.diff_view.view_layout;
+                self.diff_view = cached;
+                self.diff_loading = false;
+                self.diff_loading_since = None;
+                return None;
+            }
+            self.diff_view.reset_keep_prefs();
+        }
+
+        self.diff_loading = false;
+        self.diff_loading_since = None;
+        Some(generation)
+    }
+
+    fn cache_current_diff_for_revisit(&mut self) {
+        if self.diff_loading || self.diff_view.is_empty() || self.last_diff_key.is_empty() {
+            return;
+        }
+
+        let mut replacement = DiffViewState::new();
+        replacement.wrap = self.diff_view.wrap;
+        replacement.view_layout = self.diff_view.view_layout;
+        let view = std::mem::replace(&mut self.diff_view, replacement);
+        self.diff_preview_cache
+            .insert(self.last_diff_key.clone(), view);
+    }
+
+    fn clear_diff_preview_cache(&mut self) {
+        self.diff_preview_cache.clear();
+    }
+
+    fn maybe_request_commit_details(&mut self) {
+        if !self.show_commit_details {
+            if !self.last_commit_details_key.is_empty() {
+                self.last_commit_details_key.clear();
+                self.commit_details_generation
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let active = self.context_mgr.active();
+        let selected = self.context_mgr.selected_active();
+        let hash = {
+            let model = self.model.lock().unwrap();
+            match active {
+                ContextId::Commits => model
+                    .commits
+                    .get(selected)
+                    .map(|commit| commit.hash.clone()),
+                ContextId::BranchCommits => model
+                    .sub_commits
+                    .get(selected)
+                    .map(|commit| commit.hash.clone()),
+                ContextId::Reflog => model
+                    .reflog_commits
+                    .get(selected)
+                    .map(|commit| commit.hash.clone()),
+                ContextId::CommitFiles | ContextId::StashFiles | ContextId::BranchCommitFiles => {
+                    (!self.commit_files_hash.is_empty()).then(|| self.commit_files_hash.clone())
+                }
+                _ => None,
+            }
+        };
+        let Some(hash) = hash else {
+            if !self.last_commit_details_key.is_empty() {
+                self.last_commit_details_key.clear();
+                self.commit_details_generation
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        };
+
+        let details_key = format!("{:?}:{}", active, hash);
+        if details_key == self.last_commit_details_key {
+            return;
+        }
+        self.last_commit_details_key = details_key;
+        let generation = self
+            .commit_details_generation
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+
+        let stat_cached = self
+            .commit_stats_cache
+            .lock()
+            .map(|cache| cache.contains_key(&hash))
+            .unwrap_or(false);
+        let message_cached = self
+            .commit_messages_cache
+            .lock()
+            .map(|cache| cache.contains_key(&hash))
+            .unwrap_or(false);
+        if stat_cached && message_cached {
+            return;
+        }
+
+        let git = Arc::clone(&self.git);
+        let stat_cache = Arc::clone(&self.commit_stats_cache);
+        let message_cache = Arc::clone(&self.commit_messages_cache);
+        let generation_counter = Arc::clone(&self.commit_details_generation);
+        let _ = self.commit_details_job_tx.send(Box::new(move || {
+            if generation_counter.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            if !stat_cached {
+                if let Ok(stat) = git.commit_stat(&hash) {
+                    if let Ok(mut cache) = stat_cache.lock() {
+                        cache.insert(hash.clone(), stat);
+                    }
+                }
+            }
+
+            if generation_counter.load(Ordering::Relaxed) != generation {
+                return;
+            }
+            if !message_cached {
+                if let Ok(message) = git.commit_message_full(&hash) {
+                    if let Ok(mut cache) = message_cache.lock() {
+                        cache.insert(hash, message);
+                    }
+                }
+            }
+        }));
+    }
+
+    pub(crate) fn queue_diff_job<F>(&self, generation: u64, diff_key: String, load: F)
+    where
+        F: FnOnce() -> DiffPayload + Send + 'static,
+    {
+        let _ = self
+            .diff_scheduler_tx
+            .send(DiffSchedulerEvent::Job(DiffJob {
+                generation,
+                diff_key,
+                load: Box::new(load),
+            }));
     }
 
     /// Check for completed AI commit message generation results.
@@ -1202,29 +2001,40 @@ impl Gui {
                             body_state.render_into(&mut body_ta, wrap);
                         }
                         self.popup = PopupState::CommitInput {
+                            kind: popup::CommitInputKind::Commit,
                             summary_textarea: summary_ta,
                             body_textarea: body_ta,
                             body_state,
                             focus: popup::CommitInputFocus::Summary,
                             on_confirm: Box::new(|gui, msg| {
                                 if !msg.is_empty() {
-                                    gui.git.create_commit(msg, false)?;
-                                    gui.needs_refresh = true;
+                                    let message = msg.to_string();
+                                    gui.start_remote_op(
+                                        "Commit",
+                                        "Creating commit...",
+                                        move |git| {
+                                            git.create_commit(&message, false)?;
+                                            Ok(())
+                                        },
+                                    );
                                 }
                                 Ok(())
                             }),
                         };
                     }
+                    self.ai_commit_source = AiCommitSource::Staged;
                 }
                 Ok(None) => {
                     if let Some(stashed) = self.pending_commit_popup.take() {
                         self.saved_commit_popup = Some(stashed);
                     }
+                    self.ai_commit_source = AiCommitSource::Staged;
                 }
                 Err(e) => {
                     if let Some(stashed) = self.pending_commit_popup.take() {
                         self.saved_commit_popup = Some(stashed);
                     }
+                    self.ai_commit_source = AiCommitSource::Staged;
                     self.popup = PopupState::Message {
                         title: "AI generation failed".to_string(),
                         message: format!(
@@ -1251,9 +2061,11 @@ impl Gui {
                     let mut model = self.model.lock().unwrap();
                     let mut seen: HashSet<String> =
                         model.commits.iter().map(|c| c.hash.clone()).collect();
-                    model
-                        .commits
-                        .extend(commits.into_iter().filter(|c| seen.insert(c.hash.clone())));
+                    let new_commits: Vec<_> = commits
+                        .into_iter()
+                        .filter(|c| seen.insert(c.hash.clone()))
+                        .collect();
+                    model.extend_commits(new_commits);
                     self.commit_history_complete = page_len < DEFAULT_COMMIT_LIMIT;
                     self.context_mgr.clamp_selections(&model);
                 }
@@ -1303,14 +2115,14 @@ impl Gui {
         let generation = self.commit_page_generation;
         let git = Arc::clone(&self.git);
         let tx = self.commit_page_tx.clone();
-        let branches = self.commit_branch_filter.clone();
+        let filter = crate::git::commit::CommitFilter {
+            branches: self.commit_branch_filter.clone(),
+            path: self.commit_path_filter.clone(),
+            authors: self.commit_author_filter.clone(),
+        };
 
         std::thread::spawn(move || {
-            let result = if branches.is_empty() {
-                git.load_commits_page(DEFAULT_COMMIT_LIMIT, len)
-            } else {
-                git.load_commits_for_branches_page(&branches, DEFAULT_COMMIT_LIMIT, len)
-            };
+            let result = git.load_filtered_commits_page(&filter, DEFAULT_COMMIT_LIMIT, len);
             let _ = tx.send(CommitPageResult { generation, result });
         });
     }
@@ -1333,6 +2145,12 @@ impl Gui {
             return;
         }
         if self.auto_fetch_in_flight {
+            return;
+        }
+        // Don't race a user-initiated push/pull/fetch (even with
+        // --no-write-fetch-head, concurrent network ops are wasteful and can
+        // still contend on packed-refs / remote-tracking updates).
+        if self.remote_op_label.is_some() {
             return;
         }
         let due = match self.last_auto_fetch_at {
@@ -1361,7 +2179,7 @@ impl Gui {
     fn receive_auto_fetch_results(&mut self) {
         while let Ok(result) = self.auto_fetch_rx.try_recv() {
             self.auto_fetch_in_flight = false;
-            if result.is_ok() {
+            if matches!(result, Ok(true)) {
                 self.needs_refresh = true;
             }
         }
@@ -1383,6 +2201,125 @@ impl Gui {
                         kind: MessageKind::Error,
                     };
                 }
+            }
+        }
+    }
+
+    /// Kick off a status-only files refresh on a background thread.
+    fn start_files_refresh_async(&mut self) {
+        if self.files_refresh_in_progress {
+            return;
+        }
+        self.needs_files_refresh = false;
+        self.files_refresh_in_progress = true;
+        let git = Arc::clone(&self.git);
+        let (tx, rx) = mpsc::channel();
+        self.files_refresh_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(git.refresh_files_status_only());
+        });
+    }
+
+    /// Stage/unstage paths on a background thread, then load status-only and
+    /// apply via the files-refresh channel. Avoids racing a status refresh
+    /// ahead of the git add/reset (which would clobber optimistic UI).
+    pub(crate) fn enqueue_stage_then_refresh(&mut self, paths: Vec<String>, stage: bool) {
+        if paths.is_empty() {
+            return;
+        }
+        // Coalesce: if a light refresh is already in flight, just mark that we
+        // need another after it lands; still run the git op so the index keeps
+        // up with optimistic presses.
+        let git = Arc::clone(&self.git);
+        let should_send_files = !self.files_refresh_in_progress;
+        if should_send_files {
+            self.files_refresh_in_progress = true;
+            let (tx, rx) = mpsc::channel();
+            self.files_refresh_rx = Some(rx);
+            std::thread::spawn(move || {
+                if stage {
+                    let _ = git.stage_files(&paths);
+                } else {
+                    let _ = git.unstage_files(&paths);
+                }
+                let _ = tx.send(git.refresh_files_status_only());
+            });
+        } else {
+            self.needs_files_refresh = true;
+            std::thread::spawn(move || {
+                if stage {
+                    let _ = git.stage_files(&paths);
+                } else {
+                    let _ = git.unstage_files(&paths);
+                }
+            });
+        }
+    }
+
+    /// Stage/unstage everything on a background thread, then status-only refresh.
+    pub(crate) fn enqueue_stage_all_then_refresh(&mut self, stage: bool) {
+        let git = Arc::clone(&self.git);
+        let should_send_files = !self.files_refresh_in_progress;
+        if should_send_files {
+            self.files_refresh_in_progress = true;
+            let (tx, rx) = mpsc::channel();
+            self.files_refresh_rx = Some(rx);
+            std::thread::spawn(move || {
+                if stage {
+                    let _ = git.stage_all();
+                } else {
+                    let _ = git.unstage_all();
+                }
+                let _ = tx.send(git.refresh_files_status_only());
+            });
+        } else {
+            self.needs_files_refresh = true;
+            std::thread::spawn(move || {
+                if stage {
+                    let _ = git.stage_all();
+                } else {
+                    let _ = git.unstage_all();
+                }
+            });
+        }
+    }
+
+    /// Apply a completed status-only files refresh.
+    fn receive_files_refresh(&mut self) {
+        let Some(rx) = self.files_refresh_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(files)) => {
+                self.files_refresh_rx = None;
+                self.files_refresh_in_progress = false;
+                {
+                    let mut model = self.model.lock().unwrap();
+                    model.set_files(files);
+                    if self.show_file_tree {
+                        self.file_tree_nodes = build_file_tree(&model.files, &self.collapsed_dirs);
+                        self.context_mgr.files_list_len_override = Some(self.file_tree_nodes.len());
+                    } else {
+                        self.file_tree_nodes.clear();
+                        self.context_mgr.files_list_len_override = None;
+                    }
+                }
+                // If more stage ops landed while we were refreshing, do another.
+                if self.needs_files_refresh {
+                    self.start_files_refresh_async();
+                } else {
+                    self.needs_diff_refresh = true;
+                }
+            }
+            Ok(Err(err)) => {
+                self.files_refresh_rx = None;
+                self.files_refresh_in_progress = false;
+                self.show_error("Refresh failed", err);
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.files_refresh_rx = None;
+                self.files_refresh_in_progress = false;
             }
         }
     }
@@ -1491,6 +2428,7 @@ impl Gui {
     }
 
     /// Run a remote operation (push/pull/fetch) on a background thread.
+    /// Non-blocking: corner toast + branch-side label; input stays free (like AI commit).
     pub fn start_remote_op<F>(&mut self, title: &str, _message: &str, op: F)
     where
         F: FnOnce(&GitCommands) -> Result<()> + Send + 'static,
@@ -1560,6 +2498,7 @@ impl Gui {
         let git = Arc::clone(&self.git);
         let tx = self.ai_commit_tx.clone();
         let cmd = self.config.user_config.git.commit.generate_command.clone();
+        let source = self.ai_commit_source.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = Arc::clone(&cancel);
         self.ai_commit_generation = self.ai_commit_generation.wrapping_add(1);
@@ -1571,11 +2510,23 @@ impl Gui {
         });
 
         std::thread::spawn(move || {
-            let result = crate::git::ai_commit::generate_commit_message_cancellable(
-                git.repo_path(),
-                &cmd,
-                worker_cancel,
-            );
+            let result = match source {
+                AiCommitSource::Staged => {
+                    crate::git::ai_commit::generate_commit_message_cancellable(
+                        git.repo_path(),
+                        &cmd,
+                        worker_cancel,
+                    )
+                }
+                AiCommitSource::Commit(hash) => git.commit_diff(&hash).and_then(|diff| {
+                    crate::git::ai_commit::generate_commit_message_from_diff_cancellable(
+                        git.repo_path(),
+                        &diff,
+                        &cmd,
+                        worker_cancel,
+                    )
+                }),
+            };
             let _ = tx.send(AiCommitResult { generation, result });
         });
     }
@@ -1601,6 +2552,22 @@ impl Gui {
             return;
         }
 
+        self.ai_commit_source = match &self.popup {
+            PopupState::CommitInput {
+                kind: popup::CommitInputKind::Reword,
+                ..
+            } => {
+                let selected = self.context_mgr.selected_active();
+                self.model
+                    .lock()
+                    .unwrap()
+                    .commits
+                    .get(selected)
+                    .map(|commit| AiCommitSource::Commit(commit.hash.clone()))
+                    .unwrap_or(AiCommitSource::Staged)
+            }
+            _ => AiCommitSource::Staged,
+        };
         let stashed = std::mem::replace(&mut self.popup, PopupState::None);
         self.pending_commit_popup = Some(stashed);
         self.begin_ai_commit_generation_ui();
@@ -1643,21 +2610,10 @@ impl Gui {
 
         // Diff mode has its own diff loading
         if self.diff_mode.active {
-            let diff_key = format!("diffmode:{}", self.diff_mode.diff_files_selected);
-            if diff_key == self.last_diff_key && !self.needs_diff_refresh {
+            let diff_key = self.current_diff_key();
+            let Some(generation) = self.begin_diff_request(diff_key.clone()) else {
                 return;
-            }
-            let selection_changed = diff_key != self.last_diff_key;
-            self.last_diff_key = diff_key.clone();
-            self.needs_diff_refresh = false;
-
-            // Bump generation to invalidate any in-flight results
-            let generation = self.diff_generation.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Clear stale diff when selection changes
-            if selection_changed {
-                self.diff_view.reset_keep_prefs();
-            }
+            };
 
             self.diff_loading = true;
             self.diff_loading_since = Some(Instant::now());
@@ -1668,22 +2624,10 @@ impl Gui {
 
         let active = self.context_mgr.active();
         let selected = self.context_mgr.selected_active();
-        let diff_key = format!("{:?}:{}", active, selected);
-
-        if diff_key == self.last_diff_key && !self.needs_diff_refresh {
+        let diff_key = self.current_diff_key();
+        let Some(generation) = self.begin_diff_request(diff_key.clone()) else {
             return;
-        }
-        let selection_changed = diff_key != self.last_diff_key;
-        self.last_diff_key = diff_key.clone();
-        self.needs_diff_refresh = false;
-
-        // Bump generation to invalidate any in-flight results
-        let generation = self.diff_generation.fetch_add(1, Ordering::Relaxed) + 1;
-
-        // Clear stale diff when selection changes so user sees "Loading..." instead of old content
-        if selection_changed {
-            self.diff_view.reset_keep_prefs();
-        }
+        };
 
         let model = self.model.lock().unwrap();
         match active {
@@ -1708,18 +2652,16 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
+                    self.queue_diff_job(generation, diff_key, move || {
                         let exists = git.repo_path().join(&current_path).exists();
-                        let payload = if has_conflicts {
-                            match git.conflict_stages(&name) {
+
+                        // A conflicted file has no meaningful worktree diff —
+                        // preview the two conflicting stages against each other.
+                        if has_conflicts {
+                            return match git.conflict_stages(&name) {
                                 Ok(stages) => {
                                     let base =
                                         stages.base.and_then(|bytes| String::from_utf8(bytes).ok());
@@ -1744,20 +2686,28 @@ impl Gui {
                                     }
                                 }
                                 Err(_) => DiffPayload::Empty,
-                            }
-                        } else {
-                            let path_refs: Vec<&str> =
-                                diff_paths.iter().map(String::as_str).collect();
-                            let diff_result = if has_unstaged {
-                                git.diff_file_paths(&path_refs)
-                            } else if has_staged {
-                                git.diff_file_staged_paths(&path_refs)
-                            } else {
-                                Ok(String::new())
                             };
+                        }
 
-                            match diff_result {
-                                Ok(diff) if diff.is_empty() && !tracked => {
+                        let path_refs: Vec<&str> = diff_paths.iter().map(String::as_str).collect();
+                        let diff_result = if has_unstaged {
+                            git.diff_file_paths(&path_refs)
+                        } else if has_staged {
+                            git.diff_file_staged_paths(&path_refs)
+                        } else {
+                            Ok(String::new())
+                        };
+
+                        match diff_result {
+                            Ok(diff) if diff.is_empty() && !tracked => {
+                                if git.is_binary_path(&current_path) {
+                                    DiffPayload::Parsed(DiffViewState::parse_diff_output(
+                                        &current_path,
+                                        &synthesize_binary_file_diff(&current_path),
+                                        4,
+                                        exists,
+                                    ))
+                                } else {
                                     match git.file_content(&current_path) {
                                         Ok(content) if !content.is_empty() => {
                                             DiffPayload::Parsed(DiffViewState::parse_content(
@@ -1771,86 +2721,71 @@ impl Gui {
                                         _ => DiffPayload::Empty,
                                     }
                                 }
-                                Ok(diff) if diff.is_empty() => DiffPayload::Empty,
-                                Ok(diff) => DiffPayload::Parsed(DiffViewState::parse_diff_output(
-                                    &name, &diff, 4, exists,
-                                )),
-                                Err(_) => DiffPayload::Empty,
                             }
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                            Ok(diff) if diff.is_empty() => DiffPayload::Empty,
+                            Ok(diff) => parse_file_diff_payload(
+                                &git,
+                                &name,
+                                &current_path,
+                                &diff,
+                                exists,
+                                has_staged && !has_unstaged,
+                            ),
+                            Err(_) => DiffPayload::Empty,
+                        }
                     });
                 } else if self.show_file_tree {
                     // Directory node: show combined diff of all child files (async)
                     if let Some(node) = self.file_tree_nodes.get(selected) {
                         if node.is_dir && !node.child_file_indices.is_empty() {
-                            let child_names: Vec<(String, Vec<String>, bool, bool, bool)> = node
+                            // One `git diff HEAD -- dir/` for tracked files under the
+                            // directory; only untracked children still need synthesize.
+                            let untracked: Vec<String> = node
                                 .child_file_indices
                                 .iter()
                                 .filter_map(|&i| model.files.get(i))
-                                .map(|f| {
-                                    (
-                                        f.current_path().to_string(),
-                                        f.diff_paths().into_iter().map(str::to_string).collect(),
-                                        f.has_unstaged_changes,
-                                        f.has_staged_changes,
-                                        f.tracked,
-                                    )
-                                })
+                                .filter(|f| !f.tracked)
+                                .map(|f| f.current_path().to_string())
                                 .collect();
+                            let pathspec = pathspec_for_tree_path(&node.path);
                             let dir_name = node.name.clone();
                             drop(model);
 
                             let git = Arc::clone(&self.git);
-                            let tx = self.diff_tx.clone();
                             let gen_counter = Arc::clone(&self.diff_generation);
 
                             self.diff_loading = true;
                             self.diff_loading_since = Some(Instant::now());
-                            std::thread::spawn(move || {
+                            self.queue_diff_job(generation, diff_key, move || {
                                 if gen_counter.load(Ordering::Relaxed) != generation {
-                                    return;
+                                    return DiffPayload::Empty;
                                 }
-                                let mut combined_diff = String::new();
-                                for (current_path, diff_paths, has_unstaged, has_staged, tracked) in
-                                    &child_names
-                                {
+                                let paths: Vec<&str> = match pathspec.as_deref() {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
+                                };
+                                let mut combined_diff =
+                                    git.diff_paths_vs_head(&paths).unwrap_or_default();
+                                for path in &untracked {
                                     if gen_counter.load(Ordering::Relaxed) != generation {
-                                        return;
+                                        return DiffPayload::Empty;
                                     }
-                                    let diff = if !tracked {
-                                        // Untracked file: synthesize a unified diff from raw content
-                                        let content =
-                                            git.file_content(current_path).unwrap_or_default();
-                                        if content.is_empty() {
-                                            String::new()
-                                        } else {
-                                            synthesize_new_file_diff(current_path, &content)
-                                        }
-                                    } else if *has_unstaged {
-                                        let path_refs: Vec<&str> =
-                                            diff_paths.iter().map(String::as_str).collect();
-                                        git.diff_file_paths(&path_refs).unwrap_or_default()
-                                    } else if *has_staged {
-                                        let path_refs: Vec<&str> =
-                                            diff_paths.iter().map(String::as_str).collect();
-                                        git.diff_file_staged_paths(&path_refs).unwrap_or_default()
+                                    let synth = if git.is_binary_path(path) {
+                                        synthesize_binary_file_diff(path)
                                     } else {
-                                        String::new()
-                                    };
-                                    if !diff.is_empty() {
-                                        if !combined_diff.is_empty() {
-                                            combined_diff.push('\n');
+                                        let content = git.file_content(path).unwrap_or_default();
+                                        if content.is_empty() {
+                                            continue;
                                         }
-                                        combined_diff.push_str(&diff);
+                                        synthesize_new_file_diff(path, &content)
+                                    };
+                                    if !combined_diff.is_empty() {
+                                        combined_diff.push('\n');
                                     }
+                                    combined_diff.push_str(&synth);
                                 }
 
-                                let payload = if combined_diff.is_empty() {
+                                if combined_diff.is_empty() {
                                     DiffPayload::Empty
                                 } else {
                                     DiffPayload::Parsed(DiffViewState::parse_diff_output(
@@ -1859,12 +2794,7 @@ impl Gui {
                                         4,
                                         true,
                                     ))
-                                };
-                                let _ = tx.send(DiffResult {
-                                    generation,
-                                    diff_key,
-                                    payload,
-                                });
+                                }
                             });
                         } else {
                             drop(model);
@@ -1886,28 +2816,18 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let payload = if let Ok(diff) = git.diff_commit(&hash) {
+                    self.queue_diff_job(generation, diff_key, move || {
+                        if let Ok(diff) = git.diff_commit(&hash) {
                             let filename = format!("commit:{}", &hash[..7.min(hash.len())]);
                             DiffPayload::Parsed(DiffViewState::parse_diff_output(
                                 &filename, &diff, 4, false,
                             ))
                         } else {
                             DiffPayload::Empty
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                        }
                     });
                 }
             }
@@ -1918,28 +2838,18 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let payload = if let Ok(diff) = git.diff_commit(&hash) {
+                    self.queue_diff_job(generation, diff_key, move || {
+                        if let Ok(diff) = git.diff_commit(&hash) {
                             let filename = format!("reflog:{}", &hash[..7.min(hash.len())]);
                             DiffPayload::Parsed(DiffViewState::parse_diff_output(
                                 &filename, &diff, 4, false,
                             ))
                         } else {
                             DiffPayload::Empty
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                        }
                     });
                 }
             }
@@ -1950,16 +2860,11 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let payload = if let Ok(diff) = git.stash_diff(index) {
+                    self.queue_diff_job(generation, diff_key, move || {
+                        if let Ok(diff) = git.stash_diff(index) {
                             if diff.is_empty() {
                                 DiffPayload::Empty
                             } else {
@@ -1971,12 +2876,7 @@ impl Gui {
                             }
                         } else {
                             DiffPayload::Empty
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                        }
                     });
                 } else {
                     drop(model);
@@ -1989,28 +2889,18 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let payload = if let Ok(diff) = git.diff_commit(&hash) {
+                    self.queue_diff_job(generation, diff_key, move || {
+                        if let Ok(diff) = git.diff_commit(&hash) {
                             let filename = format!("commit:{}", &hash[..7.min(hash.len())]);
                             DiffPayload::Parsed(DiffViewState::parse_diff_output(
                                 &filename, &diff, 4, false,
                             ))
                         } else {
                             DiffPayload::Empty
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                        }
                     });
                 } else {
                     drop(model);
@@ -2032,72 +2922,52 @@ impl Gui {
                     drop(model);
 
                     let git = Arc::clone(&self.git);
-                    let tx = self.diff_tx.clone();
-                    let gen_counter = Arc::clone(&self.diff_generation);
 
                     self.diff_loading = true;
                     self.diff_loading_since = Some(Instant::now());
-                    std::thread::spawn(move || {
-                        if gen_counter.load(Ordering::Relaxed) != generation {
-                            return;
-                        }
-                        let payload = if let Ok(diff) = git.diff_commit_file(&hash, &name) {
+                    self.queue_diff_job(generation, diff_key, move || {
+                        if let Ok(diff) = git.diff_commit_file(&hash, &name) {
                             if diff.is_empty() {
                                 DiffPayload::Empty
                             } else {
-                                let exists = git.repo_path().join(&current_path).exists();
-                                DiffPayload::Parsed(DiffViewState::parse_diff_output(
-                                    &name, &diff, 4, exists,
-                                ))
+                                parse_commit_file_diff_payload(
+                                    &git,
+                                    &hash,
+                                    &name,
+                                    &current_path,
+                                    &diff,
+                                )
                             }
                         } else {
                             DiffPayload::Empty
-                        };
-                        let _ = tx.send(DiffResult {
-                            generation,
-                            diff_key,
-                            payload,
-                        });
+                        }
                     });
                 } else if self.show_commit_file_tree {
                     // Directory node in tree view: show combined diff of all child files
                     if let Some(node) = self.commit_file_tree_nodes.get(selected) {
                         if node.is_dir && !node.child_file_indices.is_empty() {
-                            let child_names: Vec<String> = node
-                                .child_file_indices
-                                .iter()
-                                .filter_map(|&i| model.commit_files.get(i))
-                                .map(|f| f.name.clone())
-                                .collect();
+                            // Single pathspec-filtered `git show`/`git diff` — not N× per file.
+                            let pathspec = pathspec_for_tree_path(&node.path);
                             let dir_name = node.name.clone();
                             let hash = self.commit_files_hash.clone();
                             drop(model);
 
                             let git = Arc::clone(&self.git);
-                            let tx = self.diff_tx.clone();
                             let gen_counter = Arc::clone(&self.diff_generation);
 
                             self.diff_loading = true;
                             self.diff_loading_since = Some(Instant::now());
-                            std::thread::spawn(move || {
+                            self.queue_diff_job(generation, diff_key, move || {
                                 if gen_counter.load(Ordering::Relaxed) != generation {
-                                    return;
+                                    return DiffPayload::Empty;
                                 }
-                                let mut combined_diff = String::new();
-                                for name in &child_names {
-                                    if gen_counter.load(Ordering::Relaxed) != generation {
-                                        return;
-                                    }
-                                    if let Ok(diff) = git.diff_commit_file(&hash, name) {
-                                        if !diff.is_empty() {
-                                            if !combined_diff.is_empty() {
-                                                combined_diff.push('\n');
-                                            }
-                                            combined_diff.push_str(&diff);
-                                        }
-                                    }
-                                }
-                                let payload = if combined_diff.is_empty() {
+                                let paths: Vec<&str> = match pathspec.as_deref() {
+                                    Some(p) => vec![p],
+                                    None => Vec::new(),
+                                };
+                                let combined_diff =
+                                    git.diff_commit_paths(&hash, &paths).unwrap_or_default();
+                                if combined_diff.is_empty() {
                                     DiffPayload::Empty
                                 } else {
                                     DiffPayload::Parsed(DiffViewState::parse_diff_output(
@@ -2106,12 +2976,7 @@ impl Gui {
                                         4,
                                         true,
                                     ))
-                                };
-                                let _ = tx.send(DiffResult {
-                                    generation,
-                                    diff_key,
-                                    payload,
-                                });
+                                }
                             });
                         } else {
                             drop(model);
@@ -2150,6 +3015,10 @@ impl Gui {
             return Ok(());
         }
 
+        if has_command_modifier(key.modifiers) && matches!(key.code, KeyCode::Char(_)) {
+            return Ok(());
+        }
+
         // Popup takes priority
         if self.popup != PopupState::None {
             return self.handle_popup_key(key);
@@ -2158,6 +3027,14 @@ impl Gui {
         // Search input mode takes priority
         if self.search_active {
             return self.handle_search_key(key);
+        }
+
+        // Terminal-level shortcuts such as Cmd+1/Cmd+2 must not fall through
+        // to character-only application shortcuts if the terminal forwards
+        // their enhanced-keyboard events. Filtered before any mode handler so
+        // no mode can claim them either.
+        if has_command_modifier(key.modifiers) {
+            return Ok(());
         }
 
         // Conflict merge view takes priority over normal/rebase/diff UI.
@@ -2214,6 +3091,12 @@ impl Gui {
             return Ok(());
         }
 
+        if matches_key(key, &keybindings.universal.toggle_diff_view_layout) {
+            self.diff_view.toggle_view_layout();
+            self.persist_diff_view_layout();
+            return Ok(());
+        }
+
         // When diff panel is focused, handle diff-specific keys
         if self.diff_focused {
             return self.handle_diff_focused_key(key);
@@ -2228,7 +3111,9 @@ impl Gui {
         }
 
         // Number keys 1-5 to jump to window (press again to cycle tabs)
-        if let KeyCode::Char(c @ '1'..='5') = key.code {
+        if key.modifiers == KeyModifiers::NONE
+            && let KeyCode::Char(c @ '1'..='5') = key.code
+        {
             let n = c.to_digit(10).unwrap();
             if let Some(window) = SideWindow::from_number(n) {
                 // If we're in a sub-context (CommitFiles), pressing the parent window's
@@ -2423,7 +3308,7 @@ impl Gui {
 
         // Diff/Compare mode (W)
         if key.code == KeyCode::Char('W') {
-            self.diff_mode.enter();
+            self.diff_mode.enter(self.show_file_tree);
             self.diff_view.reset_keep_prefs();
             return Ok(());
         }
@@ -2454,7 +3339,7 @@ impl Gui {
 
         // Help popup (?)
         if key.code == KeyCode::Char('?') {
-            self.show_help();
+            self.show_command_palette();
             return Ok(());
         }
 
@@ -2489,8 +3374,20 @@ impl Gui {
         }
 
         // Universal "I" key: interactive rebase picker
-        if key.code == KeyCode::Char('I') {
+        // SHIFT alone is accepted because terminals report uppercase letters that way.
+        // Modes that already claim keys (rebase/diff/search/popups) return earlier, so
+        // these only fire in normal views.
+        if plain_char_key(key, 'I') {
             self.show_interactive_rebase_picker();
+            return Ok(());
+        }
+
+        // Universal "G" key: global reset picker (lazygit `universal.viewResetOptions`).
+        // Opens a searchable branch/commit picker, then soft/mixed/hard options.
+        // Lowercase `g` remains contextual (commits.viewResetOptions) and is handled
+        // by per-context controllers — plain_char_key only matches uppercase G.
+        if plain_char_key(key, 'G') {
+            self.show_reset_picker();
             return Ok(());
         }
 
@@ -2818,7 +3715,7 @@ impl Gui {
 
         // Help popup
         if key.code == KeyCode::Char('?') {
-            self.show_diff_help();
+            self.show_diff_command_palette();
             return Ok(());
         }
 
@@ -2890,11 +3787,6 @@ impl Gui {
                 } else {
                     self.diff_view.prev_hunk();
                 }
-            }
-            // v toggles unified / side-by-side diff layout
-            KeyCode::Char('v') => {
-                self.diff_view.toggle_view_layout();
-                self.persist_diff_view_layout();
             }
             // [ and ] toggle old-only / new-only view
             KeyCode::Char(']') => {
@@ -3060,7 +3952,7 @@ impl Gui {
                     }
                 }
             }
-            PopupState::Help {
+            PopupState::CommandPalette {
                 selected,
                 scroll_offset,
                 search_textarea,
@@ -3071,6 +3963,23 @@ impl Gui {
                 *selected = 0;
                 *scroll_offset = 0;
             }
+            PopupState::Checklist {
+                items,
+                selected,
+                search_textarea,
+                free_entry_category,
+                ..
+            } => {
+                let cleaned: String = data.replace('\r', "").replace('\n', " ");
+                search_textarea.insert_str(&cleaned);
+                let after = search_textarea.lines().join("");
+                crate::gui::popup::sync_checklist_free_entry(
+                    items,
+                    free_entry_category.as_deref(),
+                    &after,
+                );
+                *selected = 0;
+            }
             PopupState::RefPicker {
                 core,
                 allow_freeform,
@@ -3080,6 +3989,18 @@ impl Gui {
                 core.search_textarea.insert_str(&cleaned);
                 let new_search = core.search_textarea.lines().join("");
                 update_ref_picker_search(core, &new_search, *allow_freeform, 0);
+            }
+            PopupState::ListPicker {
+                core,
+                free_entry_category,
+                ..
+            } => {
+                use crate::gui::popup::sync_list_picker_prefer_free_entry;
+                let cleaned: String = data.replace('\r', "").replace('\n', " ");
+                core.search_textarea.insert_str(&cleaned);
+                let category = free_entry_category.clone();
+                sync_list_picker_prefer_free_entry(core, &category);
+                core.scroll_offset = 0;
             }
             PopupState::ThemePicker { core, .. } => {
                 let cleaned: String = data.replace('\r', "").replace('\n', " ");
@@ -3103,8 +4024,9 @@ impl Gui {
     }
 
     pub(crate) fn handle_popup_key(&mut self, key: KeyEvent) -> Result<()> {
-        let was_help = matches!(self.popup, PopupState::Help { .. });
+        let was_help = matches!(self.popup, PopupState::CommandPalette { .. });
         let was_ref_picker = matches!(self.popup, PopupState::RefPicker { .. });
+        let was_list_picker = matches!(self.popup, PopupState::ListPicker { .. });
         let was_theme_picker = matches!(self.popup, PopupState::ThemePicker { .. });
 
         match &self.popup {
@@ -3755,53 +4677,49 @@ impl Gui {
             PopupState::Checklist {
                 items,
                 selected: _,
-                search,
+                search_textarea,
                 ..
             } => {
-                use crossterm::event::KeyModifiers;
-                // Ctrl+A: clear all checks
-                if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    if let PopupState::Checklist { items, .. } = &mut self.popup {
-                        for item in items.iter_mut() {
-                            item.checked = false;
-                        }
-                    }
-                    return Ok(());
-                }
+                let search = search_textarea.lines().join("");
                 let visible_count = items
                     .iter()
                     .filter(|it| {
-                        search.is_empty()
+                        it.is_free_entry
+                            || search.is_empty()
                             || it.label.to_lowercase().contains(&search.to_lowercase())
                     })
                     .count();
                 match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    // Arrow keys only for navigation — j/k must type into the search filter
+                    // (same pattern as ListPicker / CommandPalette / ThemePicker).
+                    KeyCode::Down if key.modifiers.is_empty() => {
                         if let PopupState::Checklist { selected, .. } = &mut self.popup {
                             if visible_count > 0 {
                                 *selected = (*selected + 1).min(visible_count - 1);
                             }
                         }
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up if key.modifiers.is_empty() => {
                         if let PopupState::Checklist { selected, .. } = &mut self.popup {
                             *selected = selected.saturating_sub(1);
                         }
                     }
-                    KeyCode::Char(' ') => {
+                    KeyCode::Char(' ') if key.modifiers.is_empty() => {
                         // Toggle checked state on the visible item at `selected`
                         if let PopupState::Checklist {
                             items,
                             selected,
-                            search,
+                            search_textarea,
                             ..
                         } = &mut self.popup
                         {
+                            let search = search_textarea.lines().join("");
                             let visible_indices: Vec<usize> = items
                                 .iter()
                                 .enumerate()
                                 .filter(|(_, it)| {
-                                    search.is_empty()
+                                    it.is_free_entry
+                                        || search.is_empty()
                                         || it.label.to_lowercase().contains(&search.to_lowercase())
                                 })
                                 .map(|(i, _)| i)
@@ -3834,34 +4752,37 @@ impl Gui {
                     KeyCode::Esc => {
                         self.popup = PopupState::None;
                     }
-                    KeyCode::Backspace => {
+                    _ => {
+                        // Search input: chars, backspace, Option/Cmd word/line edits.
                         if let PopupState::Checklist {
-                            search, selected, ..
+                            items,
+                            selected,
+                            search_textarea,
+                            free_entry_category,
+                            ..
                         } = &mut self.popup
                         {
-                            search.pop();
-                            *selected = 0;
+                            let before = search_textarea.lines().join("");
+                            textarea_input(search_textarea, key);
+                            let after = search_textarea.lines().join("");
+                            if after != before {
+                                crate::gui::popup::sync_checklist_free_entry(
+                                    items,
+                                    free_entry_category.as_deref(),
+                                    &after,
+                                );
+                                *selected = 0;
+                            }
                         }
                     }
-                    KeyCode::Char(c) => {
-                        // Type into search filter (but not j/k which are nav)
-                        // j/k already handled above, this won't fire for them
-                        if let PopupState::Checklist {
-                            search, selected, ..
-                        } = &mut self.popup
-                        {
-                            search.push(c);
-                            *selected = 0;
-                        }
-                    }
-                    _ => {}
                 }
             }
             PopupState::Loading { .. } => {
                 // Block all input while loading — user must wait
             }
-            PopupState::Help { .. } => {}
+            PopupState::CommandPalette { .. } => {}
             PopupState::RefPicker { .. } => {}
+            PopupState::ListPicker { .. } => {}
             PopupState::ThemePicker { .. } => {}
             PopupState::None => {}
         }
@@ -3870,10 +4791,12 @@ impl Gui {
         // Use else-if so that a handler that transitions to another popup
         // (e.g. Help → ThemePicker on Enter) does not also fire the new
         // popup's handler with the same key event.
-        if was_help && matches!(self.popup, PopupState::Help { .. }) {
-            self.handle_help_popup_key(key);
+        if was_help && matches!(self.popup, PopupState::CommandPalette { .. }) {
+            self.handle_command_palette_key(key)?;
         } else if was_ref_picker && matches!(self.popup, PopupState::RefPicker { .. }) {
             self.handle_ref_picker_key(key)?;
+        } else if was_list_picker && matches!(self.popup, PopupState::ListPicker { .. }) {
+            self.handle_list_picker_key(key)?;
         } else if was_theme_picker && matches!(self.popup, PopupState::ThemePicker { .. }) {
             self.handle_theme_picker_key(key);
         }
@@ -3881,9 +4804,9 @@ impl Gui {
         Ok(())
     }
 
-    fn handle_help_popup_key(&mut self, key: KeyEvent) {
+    fn handle_command_palette_key(&mut self, key: KeyEvent) -> Result<()> {
         // Helper: compute display index for a given entry selection
-        fn find_display_idx(sections: &[HelpSection], sel: usize, search_lower: &str) -> usize {
+        fn find_display_idx(sections: &[CommandSection], sel: usize, search_lower: &str) -> usize {
             let has_search = !search_lower.is_empty();
             let mut ei = 0usize;
             let mut di = 0usize;
@@ -3909,7 +4832,7 @@ impl Gui {
             di
         }
 
-        fn count_visible(sections: &[HelpSection], search_lower: &str) -> usize {
+        fn count_visible(sections: &[CommandSection], search_lower: &str) -> usize {
             let has_search = !search_lower.is_empty();
             sections
                 .iter()
@@ -3929,9 +4852,9 @@ impl Gui {
                 .sum()
         }
 
-        let mut open_theme_picker = false;
+        let mut selected_action = None;
 
-        if let PopupState::Help {
+        if let PopupState::CommandPalette {
             sections,
             selected,
             search_textarea,
@@ -3951,13 +4874,11 @@ impl Gui {
                     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
                 {
                     self.popup = PopupState::None;
-                    return;
+                    return Ok(());
                 }
                 KeyCode::Enter => {
-                    // Check if the selected entry is "Color theme..."
                     let has_search = !search_lower.is_empty();
                     let mut ei = 0usize;
-                    let mut found_desc = String::new();
                     'outer: for section in sections.iter() {
                         for entry in &section.entries {
                             let vis = !has_search
@@ -3965,15 +4886,12 @@ impl Gui {
                                 || entry.description.to_lowercase().contains(&search_lower);
                             if vis {
                                 if ei == *selected {
-                                    found_desc = entry.description.clone();
+                                    selected_action = Some(entry.action.clone());
                                     break 'outer;
                                 }
                                 ei += 1;
                             }
                         }
-                    }
-                    if found_desc == "Color theme..." {
-                        open_theme_picker = true;
                     }
                 }
                 KeyCode::Down => {
@@ -4010,10 +4928,21 @@ impl Gui {
             }
         }
 
-        if open_theme_picker {
-            self.popup = PopupState::None;
-            self.show_theme_picker();
+        if let Some(action) = selected_action {
+            match action {
+                CommandAction::Dispatch(key) => {
+                    self.popup = PopupState::None;
+                    self.handle_key(key)?;
+                }
+                CommandAction::OpenThemePicker => {
+                    self.popup = PopupState::None;
+                    self.show_theme_picker();
+                }
+                CommandAction::Unavailable => {}
+            }
         }
+
+        Ok(())
     }
 
     fn handle_ref_picker_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -4081,6 +5010,108 @@ impl Gui {
             }
         }
         Ok(())
+    }
+
+    /// Handle keys for the generic free-entry [`PopupState::ListPicker`].
+    /// Same navigation/search semantics as RefPicker, with a configurable free-entry category.
+    fn handle_list_picker_key(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::gui::popup::{list_picker_confirm_value, sync_list_picker_prefer_free_entry};
+
+        if let PopupState::ListPicker {
+            core,
+            free_entry_category,
+            ..
+        } = &mut self.popup
+        {
+            let search = core.search_textarea.lines().join("");
+            let total = core.items.len();
+            let free_cat = free_entry_category.clone();
+
+            let h = self.layout.height as usize;
+            let list_height = list_picker_visible_height(h);
+
+            match key.code {
+                KeyCode::Esc => {
+                    self.popup = PopupState::None;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    let Some(value) = list_picker_confirm_value(core) else {
+                        return Ok(());
+                    };
+                    let popup = std::mem::replace(&mut self.popup, PopupState::None);
+                    if let PopupState::ListPicker { on_confirm, .. } = popup {
+                        if let Err(e) = on_confirm(self, &value) {
+                            self.popup = PopupState::Message {
+                                title: "Error".to_string(),
+                                message: format!("{}", e),
+                                kind: MessageKind::Error,
+                            };
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if total > 0 {
+                        core.selected = (core.selected + 1).min(total.saturating_sub(1));
+                    }
+                    let sdi = list_picker_display_idx(&core.items, core.selected);
+                    if sdi >= core.scroll_offset + list_height {
+                        core.scroll_offset = sdi.saturating_sub(list_height - 1);
+                    }
+                }
+                KeyCode::Up => {
+                    core.selected = core.selected.saturating_sub(1);
+                    if core.selected == 0 {
+                        core.scroll_offset = 0;
+                    } else {
+                        let sdi = list_picker_display_idx(&core.items, core.selected);
+                        if sdi <= core.scroll_offset {
+                            core.scroll_offset = sdi.saturating_sub(1);
+                        }
+                    }
+                }
+                _ => {
+                    textarea_input(&mut core.search_textarea, key);
+                    let new_search = core.search_textarea.lines().join("");
+                    if new_search != search {
+                        sync_list_picker_prefer_free_entry(core, &free_cat);
+                        if !new_search.is_empty() {
+                            let sdi = list_picker_display_idx(&core.items, core.selected);
+                            core.scroll_offset = sdi.saturating_sub(list_height / 2);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open a reusable free-entry list picker (path/author filters, etc.).
+    ///
+    /// Callers supply candidate items and a confirm callback. Typing always
+    /// inserts a synthetic free-entry row under `free_entry_category` so the
+    /// user can confirm arbitrary text even when it does not match a candidate.
+    pub fn show_list_picker(
+        &mut self,
+        title: impl Into<String>,
+        items: Vec<crate::gui::popup::ListPickerItem>,
+        free_entry_category: impl Into<String>,
+        on_confirm: crate::gui::popup::ListPickerAction,
+    ) {
+        use crate::gui::popup::{ListPickerCore, make_command_palette_search_textarea};
+
+        self.popup = PopupState::ListPicker {
+            title: title.into(),
+            core: ListPickerCore {
+                items,
+                selected: 0,
+                search_textarea: make_command_palette_search_textarea(),
+                scroll_offset: 0,
+            },
+            free_entry_category: free_entry_category.into(),
+            on_confirm,
+        };
     }
 
     fn handle_theme_picker_key(&mut self, key: KeyEvent) {
@@ -4170,7 +5201,9 @@ impl Gui {
     }
 
     fn show_theme_picker(&mut self) {
-        use crate::gui::popup::{ListPickerCore, ListPickerItem, make_help_search_textarea};
+        use crate::gui::popup::{
+            ListPickerCore, ListPickerItem, make_command_palette_search_textarea,
+        };
 
         let original = self.current_theme_index;
         let items: Vec<ListPickerItem> = crate::config::COLOR_THEMES
@@ -4186,7 +5219,7 @@ impl Gui {
             core: ListPickerCore {
                 items,
                 selected: original,
-                search_textarea: make_help_search_textarea(),
+                search_textarea: make_command_palette_search_textarea(),
                 scroll_offset: 0,
             },
             original_theme_index: original,
@@ -4194,13 +5227,68 @@ impl Gui {
     }
 
     pub fn show_interactive_rebase_picker(&mut self) {
-        use crate::gui::popup::{ListPickerCore, ListPickerItem, make_help_search_textarea};
+        use crate::gui::popup::{ListPickerCore, make_command_palette_search_textarea};
+
+        // Skip HEAD branch / HEAD commit — rebasing onto current tip is a no-op.
+        let items = self.collect_reset_rebase_picker_items(/*skip_head=*/ true);
+
+        self.popup = PopupState::RefPicker {
+            title: "Interactive rebase current branch onto".to_string(),
+            core: ListPickerCore {
+                items,
+                selected: 0,
+                search_textarea: make_command_palette_search_textarea(),
+                scroll_offset: 0,
+            },
+            allow_freeform: true,
+            on_confirm: Box::new(|gui, ref_name| {
+                controller::branches::enter_interactive_rebase_onto(gui, ref_name)
+            }),
+        };
+    }
+
+    /// Global reset picker (uppercase `G`): choose a branch/commit/tag, then
+    /// soft/mixed/hard reset options (lazygit `universal.viewResetOptions` /
+    /// `CreateGitResetMenu`). Reuses the same searchable ref list as the
+    /// interactive rebase picker, then the shared reset-options menu used by
+    /// contextual lowercase `g`.
+    pub fn show_reset_picker(&mut self) {
+        use crate::gui::popup::{ListPickerCore, make_command_palette_search_textarea};
+
+        // Include the current branch name so users can pick it by name; skip
+        // HEAD itself in the commit list (resetting to HEAD is a no-op).
+        let items = self.collect_reset_rebase_picker_items(/*skip_head=*/ false);
+
+        self.popup = PopupState::RefPicker {
+            title: "Reset to:".to_string(),
+            core: ListPickerCore {
+                items,
+                selected: 0,
+                search_textarea: make_command_palette_search_textarea(),
+                scroll_offset: 0,
+            },
+            allow_freeform: true,
+            on_confirm: Box::new(|gui, ref_name| {
+                controller::commits::show_reset_menu_for_ref(gui, ref_name)
+            }),
+        };
+    }
+
+    /// Shared branch/remote/tag/commit items for the global I and G pickers.
+    /// When `skip_head` is true, the current HEAD branch is omitted (rebase);
+    /// when false it is included (reset). HEAD itself is always omitted from
+    /// the commits section because operating on the tip is a no-op.
+    fn collect_reset_rebase_picker_items(
+        &self,
+        skip_head: bool,
+    ) -> Vec<crate::gui::popup::ListPickerItem> {
+        use crate::gui::popup::ListPickerItem;
 
         let model = self.model.lock().unwrap();
         let mut items = Vec::new();
 
         for branch in &model.branches {
-            if branch.head {
+            if skip_head && branch.head {
                 continue;
             }
             items.push(ListPickerItem {
@@ -4237,774 +5325,476 @@ impl Gui {
             });
         }
 
-        drop(model);
-
-        self.popup = PopupState::RefPicker {
-            title: "Interactive rebase current branch onto".to_string(),
-            core: ListPickerCore {
-                items,
-                selected: 0,
-                search_textarea: make_help_search_textarea(),
-                scroll_offset: 0,
-            },
-            allow_freeform: true,
-            on_confirm: Box::new(|gui, ref_name| {
-                controller::branches::enter_interactive_rebase_onto(gui, ref_name)
-            }),
-        };
+        items
     }
 
-    fn show_help(&mut self) {
+    fn show_command_palette(&mut self) {
         let kb = &self.config.user_config.keybinding;
         let active = self.context_mgr.active();
 
         // Universal keybindings
-        let universal = HelpSection {
+        let universal = CommandSection {
             title: "Universal".into(),
             entries: vec![
-                HelpEntry {
-                    key: kb.universal.quit.clone(),
-                    description: "Quit".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.quit_alt1.clone(),
-                    description: "Quit (alt)".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.return_key.clone(),
-                    description: "Return / Cancel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.toggle_panel.clone(),
-                    description: "Next panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.toggle_panel_reverse.clone(),
-                    description: "Previous panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.prev_item.clone(),
-                    description: "Previous item".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.next_item.clone(),
-                    description: "Next item".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.prev_page.clone(),
-                    description: "Page up".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.next_page.clone(),
-                    description: "Page down".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.goto_top.clone(),
-                    description: "Go to top".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.goto_bottom.clone(),
-                    description: "Go to bottom".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.prev_block.clone(),
-                    description: "Previous panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.next_block.clone(),
-                    description: "Next panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.start_search.clone(),
-                    description: "Search".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.next_match.clone(),
-                    description: "Next search match".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.prev_match.clone(),
-                    description: "Previous search match".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.scroll_up_main_alt1.clone(),
-                    description: "Scroll diff up".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.scroll_down_main_alt1.clone(),
-                    description: "Scroll diff down".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.scroll_left.clone(),
-                    description: "Scroll left".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.scroll_right.clone(),
-                    description: "Scroll right".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.undo.clone(),
-                    description: "Undo".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.redo.clone(),
-                    description: "Redo".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.refresh.clone(),
-                    description: "Refresh".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.push_files.clone(),
-                    description: "Push".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.pull_files.clone(),
-                    description: "Pull".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.next_screen_mode.clone(),
-                    description: "Enlarge panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.prev_screen_mode.clone(),
-                    description: "Shrink panel".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.create_rebase_options_menu.clone(),
-                    description: "Rebase/merge/conflict options".into(),
-                },
-                HelpEntry {
-                    key: kb.universal.create_patch_options_menu.clone(),
-                    description: "Patch options".into(),
-                },
-                HelpEntry {
-                    key: "{/}".into(),
-                    description: "Previous/next hunk".into(),
-                },
-                HelpEntry {
-                    key: ";".into(),
-                    description: "Toggle command log".into(),
-                },
-                HelpEntry {
-                    key: "W".into(),
-                    description: "Compare / Diff mode".into(),
-                },
-                HelpEntry {
-                    key: "I".into(),
-                    description: "Interactive rebase onto...".into(),
-                },
-                HelpEntry {
-                    key: "1-5".into(),
-                    description: "Jump to panel".into(),
-                },
-                HelpEntry {
-                    key: "?".into(),
-                    description: "Show this help".into(),
-                },
-                HelpEntry {
-                    key: "▸".into(),
-                    description: "Color theme...".into(),
-                },
+                CommandEntry::keybinding(kb.universal.quit.clone(), "Quit".into()),
+                CommandEntry::keybinding(kb.universal.quit_alt1.clone(), "Quit (alt)".into()),
+                CommandEntry::keybinding(kb.universal.return_key.clone(), "Return / Cancel".into()),
+                CommandEntry::keybinding(kb.universal.toggle_panel.clone(), "Next panel".into()),
+                CommandEntry::keybinding(
+                    kb.universal.toggle_panel_reverse.clone(),
+                    "Previous panel".into(),
+                ),
+                CommandEntry::keybinding(kb.universal.prev_item.clone(), "Previous item".into()),
+                CommandEntry::keybinding(kb.universal.next_item.clone(), "Next item".into()),
+                CommandEntry::keybinding(kb.universal.prev_page.clone(), "Page up".into()),
+                CommandEntry::keybinding(kb.universal.next_page.clone(), "Page down".into()),
+                CommandEntry::keybinding(kb.universal.goto_top.clone(), "Go to top".into()),
+                CommandEntry::keybinding(kb.universal.goto_bottom.clone(), "Go to bottom".into()),
+                CommandEntry::keybinding(kb.universal.prev_block.clone(), "Previous panel".into()),
+                CommandEntry::keybinding(kb.universal.next_block.clone(), "Next panel".into()),
+                CommandEntry::keybinding(kb.universal.start_search.clone(), "Search".into()),
+                CommandEntry::keybinding(
+                    kb.universal.next_match.clone(),
+                    "Next search match".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.prev_match.clone(),
+                    "Previous search match".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.scroll_up_main_alt1.clone(),
+                    "Scroll diff up".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.scroll_down_main_alt1.clone(),
+                    "Scroll diff down".into(),
+                ),
+                CommandEntry::keybinding(kb.universal.scroll_left.clone(), "Scroll left".into()),
+                CommandEntry::keybinding(kb.universal.scroll_right.clone(), "Scroll right".into()),
+                CommandEntry::keybinding(kb.universal.undo.clone(), "Undo".into()),
+                CommandEntry::keybinding(kb.universal.redo.clone(), "Redo".into()),
+                CommandEntry::keybinding(kb.universal.refresh.clone(), "Refresh".into()),
+                CommandEntry::keybinding(kb.universal.push_files.clone(), "Push".into()),
+                CommandEntry::keybinding(kb.universal.pull_files.clone(), "Pull".into()),
+                CommandEntry::keybinding(
+                    kb.universal.next_screen_mode.clone(),
+                    "Enlarge panel".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.prev_screen_mode.clone(),
+                    "Shrink panel".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.create_rebase_options_menu.clone(),
+                    "Rebase/merge/conflict options".into(),
+                ),
+                CommandEntry::keybinding(
+                    kb.universal.create_patch_options_menu.clone(),
+                    "Patch options".into(),
+                ),
+                CommandEntry::keybinding("{/}".into(), "Previous/next hunk".into()),
+                CommandEntry::keybinding(";".into(), "Toggle command log".into()),
+                CommandEntry::keybinding("W".into(), "Compare / Diff mode".into()),
+                CommandEntry::keybinding("I".into(), "Interactive rebase onto...".into()),
+                CommandEntry::keybinding("G".into(), "Reset to...".into()),
+                CommandEntry::keybinding("1-5".into(), "Jump to panel".into()),
+                CommandEntry::keybinding("?".into(), "Show command palette".into()),
+                CommandEntry::action(
+                    "".into(),
+                    "Color theme...".into(),
+                    CommandAction::OpenThemePicker,
+                ),
             ],
         };
 
         // Context-specific keybindings
         let context_section = match active {
-            ContextId::Files => HelpSection {
+            ContextId::Files => CommandSection {
                 title: "Files".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "Toggle dir / Focus diff".into(),
-                    },
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Stage / Unstage".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.commit_changes.clone(),
-                        description: "Commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.generate_ai_commit.clone(),
-                        description: "Generate AI commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.amend_last_commit.clone(),
-                        description: "Amend last commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.commit_changes_with_editor.clone(),
-                        description: "Commit with editor".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.toggle_staged_all.clone(),
-                        description: "Toggle stage all".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.stash_all_changes.clone(),
-                        description: "Stash changes".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.view_stash_options.clone(),
-                        description: "Stash options".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.toggle_tree_view.clone(),
-                        description: "Toggle tree view".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.fetch.clone(),
-                        description: "Fetch".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.ignore_file.clone(),
-                        description: "Ignore file".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Discard changes".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.edit.clone(),
-                        description: "Open in editor".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.open_file.clone(),
-                        description: "Open in default program".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: "{/}".into(),
-                        description: "Cycle prev/next revert block in diff".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.revert_block.clone(),
-                        description: "Open hunk menu (revert selected block)".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.undo_revert_block.clone(),
-                        description: "Undo last revert (session)".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "Toggle dir / Focus diff".into()),
+                    CommandEntry::keybinding("<space>".into(), "Stage / Unstage".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.files.commit_changes.clone(), "Commit".into()),
+                    CommandEntry::keybinding(
+                        kb.files.generate_ai_commit.clone(),
+                        "Generate AI commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.amend_last_commit.clone(),
+                        "Amend last commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.commit_changes_with_editor.clone(),
+                        "Commit with editor".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.toggle_staged_all.clone(),
+                        "Toggle stage all".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.stash_all_changes.clone(),
+                        "Stash changes".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.view_stash_options.clone(),
+                        "Stash options".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.toggle_tree_view.clone(),
+                        "Toggle tree view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.files.fetch.clone(), "Fetch".into()),
+                    CommandEntry::keybinding(kb.files.ignore_file.clone(), "Ignore file".into()),
+                    CommandEntry::keybinding("d".into(), "Discard changes".into()),
+                    CommandEntry::keybinding(kb.universal.edit.clone(), "Open in editor".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.open_file.clone(),
+                        "Open in default program".into(),
+                    ),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding(
+                        "{/}".into(),
+                        "Cycle prev/next revert block in diff".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.universal.revert_block.clone(),
+                        "Open hunk menu (revert selected block)".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.universal.undo_revert_block.clone(),
+                        "Undo last revert (session)".into(),
+                    ),
                 ],
             },
-            ContextId::Worktrees => HelpSection {
+            ContextId::Worktrees => CommandSection {
                 title: "Worktrees".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Switch to worktree".into(),
-                    },
-                    HelpEntry {
-                        key: "n".into(),
-                        description: "Create worktree".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Remove worktree".into(),
-                    },
+                    CommandEntry::keybinding("<space>".into(), "Switch to worktree".into()),
+                    CommandEntry::keybinding("n".into(), "Create worktree".into()),
+                    CommandEntry::keybinding("d".into(), "Remove worktree".into()),
                 ],
             },
-            ContextId::Submodules => HelpSection {
+            ContextId::Submodules => CommandSection {
                 title: "Submodules".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Update submodule".into(),
-                    },
-                    HelpEntry {
-                        key: "a".into(),
-                        description: "Add submodule".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Remove submodule".into(),
-                    },
-                    HelpEntry {
-                        key: "e".into(),
-                        description: "Enter submodule".into(),
-                    },
-                    HelpEntry {
-                        key: "u".into(),
-                        description: "Update all submodules".into(),
-                    },
-                    HelpEntry {
-                        key: "i".into(),
-                        description: "Init submodules".into(),
-                    },
+                    CommandEntry::keybinding("<space>".into(), "Update submodule".into()),
+                    CommandEntry::keybinding("a".into(), "Add submodule".into()),
+                    CommandEntry::keybinding("d".into(), "Remove submodule".into()),
+                    CommandEntry::keybinding("e".into(), "Enter submodule".into()),
+                    CommandEntry::keybinding("u".into(), "Update all submodules".into()),
+                    CommandEntry::keybinding("i".into(), "Init submodules".into()),
                 ],
             },
-            ContextId::Branches => HelpSection {
+            ContextId::Branches => CommandSection {
                 title: "Branches".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View branch commits".into(),
-                    },
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Checkout branch".into(),
-                    },
-                    HelpEntry {
-                        key: "c".into(),
-                        description: "Checkout ref".into(),
-                    },
-                    HelpEntry {
-                        key: "-".into(),
-                        description: "Checkout previous branch".into(),
-                    },
-                    HelpEntry {
-                        key: "n".into(),
-                        description: "New branch".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Delete branch".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.merge_into_current_branch.clone(),
-                        description: "Merge into current".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.rebase_branch.clone(),
-                        description: "Rebase".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.rename_branch.clone(),
-                        description: "Rename branch".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.fast_forward.clone(),
-                        description: "Fast-forward".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.set_upstream.clone(),
-                        description: "Set upstream".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.create_pull_request.clone(),
-                        description: "Open in browser menu".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View branch commits".into()),
+                    CommandEntry::keybinding("<space>".into(), "Checkout branch".into()),
+                    CommandEntry::keybinding("c".into(), "Checkout ref".into()),
+                    CommandEntry::keybinding("-".into(), "Checkout previous branch".into()),
+                    CommandEntry::keybinding("n".into(), "New branch".into()),
+                    CommandEntry::keybinding("d".into(), "Delete branch".into()),
+                    CommandEntry::keybinding(
+                        kb.branches.merge_into_current_branch.clone(),
+                        "Merge into current".into(),
+                    ),
+                    CommandEntry::keybinding(kb.branches.rebase_branch.clone(), "Rebase".into()),
+                    CommandEntry::keybinding(
+                        kb.branches.rename_branch.clone(),
+                        "Rename branch".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.branches.fast_forward.clone(),
+                        "Fast-forward".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.branches.set_upstream.clone(),
+                        "Set upstream".into(),
+                    ),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding(
+                        kb.branches.create_pull_request.clone(),
+                        "Open in browser menu".into(),
+                    ),
                 ],
             },
-            ContextId::BranchCommits | ContextId::BranchCommitFiles => HelpSection {
+            ContextId::BranchCommits | ContextId::BranchCommitFiles => CommandSection {
                 title: "Branch Commits".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View commit files".into(),
-                    },
-                    HelpEntry {
-                        key: "<esc>".into(),
-                        description: "Back to branches".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.edit.clone(),
-                        description: "Open in editor".into(),
-                    },
-                    HelpEntry {
-                        key: ".".into(),
-                        description: "Toggle commit details panel".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View commit files".into()),
+                    CommandEntry::keybinding("<esc>".into(), "Back to branches".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.universal.edit.clone(), "Open in editor".into()),
+                    CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
                 ],
             },
-            ContextId::Commits => HelpSection {
-                title: "Commits".into(),
-                entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View commit files".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.squash_down.clone(),
-                        description: "Squash down".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.rename_commit.clone(),
-                        description: "Reword commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.view_reset_options.clone(),
-                        description: "Reset options".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.mark_commit_as_fixup.clone(),
-                        description: "Fixup commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.create_fixup_commit.clone(),
-                        description: "Create fixup commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.squash_above_commits.clone(),
-                        description: "Apply fixup commits".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.move_up_commit.clone(),
-                        description: "Move commit up".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.move_down_commit.clone(),
-                        description: "Move commit down".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.amend_to_commit.clone(),
-                        description: "Amend to commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.pick_commit.clone(),
-                        description: "Pick / Drop commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.revert_commit.clone(),
-                        description: "Revert commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.cherry_pick_copy.clone(),
-                        description: "Cherry-pick copy".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.paste_commits.clone(),
-                        description: "Paste commits".into(),
-                    },
-                    HelpEntry {
-                        key: "v".into(),
-                        description: "Toggle range select".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.tag_commit.clone(),
-                        description: "Tag commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.checkout_commit.clone(),
-                        description: "Checkout commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.view_bisect_options.clone(),
-                        description: "Bisect options".into(),
-                    },
-                    HelpEntry {
-                        key: "o".into(),
-                        description: "Open in browser".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.interactive_rebase.clone(),
-                        description: "Interactive rebase".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.open_log_menu.clone(),
-                        description: "Filter by branch".into(),
-                    },
-                    HelpEntry {
-                        key: ".".into(),
-                        description: "Toggle commit details panel".into(),
-                    },
-                ],
-            },
-            ContextId::CommitFiles => HelpSection {
+            ContextId::Commits => {
+                let mut entries = vec![
+                    CommandEntry::keybinding(
+                        kb.commits.cherry_pick_copy.clone(),
+                        "Copy (cherry-pick)".into(),
+                    ),
+                    CommandEntry::keybinding("<enter>".into(), "View commit files".into()),
+                    CommandEntry::keybinding(kb.commits.squash_down.clone(), "Squash down".into()),
+                    CommandEntry::keybinding(
+                        kb.commits.rename_commit.clone(),
+                        "Reword commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.view_reset_options.clone(),
+                        "Reset options".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.mark_commit_as_fixup.clone(),
+                        "Fixup commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.create_fixup_commit.clone(),
+                        "Create fixup commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.squash_above_commits.clone(),
+                        "Apply fixup commits".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.move_up_commit.clone(),
+                        "Move commit up".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.move_down_commit.clone(),
+                        "Move commit down".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.amend_to_commit.clone(),
+                        "Amend to commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.pick_commit.clone(),
+                        "Pick / Drop commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.revert_commit.clone(),
+                        "Revert commit".into(),
+                    ),
+                    CommandEntry::keybinding("v".into(), "Toggle range select".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.commits.tag_commit.clone(), "Tag commit".into()),
+                    CommandEntry::keybinding(
+                        kb.commits.checkout_commit.clone(),
+                        "Checkout commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.view_bisect_options.clone(),
+                        "Bisect options".into(),
+                    ),
+                    CommandEntry::keybinding("o".into(), "Open in browser".into()),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding(
+                        kb.commits.interactive_rebase.clone(),
+                        "Interactive rebase".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.open_log_menu.clone(),
+                        "Filter commits".into(),
+                    ),
+                    CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
+                ];
+                if !self.cherry_pick_clipboard.is_empty() {
+                    entries.insert(
+                        0,
+                        CommandEntry::keybinding(
+                            kb.commits.paste_commits.clone(),
+                            "Paste (cherry-pick)".into(),
+                        ),
+                    );
+                }
+                CommandSection {
+                    title: "Commits".into(),
+                    entries,
+                }
+            }
+            ContextId::CommitFiles => CommandSection {
                 title: "Commit Files".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "Toggle dir / Focus diff".into(),
-                    },
-                    HelpEntry {
-                        key: "<esc>".into(),
-                        description: "Back to commits".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.toggle_tree_view.clone(),
-                        description: "Toggle tree view".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.edit.clone(),
-                        description: "Open in editor".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: ".".into(),
-                        description: "Toggle commit details panel".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "Toggle dir / Focus diff".into()),
+                    CommandEntry::keybinding("<esc>".into(), "Back to commits".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.toggle_tree_view.clone(),
+                        "Toggle tree view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.universal.edit.clone(), "Open in editor".into()),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
                 ],
             },
-            ContextId::Reflog => HelpSection {
+            ContextId::Reflog => CommandSection {
                 title: "Reflog".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View commit files".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.checkout_commit.clone(),
-                        description: "Checkout commit".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.view_reset_options.clone(),
-                        description: "Reset options".into(),
-                    },
-                    HelpEntry {
-                        key: kb.commits.cherry_pick_copy.clone(),
-                        description: "Cherry-pick".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: ".".into(),
-                        description: "Toggle commit details panel".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View commit files".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.checkout_commit.clone(),
+                        "Checkout commit".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.view_reset_options.clone(),
+                        "Reset options".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.commits.cherry_pick_copy.clone(),
+                        "Copy (cherry-pick)".into(),
+                    ),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
                 ],
             },
-            ContextId::Stash => HelpSection {
+            ContextId::Stash => CommandSection {
                 title: "Stash".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View stash files".into(),
-                    },
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Apply stash".into(),
-                    },
-                    HelpEntry {
-                        key: kb.stash.pop_stash.clone(),
-                        description: "Pop stash".into(),
-                    },
-                    HelpEntry {
-                        key: kb.stash.rename_stash.clone(),
-                        description: "Rename stash".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Drop stash".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View stash files".into()),
+                    CommandEntry::keybinding("<space>".into(), "Apply stash".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.stash.pop_stash.clone(), "Pop stash".into()),
+                    CommandEntry::keybinding(kb.stash.rename_stash.clone(), "Rename stash".into()),
+                    CommandEntry::keybinding("d".into(), "Drop stash".into()),
                 ],
             },
-            ContextId::StashFiles => HelpSection {
+            ContextId::StashFiles => CommandSection {
                 title: "Stash Files".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "Toggle dir / Focus diff".into(),
-                    },
-                    HelpEntry {
-                        key: "<esc>".into(),
-                        description: "Back to stash".into(),
-                    },
-                    HelpEntry {
-                        key: kb.files.toggle_tree_view.clone(),
-                        description: "Toggle tree view".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.edit.clone(),
-                        description: "Open in editor".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "Toggle dir / Focus diff".into()),
+                    CommandEntry::keybinding("<esc>".into(), "Back to stash".into()),
+                    CommandEntry::keybinding(
+                        kb.universal.toggle_diff_view_layout.clone(),
+                        "Toggle unified / side-by-side view".into(),
+                    ),
+                    CommandEntry::keybinding(
+                        kb.files.toggle_tree_view.clone(),
+                        "Toggle tree view".into(),
+                    ),
+                    CommandEntry::keybinding(kb.universal.edit.clone(), "Open in editor".into()),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
                 ],
             },
-            ContextId::Remotes => HelpSection {
+            ContextId::Remotes => CommandSection {
                 title: "Remotes".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View remote branches".into(),
-                    },
-                    HelpEntry {
-                        key: "f".into(),
-                        description: "Fetch from remote".into(),
-                    },
-                    HelpEntry {
-                        key: "n".into(),
-                        description: "Add new remote".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Delete remote".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.push_files.clone(),
-                        description: "Push".into(),
-                    },
-                    HelpEntry {
-                        key: kb.universal.pull_files.clone(),
-                        description: "Pull".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View remote branches".into()),
+                    CommandEntry::keybinding("f".into(), "Fetch from remote".into()),
+                    CommandEntry::keybinding("n".into(), "Add new remote".into()),
+                    CommandEntry::keybinding("d".into(), "Delete remote".into()),
+                    CommandEntry::keybinding(kb.universal.push_files.clone(), "Push".into()),
+                    CommandEntry::keybinding(kb.universal.pull_files.clone(), "Pull".into()),
                 ],
             },
-            ContextId::RemoteBranches => HelpSection {
+            ContextId::RemoteBranches => CommandSection {
                 title: "Remote Branches".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View branch commits".into(),
-                    },
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Checkout as local branch".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.merge_into_current_branch.clone(),
-                        description: "Merge into current".into(),
-                    },
-                    HelpEntry {
-                        key: kb.branches.rebase_branch.clone(),
-                        description: "Rebase".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Delete remote branch".into(),
-                    },
-                    HelpEntry {
-                        key: "<esc>".into(),
-                        description: "Back to remotes".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View branch commits".into()),
+                    CommandEntry::keybinding("<space>".into(), "Checkout as local branch".into()),
+                    CommandEntry::keybinding(
+                        kb.branches.merge_into_current_branch.clone(),
+                        "Merge into current".into(),
+                    ),
+                    CommandEntry::keybinding(kb.branches.rebase_branch.clone(), "Rebase".into()),
+                    CommandEntry::keybinding("d".into(), "Delete remote branch".into()),
+                    CommandEntry::keybinding("<esc>".into(), "Back to remotes".into()),
                 ],
             },
-            ContextId::Tags => HelpSection {
+            ContextId::Tags => CommandSection {
                 title: "Tags".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "View tag commits".into(),
-                    },
-                    HelpEntry {
-                        key: "n".into(),
-                        description: "Create tag".into(),
-                    },
-                    HelpEntry {
-                        key: "d".into(),
-                        description: "Delete tag".into(),
-                    },
-                    HelpEntry {
-                        key: "P".into(),
-                        description: "Push tag".into(),
-                    },
-                    HelpEntry {
-                        key: "g".into(),
-                        description: "Reset options".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "View tag commits".into()),
+                    CommandEntry::keybinding("n".into(), "Create tag".into()),
+                    CommandEntry::keybinding("d".into(), "Delete tag".into()),
+                    CommandEntry::keybinding("P".into(), "Push tag".into()),
+                    CommandEntry::keybinding("g".into(), "Reset options".into()),
                 ],
             },
-            ContextId::Status => HelpSection {
+            ContextId::Status => CommandSection {
                 title: "Status".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "Recent repos".into(),
-                    },
-                    HelpEntry {
-                        key: "y".into(),
-                        description: "Copy to clipboard menu".into(),
-                    },
-                    HelpEntry {
-                        key: "o".into(),
-                        description: "Open in browser menu".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "Recent repos".into()),
+                    CommandEntry::keybinding("y".into(), "Copy to clipboard menu".into()),
+                    CommandEntry::keybinding("o".into(), "Open in browser menu".into()),
                 ],
             },
-            _ => HelpSection {
+            _ => CommandSection {
                 title: "Navigation".into(),
                 entries: vec![
-                    HelpEntry {
-                        key: "<enter>".into(),
-                        description: "Select / Open".into(),
-                    },
-                    HelpEntry {
-                        key: "<space>".into(),
-                        description: "Toggle / Confirm".into(),
-                    },
+                    CommandEntry::keybinding("<enter>".into(), "Select / Open".into()),
+                    CommandEntry::keybinding("<space>".into(), "Toggle / Confirm".into()),
                 ],
             },
         };
 
         let sections = vec![context_section, universal];
 
-        self.popup = PopupState::Help {
+        self.popup = PopupState::CommandPalette {
             sections,
             selected: 0,
-            search_textarea: popup::make_help_search_textarea(),
+            search_textarea: popup::make_command_palette_search_textarea(),
             scroll_offset: 0,
         };
     }
 
-    fn show_diff_help(&mut self) {
-        let diff_section = HelpSection {
+    fn show_diff_command_palette(&mut self) {
+        let diff_section = CommandSection {
             title: "Diff Viewer".into(),
             entries: vec![
-                HelpEntry {
-                    key: "j/k".into(),
-                    description: "Scroll down / up".into(),
-                },
-                HelpEntry {
-                    key: "h/l".into(),
-                    description: "Scroll left / right".into(),
-                },
-                HelpEntry {
-                    key: "{/}".into(),
-                    description: "Cycle prev / next hunk (selects revert block in Files)".into(),
-                },
-                HelpEntry {
-                    key: "[".into(),
-                    description: "Toggle old-only view".into(),
-                },
-                HelpEntry {
-                    key: "]".into(),
-                    description: "Toggle new-only view".into(),
-                },
-                HelpEntry {
-                    key: "v".into(),
-                    description: "Toggle unified / side-by-side view".into(),
-                },
-                HelpEntry {
-                    key: "z".into(),
-                    description: "Toggle line wrap".into(),
-                },
-                HelpEntry {
-                    key: "g/G".into(),
-                    description: "Go to top / bottom".into(),
-                },
-                HelpEntry {
-                    key: "PgUp/PgDn".into(),
-                    description: "Page up / down".into(),
-                },
-                HelpEntry {
-                    key: "/".into(),
-                    description: "Search in diff".into(),
-                },
-                HelpEntry {
-                    key: "n/N".into(),
-                    description: "Next / previous search match".into(),
-                },
-                HelpEntry {
-                    key: "<enter>".into(),
-                    description: "Open hunk menu on selected block (Files)".into(),
-                },
-                HelpEntry {
-                    key: "click 󰧛".into(),
-                    description: "Click revert icon to revert that block".into(),
-                },
-                HelpEntry {
-                    key: "u".into(),
-                    description: if self.diff_view.revert_undo_stack.is_empty() {
+                CommandEntry::keybinding("j/k".into(), "Scroll down / up".into()),
+                CommandEntry::keybinding("h/l".into(), "Scroll left / right".into()),
+                CommandEntry::keybinding(
+                    "{/}".into(),
+                    "Cycle prev / next hunk (selects revert block in Files)".into(),
+                ),
+                CommandEntry::keybinding("[".into(), "Toggle old-only view".into()),
+                CommandEntry::keybinding("]".into(), "Toggle new-only view".into()),
+                CommandEntry::keybinding(
+                    self.config
+                        .user_config
+                        .keybinding
+                        .universal
+                        .toggle_diff_view_layout
+                        .clone(),
+                    "Toggle unified / side-by-side view".into(),
+                ),
+                CommandEntry::keybinding("z".into(), "Toggle line wrap".into()),
+                CommandEntry::keybinding("g/G".into(), "Go to top / bottom".into()),
+                CommandEntry::keybinding("PgUp/PgDn".into(), "Page up / down".into()),
+                CommandEntry::keybinding("/".into(), "Search in diff".into()),
+                CommandEntry::keybinding("n/N".into(), "Next / previous search match".into()),
+                CommandEntry::keybinding(
+                    "<enter>".into(),
+                    "Open hunk menu on selected block (Files)".into(),
+                ),
+                CommandEntry::keybinding(
+                    "click 󰧛".into(),
+                    "Click revert icon to revert that block".into(),
+                ),
+                CommandEntry::keybinding(
+                    "u".into(),
+                    if self.diff_view.revert_undo_stack.is_empty() {
                         "Undo last revert (nothing to undo)".into()
                     } else {
                         format!(
@@ -5013,54 +5803,28 @@ impl Gui {
                             self.diff_view.revert_undo_high_water,
                         )
                     },
-                },
-                HelpEntry {
-                    key: "e".into(),
-                    description: "Edit file at line".into(),
-                },
-                HelpEntry {
-                    key: "o".into(),
-                    description: "Open file in default program".into(),
-                },
-                HelpEntry {
-                    key: "y".into(),
-                    description: "Copy selected text".into(),
-                },
-                HelpEntry {
-                    key: "q".into(),
-                    description: "Quit".into(),
-                },
-                HelpEntry {
-                    key: "+/_".into(),
-                    description: "Enlarge / shrink panel".into(),
-                },
-                HelpEntry {
-                    key: ";".into(),
-                    description: "Toggle command log".into(),
-                },
-                HelpEntry {
-                    key: "1-5".into(),
-                    description: "Jump to sidebar panel".into(),
-                },
-                HelpEntry {
-                    key: "esc".into(),
-                    description: "Return to sidebar".into(),
-                },
-                HelpEntry {
-                    key: "?".into(),
-                    description: "Show this help".into(),
-                },
-                HelpEntry {
-                    key: "▸".into(),
-                    description: "Color theme...".into(),
-                },
+                ),
+                CommandEntry::keybinding("e".into(), "Edit file at line".into()),
+                CommandEntry::keybinding("o".into(), "Open file in default program".into()),
+                CommandEntry::keybinding("y".into(), "Copy selected text".into()),
+                CommandEntry::keybinding("q".into(), "Quit".into()),
+                CommandEntry::keybinding("+/_".into(), "Enlarge / shrink panel".into()),
+                CommandEntry::keybinding(";".into(), "Toggle command log".into()),
+                CommandEntry::keybinding("1-5".into(), "Jump to sidebar panel".into()),
+                CommandEntry::keybinding("esc".into(), "Return to sidebar".into()),
+                CommandEntry::keybinding("?".into(), "Show command palette".into()),
+                CommandEntry::action(
+                    "".into(),
+                    "Color theme...".into(),
+                    CommandAction::OpenThemePicker,
+                ),
             ],
         };
 
-        self.popup = PopupState::Help {
+        self.popup = PopupState::CommandPalette {
             sections: vec![diff_section],
             selected: 0,
-            search_textarea: popup::make_help_search_textarea(),
+            search_textarea: popup::make_command_palette_search_textarea(),
             scroll_offset: 0,
         };
     }
@@ -5485,6 +6249,17 @@ impl Gui {
                         let new_model = new_git.load_model()?;
                         gui.git = std::sync::Arc::new(new_git);
                         *gui.model.lock().unwrap() = new_model;
+                        gui.commit_list_cache = presentation::commits::CommitListCache::default();
+                        gui.commit_stats_cache.lock().unwrap().clear();
+                        gui.commit_messages_cache.lock().unwrap().clear();
+                        gui.clear_diff_preview_cache();
+                        gui.last_commit_details_key.clear();
+                        gui.commit_details_generation
+                            .fetch_add(1, Ordering::Relaxed);
+                        gui.last_diff_key.clear();
+                        gui.diff_generation.fetch_add(1, Ordering::Relaxed);
+                        gui.diff_loading = false;
+                        gui.diff_loading_since = None;
                         gui.needs_refresh = false;
                         gui.needs_diff_refresh = true;
                         gui.context_mgr = context::ContextManager::new();
@@ -5821,19 +6596,47 @@ impl Gui {
             return;
         }
 
-        // ✦ AI-generate button on commit-message popups: track hover, handle clicks.
+        // Sidebar divider drag (Normal mode only). Must run before text-select /
+        // focus paths so the hit strip wins the gesture.
+        if self.sidebar_resizing {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.apply_sidebar_ratio_from_mouse(mouse.column, mouse.row);
+                    return;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sidebar_resizing = false;
+                    self.sidebar_resize_row_offset = 0;
+                    return;
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.apply_sidebar_ratio_from_mouse(mouse.column, mouse.row);
+                    return;
+                }
+                _ => {
+                    self.sidebar_resizing = false;
+                    self.sidebar_resize_row_offset = 0;
+                }
+            }
+        } else if self.popup == PopupState::None
+            && self.screen_mode == ScreenMode::Normal
+            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && self.sidebar_divider_hit(mouse.column, mouse.row)
+        {
+            self.sidebar_resizing = true;
+            self.sidebar_resize_row_offset = self.portrait_sidebar_resize_offset(mouse.row);
+            self.diff_view.selection = None;
+            self.apply_sidebar_ratio_from_mouse(mouse.column, mouse.row);
+            return;
+        }
+
+        // ✦ AI-generate button on commit-message popups: handle clicks.
         if matches!(self.popup, PopupState::CommitInput { .. }) {
             let area = ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
             if let Some(btn_rect) = views::commit_ai_button_geometry(&self.popup, area) {
                 let over = rect_contains(btn_rect, mouse.column, mouse.row);
                 match mouse.kind {
-                    MouseEventKind::Moved | MouseEventKind::Drag(_) => {
-                        if self.commit_ai_button_hovered != over {
-                            self.commit_ai_button_hovered = over;
-                        }
-                    }
                     MouseEventKind::Down(MouseButton::Left) if over => {
-                        self.commit_ai_button_hovered = false;
                         let configured = !self
                             .config
                             .user_config
@@ -5858,11 +6661,7 @@ impl Gui {
                     }
                     _ => {}
                 }
-            } else if self.commit_ai_button_hovered {
-                self.commit_ai_button_hovered = false;
             }
-        } else if self.commit_ai_button_hovered {
-            self.commit_ai_button_hovered = false;
         }
 
         if matches!(self.popup, PopupState::CommitInput { .. }) {
@@ -5951,7 +6750,7 @@ impl Gui {
         }
 
         // Help popup intercepts mouse scroll and click
-        if let PopupState::Help {
+        if let PopupState::CommandPalette {
             sections,
             selected,
             scroll_offset,
@@ -6050,87 +6849,18 @@ impl Gui {
             return;
         }
 
-        // RefPicker popup intercepts mouse scroll and click
-        if let PopupState::RefPicker { core, .. } = &mut self.popup {
-            let total = core.items.len();
-            let h = self.layout.height as usize;
-            let lh = list_picker_visible_height(h);
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    core.selected = core.selected.saturating_sub(1);
-                    if core.selected < core.scroll_offset {
-                        core.scroll_offset = core.selected;
-                    }
+        // Free-entry list pickers (RefPicker / ListPicker) intercept mouse scroll and click
+        if matches!(
+            self.popup,
+            PopupState::RefPicker { .. } | PopupState::ListPicker { .. }
+        ) {
+            let (core, w, h) = match &mut self.popup {
+                PopupState::RefPicker { core, .. } | PopupState::ListPicker { core, .. } => {
+                    (core, self.layout.width, self.layout.height)
                 }
-                MouseEventKind::ScrollDown => {
-                    core.selected = (core.selected + 1).min(total.saturating_sub(1));
-                    let di = list_picker_display_idx(&core.items, core.selected);
-                    if di >= core.scroll_offset + lh {
-                        core.scroll_offset = di.saturating_sub(lh - 1);
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // Click to select an item in the list picker
-                    let area =
-                        ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
-                    let popup_width = (area.width * 60 / 100).min(60).max(30);
-                    let max_popup = (area.height * 60 / 100).max(10);
-                    let popup_height = max_popup.min(area.height.saturating_sub(4));
-                    let x = (area.width.saturating_sub(popup_width)) / 2;
-                    let y = (area.height.saturating_sub(popup_height)) / 2;
-                    let inner_y = y + 1;
-                    let list_start = inner_y + 2;
-                    let inner_height = popup_height.saturating_sub(2);
-                    let list_height = inner_height.saturating_sub(3) as usize;
-
-                    if mouse.row >= list_start
-                        && mouse.row < list_start + list_height as u16
-                        && mouse.column >= x
-                        && mouse.column < x + popup_width
-                    {
-                        let row_in_list = (mouse.row - list_start) as usize;
-                        // Map display row to entry index, accounting for category headers
-                        let has_categories = core.items.iter().any(|i| !i.category.is_empty());
-                        let effective_scroll = core.scroll_offset.min(if has_categories {
-                            // display length includes headers
-                            let display_len =
-                                list_picker_display_idx(&core.items, total.saturating_sub(1)) + 1;
-                            display_len.saturating_sub(list_height)
-                        } else {
-                            total.saturating_sub(list_height)
-                        });
-                        let display_idx = effective_scroll + row_in_list;
-
-                        if has_categories {
-                            // Walk through display rows to find which entry was clicked
-                            let mut di = 0usize;
-                            let mut ei = 0usize;
-                            let mut last_cat = String::new();
-                            for item in core.items.iter() {
-                                if !item.category.is_empty() && item.category != last_cat {
-                                    if di == display_idx {
-                                        break; // clicked on header
-                                    }
-                                    di += 1;
-                                    last_cat = item.category.clone();
-                                }
-                                if di == display_idx {
-                                    core.selected = ei;
-                                    break;
-                                }
-                                di += 1;
-                                ei += 1;
-                            }
-                        } else {
-                            let clicked_idx = effective_scroll + row_in_list;
-                            if clicked_idx < total {
-                                core.selected = clicked_idx;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+                _ => unreachable!(),
+            };
+            handle_list_picker_mouse(core, mouse, w, h);
             return;
         }
 
@@ -6184,6 +6914,65 @@ impl Gui {
                     }
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        // Action menus: first click selects, second click on same item confirms.
+        if matches!(self.popup, PopupState::Menu { .. }) {
+            let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+                return;
+            };
+            let area = ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
+            if let Some(idx) = views::menu_item_at(&self.popup, area, mouse.column, mouse.row) {
+                let already_selected = matches!(
+                    &self.popup,
+                    PopupState::Menu { selected, .. } if *selected == idx
+                );
+                if already_selected {
+                    self.execute_menu_action(Some(idx));
+                } else if let PopupState::Menu { selected, .. } = &mut self.popup {
+                    *selected = idx;
+                }
+            }
+            return;
+        }
+
+        // Checklists: first click selects, second click on same item toggles.
+        if matches!(self.popup, PopupState::Checklist { .. }) {
+            let MouseEventKind::Down(MouseButton::Left) = mouse.kind else {
+                return;
+            };
+            let area = ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
+            if let Some(visible_idx) =
+                views::checklist_item_at(&self.popup, area, mouse.column, mouse.row)
+            {
+                if let PopupState::Checklist {
+                    items,
+                    selected,
+                    search_textarea,
+                    ..
+                } = &mut self.popup
+                {
+                    if *selected == visible_idx {
+                        let search = search_textarea.lines().join("");
+                        let visible_indices: Vec<usize> = items
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, it)| {
+                                it.is_free_entry
+                                    || search.is_empty()
+                                    || it.label.to_lowercase().contains(&search.to_lowercase())
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        if let Some(&real_idx) = visible_indices.get(visible_idx) {
+                            items[real_idx].checked = !items[real_idx].checked;
+                        }
+                    } else {
+                        *selected = visible_idx;
+                    }
+                }
             }
             return;
         }
@@ -6352,7 +7141,7 @@ impl Gui {
         use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
         // Help popup intercepts mouse scroll
-        if let PopupState::Help {
+        if let PopupState::CommandPalette {
             sections,
             scroll_offset,
             search_textarea,
@@ -6391,83 +7180,18 @@ impl Gui {
             return;
         }
 
-        // RefPicker popup intercepts mouse scroll and click
-        if let PopupState::RefPicker { core, .. } = &mut self.popup {
-            let total = core.items.len();
-            let h = self.layout.height as usize;
-            let lh = list_picker_visible_height(h);
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    core.selected = core.selected.saturating_sub(1);
-                    if core.selected < core.scroll_offset {
-                        core.scroll_offset = core.selected;
-                    }
+        // Free-entry list pickers (RefPicker / ListPicker) intercept mouse scroll and click
+        if matches!(
+            self.popup,
+            PopupState::RefPicker { .. } | PopupState::ListPicker { .. }
+        ) {
+            let (core, w, h) = match &mut self.popup {
+                PopupState::RefPicker { core, .. } | PopupState::ListPicker { core, .. } => {
+                    (core, self.layout.width, self.layout.height)
                 }
-                MouseEventKind::ScrollDown => {
-                    core.selected = (core.selected + 1).min(total.saturating_sub(1));
-                    let di = list_picker_display_idx(&core.items, core.selected);
-                    if di >= core.scroll_offset + lh {
-                        core.scroll_offset = di.saturating_sub(lh - 1);
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let area =
-                        ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
-                    let popup_width = (area.width * 60 / 100).min(60).max(30);
-                    let max_popup = (area.height * 60 / 100).max(10);
-                    let popup_height = max_popup.min(area.height.saturating_sub(4));
-                    let x = (area.width.saturating_sub(popup_width)) / 2;
-                    let y = (area.height.saturating_sub(popup_height)) / 2;
-                    let inner_y = y + 1;
-                    let list_start = inner_y + 2;
-                    let inner_height = popup_height.saturating_sub(2);
-                    let list_height = inner_height.saturating_sub(3) as usize;
-
-                    if mouse.row >= list_start
-                        && mouse.row < list_start + list_height as u16
-                        && mouse.column >= x
-                        && mouse.column < x + popup_width
-                    {
-                        let row_in_list = (mouse.row - list_start) as usize;
-                        let has_categories = core.items.iter().any(|i| !i.category.is_empty());
-                        let effective_scroll = core.scroll_offset.min(if has_categories {
-                            let display_len =
-                                list_picker_display_idx(&core.items, total.saturating_sub(1)) + 1;
-                            display_len.saturating_sub(list_height)
-                        } else {
-                            total.saturating_sub(list_height)
-                        });
-                        let display_idx = effective_scroll + row_in_list;
-
-                        if has_categories {
-                            let mut di = 0usize;
-                            let mut ei = 0usize;
-                            let mut last_cat = String::new();
-                            for item in core.items.iter() {
-                                if !item.category.is_empty() && item.category != last_cat {
-                                    if di == display_idx {
-                                        break;
-                                    }
-                                    di += 1;
-                                    last_cat = item.category.clone();
-                                }
-                                if di == display_idx {
-                                    core.selected = ei;
-                                    break;
-                                }
-                                di += 1;
-                                ei += 1;
-                            }
-                        } else {
-                            let clicked_idx = effective_scroll + row_in_list;
-                            if clicked_idx < total {
-                                core.selected = clicked_idx;
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
+                _ => unreachable!(),
+            };
+            handle_list_picker_mouse(core, mouse, w, h);
             return;
         }
 
@@ -6868,6 +7592,116 @@ impl Gui {
         )
     }
 
+    /// Content area above the status bar (side + main live here).
+    fn content_area_rect(&self) -> ratatui::layout::Rect {
+        ratatui::layout::Rect::new(
+            0,
+            0,
+            self.layout.width,
+            self.layout.height.saturating_sub(1),
+        )
+    }
+
+    /// Hit-test the side↔main split for drag-resize.
+    /// Portrait: expanded panel bottom border and/or main (diff) top border.
+    /// Landscape: ~3-col strip around the vertical split.
+    fn sidebar_divider_hit(&self, col: u16, row: u16) -> bool {
+        if self.screen_mode != ScreenMode::Normal {
+            return false;
+        }
+        let content = self.content_area_rect();
+        if content.width == 0 || content.height == 0 || !rect_contains(content, col, row) {
+            return false;
+        }
+
+        let fl = self.compute_current_frame_layout();
+
+        if fl.portrait {
+            // Either the expanded side panel's bottom border or the main/diff
+            // panel's top border (collapsed panels may sit between them).
+            if fl.side_panels.is_empty() {
+                return row == content.y;
+            }
+            if fl.main_panel.height == 0 {
+                let y = content.y + content.height.saturating_sub(1);
+                return row == y;
+            }
+            // Top border of the diff box — single row only (content is y+1).
+            if fl.main_panel.height > 0 && row == fl.main_panel.y {
+                return true;
+            }
+            let active_window = self.context_mgr.active_window();
+            let active_idx = SideWindow::ALL
+                .iter()
+                .position(|w| *w == active_window)
+                .unwrap_or(1);
+            // Match layout.rs: Status stays compact; Files expands instead.
+            let expand_idx = if active_idx == 0 { 1 } else { active_idx };
+            let Some(panel) = fl.side_panels.get(expand_idx) else {
+                return false;
+            };
+            if panel.height == 0 {
+                return false;
+            }
+            // Only the bottom border row — a taller strip steals clicks from the
+            // last list items (content sits on bottom-1 with Borders::ALL).
+            let bottom = panel.y + panel.height.saturating_sub(1);
+            row == bottom
+        } else if fl.side_panels.is_empty() {
+            col == content.x
+        } else if fl.main_panel.width == 0 {
+            col == content.x + content.width.saturating_sub(1)
+        } else {
+            let divider_x = fl.main_panel.x;
+            let lo = divider_x.saturating_sub(1);
+            let hi = divider_x.saturating_add(1);
+            col >= lo && col <= hi
+        }
+    }
+
+    /// Rows to add when mapping a portrait grab to the side/main split.
+    /// Main/diff top border: 0 (row is already the split). Expanded panel bottom:
+    /// 1 + trailing collapsed panels so both grabs drive the same ratio.
+    fn portrait_sidebar_resize_offset(&self, row: u16) -> u16 {
+        let fl = self.compute_current_frame_layout();
+        if !fl.portrait {
+            return 0;
+        }
+        if fl.main_panel.height > 0 && row == fl.main_panel.y {
+            return 0;
+        }
+        let panel_count = SideWindow::ALL.len();
+        let active_window = self.context_mgr.active_window();
+        let active_idx = SideWindow::ALL
+            .iter()
+            .position(|w| *w == active_window)
+            .unwrap_or(1);
+        let expand_idx = if active_idx == 0 { 1 } else { active_idx };
+        let collapsed: u16 = 1;
+        let trailing =
+            (panel_count.saturating_sub(expand_idx.saturating_add(1)) as u16) * collapsed;
+        1 + trailing
+    }
+
+    fn apply_sidebar_ratio_from_mouse(&mut self, col: u16, row: u16) {
+        let content = self.content_area_rect();
+        if content.width == 0 || content.height == 0 {
+            return;
+        }
+        let fl = self.compute_current_frame_layout();
+        let ratio = if fl.portrait {
+            let side_end = row
+                .saturating_sub(content.y)
+                .saturating_add(self.sidebar_resize_row_offset)
+                .min(content.height);
+            side_end as f64 / content.height as f64
+        } else {
+            let pos = col.saturating_sub(content.x).min(content.width);
+            pos as f64 / content.width as f64
+        };
+        self.layout.side_panel_ratio = ratio.clamp(0.0, 1.0);
+    }
+
     /// True when the active context is one where commit-details makes sense
     /// (drives both the `.` toggle and layout-time `show_details`).
     fn context_has_commit_details(&self) -> bool {
@@ -7250,19 +8084,56 @@ impl Gui {
         true
     }
 
+    /// Kick off a full model reload on a background thread (same streaming
+    /// path as initial load). UI stays responsive; panels fill as parts arrive.
+    fn start_background_refresh(&mut self) {
+        if self.refresh_in_progress || self.initial_load_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.initial_load_rx = Some(rx);
+        self.initial_load_received = 0;
+        self.refresh_in_progress = true;
+        self.needs_refresh = false;
+        self.reset_commit_pagination();
+        self.clear_diff_preview_cache();
+        let git = Arc::clone(&self.git);
+        std::thread::spawn(move || {
+            git.load_model_streaming(&tx);
+        });
+    }
+
     fn refresh(&mut self) -> Result<()> {
         self.reset_commit_pagination();
+        self.clear_diff_preview_cache();
         let new_model = self.git.load_model()?;
-        let mut model = self.model.lock().unwrap();
-        model.replace_keeping_file_order(new_model);
+        {
+            let mut model = self.model.lock().unwrap();
+            model.replace_keeping_file_order(new_model);
+        }
+        self.after_model_refresh()
+    }
 
-        // If branch filters are active, reload commits for those branches only.
-        if !self.commit_branch_filter.is_empty() {
-            if let Ok(filtered) = self
-                .git
-                .load_commits_for_branches(&self.commit_branch_filter, DEFAULT_COMMIT_LIMIT)
+    /// Re-apply selection-dependent views after the model was reloaded
+    /// (blocking `refresh` or background streaming refresh).
+    fn after_model_refresh(&mut self) -> Result<()> {
+        let mut model = self.model.lock().unwrap();
+
+        // Re-apply commit filters after refresh replaces the model.
+        if !self.commit_branch_filter.is_empty()
+            || self.commit_path_filter.is_some()
+            || !self.commit_author_filter.is_empty()
+        {
+            let filter = crate::git::commit::CommitFilter {
+                branches: self.commit_branch_filter.clone(),
+                path: self.commit_path_filter.clone(),
+                authors: self.commit_author_filter.clone(),
+            };
+            if let Ok(filtered) =
+                self.git
+                    .load_filtered_commits_page(&filter, DEFAULT_COMMIT_LIMIT, 0)
             {
-                model.commits = filtered;
+                model.set_commits(filtered);
             }
         }
         self.commit_history_complete = model.commits.len() < DEFAULT_COMMIT_LIMIT;
@@ -7285,7 +8156,7 @@ impl Gui {
                 .git
                 .load_commits_for_branch(&self.branch_commits_name, 300)
             {
-                model.sub_commits = commits;
+                model.set_sub_commits(commits);
             }
         }
 
@@ -7367,23 +8238,15 @@ impl Gui {
     }
 
     /// Lightweight refresh that only reloads files and diff stats.
-    /// Use this after staging/unstaging operations where branches, commits,
-    /// tags, etc. haven't changed.
+    /// Prefer the async status-only path after stage/unstage; this full
+    /// variant is kept for callers that need numstat immediately.
     fn refresh_files_only(&mut self) -> Result<()> {
-        let (files, shortstat) = std::thread::scope(|s| {
-            let h_files = s.spawn(|| self.git.load_files());
-            let h_stat = s.spawn(|| self.git.diff_shortstat());
-            (h_files.join().unwrap(), h_stat.join().unwrap())
-        });
-
+        self.clear_diff_preview_cache();
+        // Status-only is enough for staging correctness; skip expensive
+        // numstat/hunk subprocesses on this hot path.
+        let files = self.git.load_files_status_only()?;
         let mut model = self.model.lock().unwrap();
-        if let Ok(f) = files {
-            model.set_files(f);
-        }
-        if let Ok((added, deleted)) = shortstat {
-            model.total_additions = added;
-            model.total_deletions = deleted;
-        }
+        model.set_files(files);
 
         if self.show_file_tree {
             self.file_tree_nodes = build_file_tree(&model.files, &self.collapsed_dirs);
@@ -7394,6 +8257,18 @@ impl Gui {
         }
 
         Ok(())
+    }
+
+    /// Rebuild the file tree from the current in-memory model (no git).
+    pub(crate) fn rebuild_file_tree_from_model(&mut self) {
+        let model = self.model.lock().unwrap();
+        if self.show_file_tree {
+            self.file_tree_nodes = build_file_tree(&model.files, &self.collapsed_dirs);
+            self.context_mgr.files_list_len_override = Some(self.file_tree_nodes.len());
+        } else {
+            self.file_tree_nodes.clear();
+            self.context_mgr.files_list_len_override = None;
+        }
     }
 
     /// Resolve the currently selected file index in the files panel.
@@ -7747,6 +8622,223 @@ fn rect_contains(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
+fn keyboard_enhancement_flags() -> crossterm::event::KeyboardEnhancementFlags {
+    // Keep printable input on the terminal's normal text path. In particular,
+    // REPORT_ALL_KEYS_AS_ESCAPE_CODES replaces produced text with a logical key
+    // identity. Crossterm 0.28 does not expose the protocol's associated-text
+    // field, so keyboard layouts, IMEs, or remappers can otherwise turn a typed
+    // character into a different shortcut (for example, `q` into `u`).
+    //
+    // REPORT_EVENT_TYPES is also unnecessary: the UI handles press events only,
+    // and enabling it would turn key auto-repeat into ignored Repeat events.
+    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
+/// Enables button, drag, and scroll events without passive pointer-motion events.
+///
+/// Crossterm's `EnableMouseCapture` also enables DEC mode 1003 (all motion), which can
+/// cause terminals to repeatedly focus or redraw while merely moving the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableMouseCaptureWithoutHover;
+
+impl Command for EnableMouseCaptureWithoutHover {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Command::execute_winapi(&crossterm::event::EnableMouseCapture)
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        Command::is_ansi_code_supported(&crossterm::event::EnableMouseCapture)
+    }
+}
+
+#[cfg(test)]
+mod terminal_mouse_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn split_commit_message_keeps_summary_and_body_separate() {
+        assert_eq!(
+            split_commit_message("feat: add editor\n\nExplain the change.\nKeep this line."),
+            (
+                "feat: add editor".to_string(),
+                "Explain the change.\nKeep this line.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn split_commit_message_handles_subject_only() {
+        assert_eq!(
+            split_commit_message("fix: subject only"),
+            ("fix: subject only".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn keyboard_enhancement_preserves_terminal_text_input() {
+        let flags = keyboard_enhancement_flags();
+
+        assert_eq!(
+            flags,
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        );
+        assert!(
+            !flags.contains(
+                crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+        assert!(!flags.contains(crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+    }
+
+    #[test]
+    fn plain_character_shortcuts_reject_extra_modifiers() {
+        assert!(plain_char_key(
+            KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT),
+            'I'
+        ));
+        assert!(!plain_char_key(
+            KeyEvent::new(
+                KeyCode::Char('I'),
+                KeyModifiers::SHIFT | KeyModifiers::SUPER
+            ),
+            'I'
+        ));
+        // Global reset picker (G) uses the same plain-char matching as I.
+        assert!(plain_char_key(
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT),
+            'G'
+        ));
+        assert!(!plain_char_key(
+            KeyEvent::new(
+                KeyCode::Char('G'),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL
+            ),
+            'G'
+        ));
+        // Lowercase g must not match the global reset picker binding.
+        assert!(!plain_char_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+            'G'
+        ));
+    }
+
+    #[test]
+    fn mouse_capture_does_not_request_passive_motion_events() {
+        let mut ansi = String::new();
+        EnableMouseCaptureWithoutHover
+            .write_ansi(&mut ansi)
+            .unwrap();
+
+        assert!(ansi.contains("\x1b[?1000h"));
+        assert!(ansi.contains("\x1b[?1002h"));
+        assert!(ansi.contains("\x1b[?1006h"));
+        assert!(!ansi.contains("\x1b[?1003h"));
+    }
+
+    #[test]
+    fn latest_background_worker_coalesces_rapid_jobs() {
+        let (job_tx, job_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        spawn_latest_background_worker(job_rx);
+
+        for value in 1..=3 {
+            let done_tx = done_tx.clone();
+            job_tx
+                .send(Box::new(move || {
+                    done_tx.send(value).unwrap();
+                }))
+                .unwrap();
+        }
+
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 3);
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn diff_scheduler_starts_immediately_and_keeps_latest_overflow_job() {
+        let (scheduler_tx, scheduler_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let generation = Arc::new(AtomicU64::new(1));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        spawn_diff_scheduler(
+            scheduler_rx,
+            scheduler_tx.clone(),
+            result_tx,
+            Arc::clone(&generation),
+        );
+
+        for value in 1..=3 {
+            let executed = Arc::clone(&executed);
+            let release_rx = Arc::clone(&release_rx);
+            scheduler_tx
+                .send(DiffSchedulerEvent::Job(DiffJob {
+                    generation: 1,
+                    diff_key: format!("commit:{value}"),
+                    load: Box::new(move || {
+                        executed.fetch_or(1 << value, Ordering::Relaxed);
+                        release_rx.lock().unwrap().recv().unwrap();
+                        DiffPayload::Empty
+                    }),
+                }))
+                .unwrap();
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while executed.load(Ordering::Relaxed).count_ones() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(executed.load(Ordering::Relaxed).count_ones(), 2);
+
+        release_tx.send(()).unwrap();
+        let _ = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while executed.load(Ordering::Relaxed) & (1 << 3) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(executed.load(Ordering::Relaxed) & (1 << 3), 0);
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn diff_preview_cache_moves_recent_views_and_enforces_entry_limit() {
+        let mut cache = DiffPreviewCache::default();
+        for index in 0..=DIFF_PREVIEW_CACHE_ENTRIES {
+            let mut view = DiffViewState::new();
+            view.filename = format!("file-{index}");
+            view.lines.push(crate::pager::DiffLine {
+                old_line: Some((1, "old".to_string())),
+                new_line: Some((1, "new".to_string())),
+                change_type: crate::pager::ChangeType::Modified,
+                old_segments: None,
+                new_segments: None,
+                file_header: None,
+                section_index: 0,
+            });
+            cache.insert(format!("key-{index}"), view);
+        }
+
+        assert_eq!(cache.entries.len(), DIFF_PREVIEW_CACHE_ENTRIES);
+        assert!(cache.take("key-0").is_none());
+        let restored = cache.take(&format!("key-{DIFF_PREVIEW_CACHE_ENTRIES}"));
+        assert_eq!(
+            restored.map(|view| view.filename),
+            Some(format!("file-{DIFF_PREVIEW_CACHE_ENTRIES}"))
+        );
+    }
+}
+
 /// Enable raw mode and enter the alternate screen with mouse, focus, and paste
 /// reporting. When `keyboard_enhanced` is `None` the terminal is probed and the
 /// result returned; when `Some(v)` a previously probed value is reused, so a
@@ -7757,7 +8849,7 @@ pub(crate) fn enter_terminal_modes(keyboard_enhanced: Option<bool>) -> Result<bo
     execute!(
         stdout,
         EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
+        EnableMouseCaptureWithoutHover,
         crossterm::event::EnableFocusChange,
         crossterm::event::EnableBracketedPaste,
         cursor::Hide
@@ -7769,11 +8861,7 @@ pub(crate) fn enter_terminal_modes(keyboard_enhanced: Option<bool>) -> Result<bo
     if enhanced {
         execute!(
             stdout,
-            crossterm::event::PushKeyboardEnhancementFlags(
-                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            )
+            crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         )?;
     }
     Ok(enhanced)
@@ -7786,9 +8874,12 @@ fn setup_terminal() -> Result<(Term, bool)> {
     Ok((terminal, keyboard_enhanced))
 }
 
+/// Put the terminal back the way we found it.
+///
+/// Nothing drains leftover input here: crossterm guards its reader with a
+/// process-wide mutex that the input thread holds for the duration of its
+/// blocking read, so any drain from this thread would silently no-op.
 pub(crate) fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
-    drain_pending_terminal_events(Duration::from_millis(0));
-
     if keyboard_enhanced {
         execute!(
             terminal.backend_mut(),
@@ -7811,7 +8902,6 @@ pub(crate) fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> 
     }
     terminal.backend_mut().flush()?;
 
-    drain_pending_terminal_events(Duration::from_millis(25));
     terminal::disable_raw_mode()?;
 
     Ok(())

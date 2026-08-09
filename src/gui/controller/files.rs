@@ -6,13 +6,17 @@ use crate::config::keybindings::key_matches;
 use crate::gui::Gui;
 use crate::gui::interactive::{EditRequest, Interactive};
 use crate::gui::popup::{
-    CommitInputFocus, MenuItem, PopupState, make_commit_body_textarea,
+    CommitInputFocus, CommitInputKind, MenuItem, PopupState, make_commit_body_textarea,
     make_commit_summary_textarea, make_textarea,
 };
 use crate::os::platform::Platform;
 use crate::pager::side_by_side::DiffPanel;
 
 pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) -> Result<()> {
+    if super::commits::matches_key(key, &keybindings.commits.open_log_menu) {
+        return super::commits::show_files_filtering_menu(gui);
+    }
+
     // Enter: toggle directory collapse in tree view, or focus diff for files
     if key.code == KeyCode::Enter {
         if gui.show_file_tree {
@@ -118,39 +122,52 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
 }
 
 fn toggle_stage(gui: &mut Gui) -> Result<()> {
-    // If in tree view and a directory is selected, stage/unstage all child files
+    // If in tree view and a directory is selected, stage/unstage all child files.
+    // Optimistic UI + background git so rapid Space presses stay snappy.
     if gui.show_file_tree {
         let selected = gui.context_mgr.selected_active();
         if let Some(node) = gui.file_tree_nodes.get(selected) {
             if node.is_dir {
                 let child_indices = node.child_file_indices.clone();
-                let model = gui.model.lock().unwrap();
-                // Check if any child has unstaged changes
-                let any_unstaged = child_indices.iter().any(|&i| {
-                    model
-                        .files
-                        .get(i)
-                        .map_or(false, |f| f.has_unstaged_changes || !f.tracked)
-                });
-                let paths: Vec<String> = child_indices
-                    .iter()
-                    .filter_map(|&i| model.files.get(i))
-                    .flat_map(|f| {
-                        if any_unstaged {
-                            vec![f.git_add_path().to_string()]
-                        } else {
-                            f.git_reset_paths().into_iter().map(String::from).collect()
+                let mut model = gui.model.lock().unwrap();
+                // Only stage children that still need staging. Re-adding already
+                // fully staged paths fails when the path is gone from disk
+                // (e.g. staged deletions). Matches lazygit:
+                // filterNodesHaveUnstagedChanges + StageFiles.
+                let mut staging = false;
+                for &i in &child_indices {
+                    if let Some(f) = model.files.get(i) {
+                        if f.has_unstaged_changes || !f.tracked {
+                            staging = true;
+                            break;
                         }
-                    })
-                    .collect();
-                drop(model);
-
-                if any_unstaged {
-                    gui.git.stage_files(&paths)?;
-                } else {
-                    gui.git.unstage_files(&paths)?;
+                    }
                 }
-                gui.needs_files_refresh = true;
+                let mut to_stage = Vec::new();
+                let mut to_unstage = Vec::new();
+                for &i in &child_indices {
+                    let Some(f) = model.files.get_mut(i) else {
+                        continue;
+                    };
+                    if staging {
+                        if f.has_unstaged_changes || !f.tracked {
+                            to_stage.push(f.git_add_path().to_string());
+                            let _ = f.optimistic_stage();
+                        }
+                    } else {
+                        to_unstage.extend(f.git_reset_paths().into_iter().map(String::from));
+                        let _ = f.optimistic_unstage();
+                    }
+                }
+                drop(model);
+                gui.rebuild_file_tree_from_model();
+                gui.needs_diff_refresh = true;
+
+                if !to_stage.is_empty() {
+                    gui.enqueue_stage_then_refresh(to_stage, true);
+                } else if !to_unstage.is_empty() {
+                    gui.enqueue_stage_then_refresh(to_unstage, false);
+                }
                 return Ok(());
             }
         }
@@ -159,8 +176,8 @@ fn toggle_stage(gui: &mut Gui) -> Result<()> {
     let Some(file_idx) = gui.selected_file_index() else {
         return Ok(());
     };
-    let model = gui.model.lock().unwrap();
-    if let Some(file) = model.files.get(file_idx) {
+    let mut model = gui.model.lock().unwrap();
+    if let Some(file) = model.files.get_mut(file_idx) {
         let add_path = file.git_add_path().to_string();
         let reset_paths: Vec<String> = file
             .git_reset_paths()
@@ -169,32 +186,48 @@ fn toggle_stage(gui: &mut Gui) -> Result<()> {
             .collect();
         let has_staged = file.has_staged_changes;
         let has_unstaged = file.has_unstaged_changes;
-        drop(model);
-
-        if has_unstaged || !has_staged {
-            gui.git.stage_file(&add_path)?;
+        let should_stage = has_unstaged || !has_staged;
+        if should_stage {
+            let _ = file.optimistic_stage();
         } else {
-            gui.git.unstage_files(&reset_paths)?;
+            let _ = file.optimistic_unstage();
         }
-        gui.needs_files_refresh = true;
+        drop(model);
+        gui.rebuild_file_tree_from_model();
+        gui.needs_diff_refresh = true;
+
+        if should_stage {
+            gui.enqueue_stage_then_refresh(vec![add_path], true);
+        } else {
+            gui.enqueue_stage_then_refresh(reset_paths, false);
+        }
+    } else {
+        drop(model);
     }
     Ok(())
 }
 
 fn toggle_stage_all(gui: &mut Gui) -> Result<()> {
-    let model = gui.model.lock().unwrap();
+    // Optimistic UI + background git (same pattern as Space / dir toggle).
+    let mut model = gui.model.lock().unwrap();
     let any_unstaged = model
         .files
         .iter()
         .any(|f| f.has_unstaged_changes || !f.tracked);
-    drop(model);
-
-    if any_unstaged {
-        gui.git.stage_all()?;
-    } else {
-        gui.git.unstage_all()?;
+    let stage = any_unstaged;
+    for f in model.files.iter_mut() {
+        if stage {
+            if f.has_unstaged_changes || !f.tracked {
+                let _ = f.optimistic_stage();
+            }
+        } else if f.has_staged_changes {
+            let _ = f.optimistic_unstage();
+        }
     }
-    gui.needs_files_refresh = true;
+    drop(model);
+    gui.rebuild_file_tree_from_model();
+    gui.needs_diff_refresh = true;
+    gui.enqueue_stage_all_then_refresh(stage);
     Ok(())
 }
 
@@ -203,6 +236,21 @@ fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
         return Ok(());
     }
 
+    let head_is_detached = gui.model.lock().unwrap().head_branch_name.is_empty();
+    if head_is_detached {
+        gui.popup = PopupState::Confirm {
+            title: "Detached HEAD".to_string(),
+            message: "You are in a detached HEAD, not a branch. Are you sure you want to commit?"
+                .to_string(),
+            on_confirm: Box::new(open_commit_prompt_after_detached_head_warning),
+        };
+        return Ok(());
+    }
+
+    open_commit_prompt_after_detached_head_warning(gui)
+}
+
+fn open_commit_prompt_after_detached_head_warning(gui: &mut Gui) -> Result<()> {
     let model = gui.model.lock().unwrap();
     let any_staged = model.files.iter().any(|f| f.has_staged_changes);
     let no_files = model.files.is_empty();
@@ -217,14 +265,22 @@ fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
                     gui.popup = saved;
                 } else {
                     gui.popup = PopupState::CommitInput {
+                        kind: CommitInputKind::Commit,
                         summary_textarea: make_commit_summary_textarea(),
                         body_textarea: make_commit_body_textarea(),
                         body_state: crate::gui::popup::BodySoftWrap::new(),
                         focus: CommitInputFocus::Summary,
                         on_confirm: Box::new(|gui, message| {
                             if !message.is_empty() {
-                                gui.git.create_empty_commit(message)?;
-                                gui.needs_refresh = true;
+                                let message = message.to_string();
+                                gui.start_remote_op(
+                                    "Empty commit",
+                                    "Creating empty commit...",
+                                    move |git| {
+                                        git.create_empty_commit(&message)?;
+                                        Ok(())
+                                    },
+                                );
                             }
                             Ok(())
                         }),
@@ -247,14 +303,18 @@ fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
                     gui.popup = saved;
                 } else {
                     gui.popup = PopupState::CommitInput {
+                        kind: CommitInputKind::Commit,
                         summary_textarea: make_commit_summary_textarea(),
                         body_textarea: make_commit_body_textarea(),
                         body_state: crate::gui::popup::BodySoftWrap::new(),
                         focus: CommitInputFocus::Summary,
                         on_confirm: Box::new(|gui, message| {
                             if !message.is_empty() {
-                                gui.git.create_commit(message, false)?;
-                                gui.needs_refresh = true;
+                                let message = message.to_string();
+                                gui.start_remote_op("Commit", "Creating commit...", move |git| {
+                                    git.create_commit(&message, false)?;
+                                    Ok(())
+                                });
                             }
                             Ok(())
                         }),
@@ -272,14 +332,18 @@ fn open_commit_prompt(gui: &mut Gui) -> Result<()> {
     }
 
     gui.popup = PopupState::CommitInput {
+        kind: CommitInputKind::Commit,
         summary_textarea: make_commit_summary_textarea(),
         body_textarea: make_commit_body_textarea(),
         body_state: crate::gui::popup::BodySoftWrap::new(),
         focus: CommitInputFocus::Summary,
         on_confirm: Box::new(|gui, message| {
             if !message.is_empty() {
-                gui.git.create_commit(message, false)?;
-                gui.needs_refresh = true;
+                let message = message.to_string();
+                gui.start_remote_op("Commit", "Creating commit...", move |git| {
+                    git.create_commit(&message, false)?;
+                    Ok(())
+                });
             }
             Ok(())
         }),
@@ -314,14 +378,18 @@ fn open_ai_commit_prompt(gui: &mut Gui) -> Result<()> {
             on_confirm: Box::new(|gui| {
                 gui.git.stage_all()?;
                 gui.popup = PopupState::CommitInput {
+                    kind: CommitInputKind::Commit,
                     summary_textarea: make_commit_summary_textarea(),
                     body_textarea: make_commit_body_textarea(),
                     body_state: crate::gui::popup::BodySoftWrap::new(),
                     focus: CommitInputFocus::Summary,
                     on_confirm: Box::new(|gui, message| {
                         if !message.is_empty() {
-                            gui.git.create_commit(message, false)?;
-                            gui.needs_refresh = true;
+                            let message = message.to_string();
+                            gui.start_remote_op("Commit", "Creating commit...", move |git| {
+                                git.create_commit(&message, false)?;
+                                Ok(())
+                            });
                         }
                         Ok(())
                     }),
@@ -334,14 +402,18 @@ fn open_ai_commit_prompt(gui: &mut Gui) -> Result<()> {
     }
 
     gui.popup = PopupState::CommitInput {
+        kind: CommitInputKind::Commit,
         summary_textarea: make_commit_summary_textarea(),
         body_textarea: make_commit_body_textarea(),
         body_state: crate::gui::popup::BodySoftWrap::new(),
         focus: CommitInputFocus::Summary,
         on_confirm: Box::new(|gui, message| {
             if !message.is_empty() {
-                gui.git.create_commit(message, false)?;
-                gui.needs_refresh = true;
+                let message = message.to_string();
+                gui.start_remote_op("Commit", "Creating commit...", move |git| {
+                    git.create_commit(&message, false)?;
+                    Ok(())
+                });
             }
             Ok(())
         }),
@@ -809,8 +881,10 @@ fn amend_commit(gui: &mut Gui) -> Result<()> {
         title: "Amend".to_string(),
         message: "Amend last commit with staged changes?".to_string(),
         on_confirm: Box::new(|gui| {
-            gui.git.amend_commit()?;
-            gui.needs_refresh = true;
+            gui.start_remote_op("Amend", "Amending commit...", |git| {
+                git.amend_commit()?;
+                Ok(())
+            });
             Ok(())
         }),
     };
@@ -824,13 +898,13 @@ fn commit_with_editor(gui: &mut Gui) -> Result<()> {
         title: "Commit message (or leave empty to open editor)".to_string(),
         textarea: make_textarea("Enter commit message..."),
         on_confirm: Box::new(|gui, message| {
-            if message.is_empty() {
-                // For now, just create an empty commit message prompt
-                // Full editor integration requires Phase 4 (subprocess management)
-            } else {
-                gui.git.create_commit(message, false)?;
+            if !message.is_empty() {
+                let message = message.to_string();
+                gui.start_remote_op("Commit", "Creating commit...", move |git| {
+                    git.create_commit(&message, false)?;
+                    Ok(())
+                });
             }
-            gui.needs_refresh = true;
             Ok(())
         }),
         is_commit: false,
