@@ -1,6 +1,6 @@
 [package]
 name = "lazygitrs"
-version = "0.0.23"
+version = "0.0.30"
 edition = "2024"
 description = "A faster, memory-safe, more ergonomic slopfork of lazygit"
 repository = "https://github.com/blankeos/lazygitrs"
@@ -40,6 +40,7 @@ unicode-width = "0.2"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 textwrap = "0.16.2"
 terminal-colorsaurus = "1.0.3"
+libc = "0.2"
 
 [profile.release]
 lto = true

@@ -7,7 +7,8 @@ use crate::config::KeybindingConfig;
 use crate::gui::Gui;
 use crate::gui::controller::input_normalization::replace_spaces_with_dashes;
 use crate::gui::popup::{
-    ListPickerCore, ListPickerItem, MenuItem, PopupState, make_help_search_textarea, make_textarea,
+    ListPickerCore, ListPickerItem, MenuItem, PopupState, make_command_palette_search_textarea,
+    make_textarea,
 };
 
 pub fn handle_key(gui: &mut Gui, key: KeyEvent, _keybindings: &KeybindingConfig) -> Result<()> {
@@ -120,7 +121,7 @@ fn prompt_worktree_existing_branch(gui: &mut Gui, path: String) {
         core: ListPickerCore {
             items: worktree_existing_local_branch_items(gui),
             selected: 0,
-            search_textarea: make_help_search_textarea(),
+            search_textarea: make_command_palette_search_textarea(),
             scroll_offset: 0,
         },
         allow_freeform: false,
@@ -165,7 +166,7 @@ fn prompt_worktree_base_ref(gui: &mut Gui, path: String, branch: String) {
         core: ListPickerCore {
             items: worktree_base_ref_items(gui),
             selected: 0,
-            search_textarea: make_help_search_textarea(),
+            search_textarea: make_command_palette_search_textarea(),
             scroll_offset: 0,
         },
         allow_freeform: true,
