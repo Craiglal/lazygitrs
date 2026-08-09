@@ -121,6 +121,8 @@ lazygitrs ships with 30+ built-in color themes (Catppuccin, Dracula, Tokyo Night
 
 **Unlike original lazygit, you can switch themes without touching any config file** — just press `?` > **Color Themes** > Enter. Your choice is saved automatically.
 
+**System (Auto)** is the default. It asks your *terminal* what its background color is (via OSC 11) and picks the built-in light or dark theme to match. Note that this follows the terminal, not the desktop: if your terminal config pins a background (e.g. kitty's `background #181616`), lazygitrs stays dark even when the desktop switches to light mode — which is what keeps the text readable. Terminals that don't answer the query fall back to the `COLORFGBG` environment variable, then to dark. Pick **Default (Dark)** or **Default (Light)** in the picker to opt out and pin one.
+
 **Custom themes:** Drop a `.json` file into `~/.config/lazygitrs/themes/` and it appears in the picker. Start by copying an existing theme from `src/generated_themes/` and tweaking the colors. The format is a flat JSON with all fields optional (unset values are derived from semantic base colors like `primary`, `success`, `error`):
 
 ```json

@@ -1,4 +1,5 @@
 pub mod app_state;
+pub mod appearance;
 pub mod keybindings;
 pub mod theme;
 pub mod user_config;

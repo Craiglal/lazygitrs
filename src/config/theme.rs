@@ -181,12 +181,20 @@ impl Theme {
     }
 
     pub fn dark() -> Self {
+        // These two must be explicit RGB rather than `Color::DarkGray`.  Both
+        // used to resolve to ANSI slot 8, so dimmed text drawn on a selected
+        // row came out at 1:1 contrast — invisible — in *any* palette, and
+        // pinning only one side still breaks on palettes at the other
+        // extreme (kanagawa renders slot 8 as #a6a69c, others as #555).
+        const SELECTED_BG: Color = Color::Rgb(55, 61, 76);
+        const TEXT_DIMMED: Color = Color::Rgb(138, 143, 156);
+
         Self {
             active_border: Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
             inactive_border: Style::default().fg(Color::DarkGray),
-            selected_line: Style::default().bg(Color::DarkGray),
+            selected_line: Style::default().bg(SELECTED_BG),
             options_text: Style::default().fg(Color::Blue),
             title: Style::default()
                 .fg(Color::White)
@@ -223,11 +231,11 @@ impl Theme {
             // UI chrome
             accent: Color::Cyan,
             accent_secondary: Color::Yellow,
-            text_dimmed: Color::DarkGray,
+            text_dimmed: TEXT_DIMMED,
             text: Color::Gray,
             text_strong: Color::White,
             separator: Color::DarkGray,
-            selected_bg: Color::DarkGray,
+            selected_bg: SELECTED_BG,
             popup_border: Color::Cyan,
 
             // Command log
@@ -320,6 +328,176 @@ impl Theme {
             remote_url: Color::White,
             remote_branch_name: Color::Cyan,
             remote_branch_detail: Color::DarkGray,
+        }
+    }
+
+    /// Light counterpart of [`Theme::dark`], tuned for a light terminal
+    /// background.  Uses explicit RGB rather than the ANSI names `dark()`
+    /// leans on: the bright end of a terminal's default palette (green,
+    /// yellow, cyan) is close to unreadable on white.
+    pub fn light() -> Self {
+        // GitHub Light-derived palette.
+        const TEXT: Color = Color::Rgb(0x57, 0x60, 0x6a);
+        const TEXT_STRONG: Color = Color::Rgb(0x24, 0x29, 0x2f);
+        // Dark enough to stay legible on SELECTED_BG, not just on white.
+        const TEXT_DIMMED: Color = Color::Rgb(0x73, 0x7d, 0x87);
+        const BLUE: Color = Color::Rgb(0x09, 0x69, 0xda);
+        const GREEN: Color = Color::Rgb(0x1a, 0x7f, 0x37);
+        const RED: Color = Color::Rgb(0xcf, 0x22, 0x2e);
+        const YELLOW: Color = Color::Rgb(0x9a, 0x66, 0x00);
+        const CYAN: Color = Color::Rgb(0x1b, 0x7c, 0x83);
+        const PURPLE: Color = Color::Rgb(0x82, 0x50, 0xdf);
+        const ORANGE: Color = Color::Rgb(0xbc, 0x4c, 0x00);
+        const PINK: Color = Color::Rgb(0xbf, 0x39, 0x89);
+        // Deliberately darker than GitHub's #d0d7de rule colour: box-drawing
+        // glyphs need more weight than a 1px CSS border to stay visible, and
+        // this keeps borders about as prominent here as DarkGray is in dark().
+        const BORDER: Color = Color::Rgb(0xaf, 0xb8, 0xc1);
+        const SELECTED_BG: Color = Color::Rgb(0xdd, 0xe4, 0xed);
+
+        Self {
+            active_border: Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+            inactive_border: Style::default().fg(BORDER),
+            selected_line: Style::default().bg(SELECTED_BG),
+            options_text: Style::default().fg(BLUE),
+            title: Style::default()
+                .fg(TEXT_STRONG)
+                .add_modifier(Modifier::BOLD),
+
+            diff_add: Style::default().fg(GREEN),
+            diff_remove: Style::default().fg(RED),
+            diff_context: Style::default().fg(TEXT),
+            diff_add_bg: Color::Rgb(0xe6, 0xff, 0xec),
+            diff_remove_bg: Color::Rgb(0xff, 0xeb, 0xe9),
+            diff_add_gutter_bg: Color::Rgb(0xcc, 0xff, 0xd8),
+            diff_remove_gutter_bg: Color::Rgb(0xff, 0xd8, 0xd3),
+            diff_add_gutter_fg: Color::Rgb(0x11, 0x6a, 0x2c),
+            diff_remove_gutter_fg: Color::Rgb(0xa4, 0x1c, 0x24),
+            // Word-level emphasis: a background, drawn under `text_strong`.
+            diff_add_word: Color::Rgb(0xab, 0xf2, 0xbc),
+            diff_remove_word: Color::Rgb(0xff, 0xc1, 0xc0),
+
+            commit_hash: Style::default().fg(YELLOW),
+            commit_author: Style::default().fg(GREEN),
+            commit_date: Style::default().fg(BLUE),
+            commit_hash_pushed: Color::Rgb(0x8c, 0x95, 0x9f),
+            commit_hash_merged: Color::Rgb(0xaf, 0xb8, 0xc1),
+
+            branch_local: Style::default().fg(GREEN),
+            branch_remote: Style::default().fg(RED),
+            branch_head: Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+
+            file_staged: Style::default().fg(GREEN),
+            file_unstaged: Style::default().fg(RED),
+            file_untracked: Style::default().fg(ORANGE),
+            file_conflicted: Style::default().fg(RED).add_modifier(Modifier::BOLD),
+
+            search_match: Style::default()
+                .bg(Color::Rgb(0xff, 0xf1, 0xa7))
+                .fg(TEXT_STRONG),
+            status_bar: Style::default().fg(TEXT_DIMMED),
+            spinner: Style::default().fg(CYAN),
+
+            // UI chrome
+            accent: CYAN,
+            accent_secondary: YELLOW,
+            text_dimmed: TEXT_DIMMED,
+            text: TEXT,
+            text_strong: TEXT_STRONG,
+            separator: BORDER,
+            selected_bg: SELECTED_BG,
+            popup_border: CYAN,
+
+            // Command log
+            cmd_log_border: BORDER,
+            cmd_log_title: Color::Rgb(0x6e, 0x77, 0x81),
+            cmd_log_hint: Color::Rgb(0x9a, 0xa3, 0xad),
+            cmd_log_text: Color::Rgb(0x7d, 0x86, 0x90),
+            cmd_log_timestamp: Color::Rgb(0x6e, 0x77, 0x81),
+            cmd_log_success: Color::Rgb(0x2d, 0x8a, 0x47),
+
+            // Diff panel
+            diff_gutter: TEXT_DIMMED,
+            diff_line_number: Color::Rgb(0xba, 0xc2, 0xcb),
+            diff_selection_fg: Color::Rgb(0x03, 0x3d, 0x8b),
+            diff_selection_bg: Color::Rgb(0xdd, 0xe9, 0xff),
+            diff_search_highlight_bg: Color::Rgb(0xff, 0xe4, 0x8a),
+            diff_search_highlight_fg: TEXT_STRONG,
+            diff_search_cursor_bg: Color::Rgb(0xf5, 0xb8, 0x1a),
+            diff_search_cursor_fg: TEXT_STRONG,
+            diff_grid_bg: Color::Rgb(0xea, 0xee, 0xf2),
+            diff_grid_fg: YELLOW,
+
+            // Syntax highlighting
+            syntax_comment: Color::Rgb(0x6e, 0x77, 0x81),
+            syntax_keyword: Color::Rgb(0xcf, 0x22, 0x2e),
+            syntax_string: Color::Rgb(0x0a, 0x30, 0x69),
+            syntax_number: Color::Rgb(0x05, 0x50, 0xae),
+            syntax_function: PURPLE,
+            syntax_function_macro: PINK,
+            syntax_type: ORANGE,
+            syntax_variable_builtin: Color::Rgb(0xcf, 0x22, 0x2e),
+            syntax_variable_member: Color::Rgb(0x05, 0x50, 0xae),
+            syntax_module: ORANGE,
+            syntax_operator: Color::Rgb(0xcf, 0x22, 0x2e),
+            syntax_tag: Color::Rgb(0x11, 0x6a, 0x2c),
+            syntax_attribute: PURPLE,
+            syntax_label: ORANGE,
+            syntax_punctuation: Color::Rgb(0x57, 0x60, 0x6a),
+            syntax_default: TEXT_STRONG,
+
+            // Graph
+            graph_colors: [
+                CYAN,
+                GREEN,
+                YELLOW,
+                Color::Rgb(0x8a, 0x3f, 0xfc),
+                BLUE,
+                RED,
+                Color::Rgb(0x0f, 0x5f, 0x64),
+                Color::Rgb(0x2d, 0x8a, 0x47),
+            ],
+
+            // Rebase
+            rebase_pick: GREEN,
+            rebase_reword: BLUE,
+            rebase_edit: YELLOW,
+            rebase_squash: ORANGE,
+            rebase_fixup: PURPLE,
+            rebase_drop: RED,
+            rebase_paused_bg: Color::Rgb(0xff, 0xf3, 0xd4),
+
+            // File change status
+            change_added: GREEN,
+            change_deleted: RED,
+            change_renamed: YELLOW,
+            change_copied: CYAN,
+            change_unmerged: RED,
+
+            // Ref labels
+            ref_head: CYAN,
+            ref_remote: RED,
+            ref_local: GREEN,
+            ref_tag: CYAN,
+
+            // Tags
+            tag_name: GREEN,
+            tag_hash: YELLOW,
+            tag_message: TEXT_STRONG,
+
+            // Stash
+            stash_index: YELLOW,
+            stash_message: TEXT_STRONG,
+
+            // Reflog
+            reflog_hash: BLUE,
+            reflog_message: TEXT_STRONG,
+
+            // Remotes
+            remote_name: CYAN,
+            remote_url: TEXT_STRONG,
+            remote_branch_name: CYAN,
+            remote_branch_detail: TEXT_DIMMED,
         }
     }
 }
@@ -735,8 +913,19 @@ pub struct ColorTheme {
 impl ColorTheme {
     /// Apply this theme preset to produce a full Theme.
     pub fn to_theme(&self) -> Theme {
-        if self.id == "default" {
-            return Theme::dark();
+        match self.id.as_str() {
+            // Reads the appearance cached at startup — never queries the
+            // terminal here, since this runs on every frame.
+            "system" => {
+                use super::appearance::{Appearance, appearance};
+                return match appearance() {
+                    Appearance::Light => Theme::light(),
+                    Appearance::Dark => Theme::dark(),
+                };
+            }
+            "default" => return Theme::dark(),
+            "default-light" => return Theme::light(),
+            _ => {}
         }
 
         // Try embedded themes (generated + custom built-in)
@@ -773,12 +962,21 @@ pub fn load_color_themes() -> Vec<ColorTheme> {
     let mut themes = Vec::new();
     let mut seen_ids = std::collections::HashSet::new();
 
-    // 1. Default theme first
-    themes.push(ColorTheme {
-        name: "Default (Dark)".to_string(),
-        id: "default".to_string(),
-    });
-    seen_ids.insert("default".to_string());
+    // 1. Built-in themes first, in fixed order.  "System" sits at index 0 so
+    //    that users with no saved choice (the `unwrap_or(0)` in Gui::new) get
+    //    follow-the-terminal by default.
+    for (name, id) in [
+        ("System (Auto)", "system"),
+        ("Default (Dark)", "default"),
+        ("Default (Light)", "default-light"),
+    ] {
+        themes.push(ColorTheme {
+            name: name.to_string(),
+            id: id.to_string(),
+        });
+        seen_ids.insert(id.to_string());
+    }
+    let builtin_count = themes.len();
 
     // 2. Embedded themes (generated + custom built-in)
     for dir in &[&GENERATED_THEMES_DIR, &CUSTOM_THEMES_DIR] {
@@ -808,9 +1006,10 @@ pub fn load_color_themes() -> Vec<ColorTheme> {
         }
     }
 
-    // Sort non-default themes alphabetically by name
-    if themes.len() > 1 {
-        themes[1..].sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Sort the discovered themes alphabetically, leaving the built-ins pinned
+    // to the front.
+    if themes.len() > builtin_count {
+        themes[builtin_count..].sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     }
 
     themes

@@ -51,7 +51,9 @@ working version validated on 2026-07-29.
 - Writes the commit message to stdout, nothing else. Actionable reason to stderr on failure
   (lazygitrs displays stderr when the command exits non-zero).
 - Env-tunable: `AI_COMMIT_MODEL` (default `deepseek-v4-flash`), `AI_COMMIT_API_URL`,
-  `AI_COMMIT_MAX_TOKENS` (default 3000), `AI_COMMIT_TIMEOUT`, `AI_COMMIT_MAX_DIFF_CHARS`.
+  `AI_COMMIT_MAX_TOKENS` (default 3000), `AI_COMMIT_TIMEOUT`, `AI_COMMIT_MAX_DIFF_CHARS`,
+  `AI_COMMIT_REASONING_EFFORT` (default `none`; empty omits the field and takes the API
+  default).
 - Requires `jq` and `curl`; reads `DEEPSEEK_API_KEY` from the environment.
 
 **`contrib/config.yml`** — the canonical, version-controlled config; target of the config
@@ -70,9 +72,16 @@ message".
 The helper therefore:
 
 - reads `.choices[0].message.content`, **not** `.reasoning_content`;
-- defaults `max_tokens` high enough (3000) for reasoning plus message;
-- when content is empty and `finish_reason == "length"`, reports that the budget was spent on
-  reasoning and names `AI_COMMIT_MAX_TOKENS` as the fix.
+- sends `reasoning_effort: "none"` by default. Amended 2026-08-03: budgeting 3000 tokens for
+  "reasoning plus message" does not hold, because reasoning grows with the diff while the
+  budget does not — a 10 KB diff spent 1930 of 3000 tokens reasoning, and larger diffs
+  returned an empty or truncated message. Writing a commit message needs no chain of thought,
+  so the whole budget now goes to the message: the same 10 KB diff costs 227 completion
+  tokens. `AI_COMMIT_REASONING_EFFORT` opts reasoning back in;
+- when `finish_reason == "length"`, reports which limit was hit — reasoning eating the budget
+  (and offers `AI_COMMIT_REASONING_EFFORT=none`), an empty message with reasoning already off,
+  or a message truncated mid-way — and names `AI_COMMIT_MAX_TOKENS` as the fix. A truncated
+  message is a failure, never passed through to the commit editor.
 
 Verified against the live API: only `deepseek-v4-flash` and `deepseek-v4-pro` exist.
 
@@ -162,6 +171,11 @@ package manager is found.
   - missing key → names the variable and where it is expected from
   - bad key → `DeepSeek API returned HTTP 401: Authentication Fails`
   - starved budget → names `AI_COMMIT_MAX_TOKENS` as the fix
+- Amended 2026-08-03: the blank-input and blank-message checks are shell `case` matches, not
+  `printf … | grep -q`. Under `set -o pipefail`, `grep -q` exits at the first match while
+  `printf` is still writing, and that SIGPIPE became the pipeline's status once the diff
+  outgrew the 64 KiB pipe buffer — so a large staged diff was reported as `No staged changes
+  to describe.`
 - `doctor` distinguishes required failures (non-zero exit) from optional-dep warnings.
 
 ## Testing

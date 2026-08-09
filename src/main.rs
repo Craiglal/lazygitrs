@@ -68,6 +68,11 @@ fn main() {
         .or(cli.work_tree)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+    // Ask the terminal whether it is light or dark before anything starts
+    // reading stdin — the OSC 11 reply lands there, so this cannot wait until
+    // the GUI has its event stream running.
+    config::appearance::detect();
+
     match app::App::new(repo_path, cli.debug) {
         Ok(app) => {
             if let Err(e) = app.run() {

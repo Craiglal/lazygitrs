@@ -18,10 +18,15 @@
 #   AI_COMMIT_MAX_TOKENS      default: 3000
 #   AI_COMMIT_MAX_DIFF_CHARS  default: 120000
 #   AI_COMMIT_TIMEOUT         default: 120 (seconds)
+#   AI_COMMIT_REASONING_EFFORT
+#                             default: none. Set empty to send no such field and
+#                             take the API default; any other value is forwarded
+#                             verbatim (e.g. minimal, low, medium, high).
 #
 # Test-only seams, used by contrib/test-ai-commit.sh:
 #   AI_COMMIT_STUB_RESPONSE   path to a JSON file used instead of calling the API
 #   AI_COMMIT_STUB_HTTP_CODE  HTTP status to simulate with the stub (default 200)
+#   AI_COMMIT_DUMP_PAYLOAD    path to write the request payload to
 
 set -uo pipefail
 
@@ -30,7 +35,10 @@ API_URL="${AI_COMMIT_API_URL:-https://api.deepseek.com/chat/completions}"
 MAX_TOKENS="${AI_COMMIT_MAX_TOKENS:-3000}"
 MAX_DIFF_CHARS="${AI_COMMIT_MAX_DIFF_CHARS:-120000}"
 TIMEOUT="${AI_COMMIT_TIMEOUT:-120}"
+# Unset means "none"; explicitly empty means "omit the field entirely".
+REASONING_EFFORT="${AI_COMMIT_REASONING_EFFORT-none}"
 STUB_RESPONSE="${AI_COMMIT_STUB_RESPONSE:-}"
+DUMP_PAYLOAD="${AI_COMMIT_DUMP_PAYLOAD:-}"
 
 die() {
     printf '%s\n' "$*" >&2
@@ -45,7 +53,14 @@ diff="$(cat)"
 # reading stderr).
 command -v jq >/dev/null 2>&1 || die "jq is required but was not found on PATH."
 
-printf '%s' "$diff" | grep -q '[^[:space:]]' || die "No staged changes to describe."
+# Matched in-shell rather than piped to `grep -q`: grep exits at the first match
+# while printf is still writing, and under `set -o pipefail` that SIGPIPE became
+# the pipeline's status once the diff outgrew the 64 KiB pipe buffer — reporting
+# a large staged diff as no diff at all.
+case "$diff" in
+    *[![:space:]]*) ;;
+    *) die "No staged changes to describe." ;;
+esac
 
 # Keep very large diffs inside a sane request size; the tail of a big change is
 # usually its least informative part.
@@ -61,6 +76,32 @@ Rules:
 - Describe only what the diff actually shows. Never invent changes, issue numbers, or co-authors.
 - Output the raw commit message only: no markdown code fences, no preamble, no trailing commentary.'
 
+# deepseek-v4-* are reasoning models that draw reasoning tokens from the same
+# max_tokens budget as the message, and reasoning grows with the size of the
+# diff. Writing a commit message needs no chain of thought, so reasoning is off
+# by default: the whole budget goes to the message instead of a large diff
+# starving it down to nothing.
+payload="$(
+    jq -n \
+        --arg model "$MODEL" \
+        --arg system "$system_prompt" \
+        --arg user "Write a commit message for this staged diff:"$'\n\n'"$diff" \
+        --arg effort "$REASONING_EFFORT" \
+        --argjson max_tokens "$MAX_TOKENS" \
+        '{
+            model: $model,
+            stream: false,
+            max_tokens: $max_tokens,
+            messages: [
+                {role: "system", content: $system},
+                {role: "user", content: $user}
+            ]
+        }
+        + (if $effort == "" then {} else {reasoning_effort: $effort} end)'
+)" || die "Failed to build the request payload."
+
+[ -z "$DUMP_PAYLOAD" ] || printf '%s' "$payload" >"$DUMP_PAYLOAD"
+
 if [ -n "$STUB_RESPONSE" ]; then
     [ -f "$STUB_RESPONSE" ] || die "AI_COMMIT_STUB_RESPONSE points at a missing file: $STUB_RESPONSE"
     body="$(cat "$STUB_RESPONSE")"
@@ -68,23 +109,6 @@ if [ -n "$STUB_RESPONSE" ]; then
 else
     [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY is not set (expected it exported from your shell's env file, e.g. ~/.zshenv)."
     command -v curl >/dev/null 2>&1 || die "curl is required but was not found on PATH."
-
-    payload="$(
-        jq -n \
-            --arg model "$MODEL" \
-            --arg system "$system_prompt" \
-            --arg user "Write a commit message for this staged diff:"$'\n\n'"$diff" \
-            --argjson max_tokens "$MAX_TOKENS" \
-            '{
-                model: $model,
-                stream: false,
-                max_tokens: $max_tokens,
-                messages: [
-                    {role: "system", content: $system},
-                    {role: "user", content: $user}
-                ]
-            }'
-    )" || die "Failed to build the request payload."
 
     response="$(
         printf '%s' "$payload" | curl -sS -X POST "$API_URL" \
@@ -108,13 +132,25 @@ fi
 message="$(printf '%s' "$body" | jq -r '.choices[0].message.content // ""' 2>/dev/null)"
 finish_reason="$(printf '%s' "$body" | jq -r '.choices[0].finish_reason // ""' 2>/dev/null)"
 
-if ! printf '%s' "$message" | grep -q '[^[:space:]]'; then
-    # deepseek-v4-* are reasoning models: reasoning tokens are drawn from the
-    # same max_tokens budget, so too small a budget yields empty content.
+case "$message" in *[![:space:]]*) has_message=1 ;; *) has_message=0 ;; esac
+
+if [ "$has_message" -eq 0 ]; then
     if [ "$finish_reason" = "length" ]; then
-        die "Model used its entire ${MAX_TOKENS}-token budget on reasoning and returned no message. Raise AI_COMMIT_MAX_TOKENS."
+        # An empty message means the budget ran out before the message started.
+        # Reasoning is the usual culprit, but only if it was left enabled — an
+        # empty REASONING_EFFORT still means the API's default, which is on.
+        if [ "$REASONING_EFFORT" != "none" ]; then
+            die "Model used its entire ${MAX_TOKENS}-token budget on reasoning and returned no message. Raise AI_COMMIT_MAX_TOKENS, or set AI_COMMIT_REASONING_EFFORT=none to spend the whole budget on the message."
+        fi
+        die "Model hit the ${MAX_TOKENS}-token limit before producing any message. Raise AI_COMMIT_MAX_TOKENS."
     fi
     die "Model returned an empty commit message (finish_reason: ${finish_reason:-unknown})."
+fi
+
+# Non-empty but still cut off at the budget: a summary that stops mid-word is
+# not a commit message, so fail rather than let it reach the commit editor.
+if [ "$finish_reason" = "length" ]; then
+    die "Model hit the ${MAX_TOKENS}-token limit mid-message, so the commit message is truncated. Raise AI_COMMIT_MAX_TOKENS."
 fi
 
 # Trim surrounding blank lines; lazygitrs strips any stray markdown fences.
