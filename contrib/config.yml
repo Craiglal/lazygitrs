@@ -11,6 +11,13 @@ gui:
   showCommandLog: true
   showFileTree: true
 
+os:
+  # Explicit, so `e` opens nvim on every machine instead of whatever $EDITOR
+  # happens to be. The preset supplies the templates (`nvim -- {{filename}}`,
+  # `nvim +{{line}} -- {{filename}}`) and marks nvim as a terminal editor, so
+  # lazygitrs suspends the TUI and waits for it.
+  editPreset: nvim
+
 git:
   autoFetch: true
   autoRefresh: true
