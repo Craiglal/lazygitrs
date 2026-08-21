@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.33] - 2026-08-21
+
+### Features
+
+- Add edit and open-file shortcuts to commit files panel by @Blankeos
+- Support suspending TUI for terminal editors (hx/nvim/vim) by @Blankeos
+- Display co-authors in commit details and offer branch creation on checkout miss by @Blankeos
+
+## [0.0.32] - 2026-08-13
+
+### Features
+
+- Add remote edit and fork-remote workflows by @Blankeos
+- Add lazygitrs self-upgrade command by @Blankeos
+
+### Performance
+
+- Make commit diff navigation instant with prefetch and churn fix (#24) by @joshxfi in [#24](https://github.com/Blankeos/lazygitrs/pull/24)
+
+
+### New Contributors
+
+- @joshxfi made their first contribution in [#24](https://github.com/Blankeos/lazygitrs/pull/24)
+## [0.0.31] - 2026-08-13
+
+### Bug Fixes
+
+- Errors when partially adding filetrees by @Blankeos
+- Migrate checklist search input to textarea with enhanced editing by @Blankeos
+- Render pure rename diffs by falling back to file content by @Blankeos
+- Prevent concurrent fetch races causing divergent branch errors by @Blankeos
+
+### Features
+
+- Skip expensive untracked file stats in diff/file loading by @Blankeos
+- Fix tree row spacing for status icons by @Blankeos
+
+### Performance
+
+- Optimize stage-all toggling with optimistic UI updates by @Blankeos
+- Make stage/unstage and checkout paths non-blocking by @Blankeos
+
 ## [0.0.30] - 2026-08-05
 
 ### Features

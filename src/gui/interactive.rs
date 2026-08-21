@@ -10,6 +10,7 @@ use anyhow::{Result, bail};
 use crate::config::user_config::OsConfig;
 use crate::os::editor::{self, EditorCmd};
 
+use super::input::InputReader;
 use super::{Term, drain_pending_terminal_events, enter_terminal_modes, restore_terminal};
 
 /// A request to open a file in the user's editor.
@@ -54,12 +55,19 @@ pub enum Interactive {
 /// exits.
 pub fn run_with_terminal_suspended<F, R>(
     terminal: &mut Term,
+    input: &InputReader,
     keyboard_enhanced: bool,
     f: F,
 ) -> Result<R>
 where
     F: FnOnce() -> R,
 {
+    // Crossterm's event source is process-wide, so the reader thread would keep
+    // consuming stdin and swallow the editor's keystrokes. Stop it first, and
+    // drop whatever it already queued so a stale key cannot act on the TUI when
+    // we come back.
+    input.pause();
+    input.drain();
     restore_terminal(terminal, keyboard_enhanced)?;
 
     let value = match panic::catch_unwind(AssertUnwindSafe(f)) {
@@ -77,6 +85,8 @@ where
     // Discard any query replies the editor left unread, mirroring the two drains
     // restore_terminal already does — crossterm would parse them as key events.
     drain_pending_terminal_events(Duration::from_millis(0));
+    input.drain();
+    input.resume();
     terminal.clear()?;
     Ok(value)
 }
@@ -180,16 +190,18 @@ pub enum EditError {
 /// Execute an edit request, suspending the TUI only when the editor needs it.
 pub fn run_edit_request(
     terminal: &mut Term,
+    input: &InputReader,
     keyboard_enhanced: bool,
     os: &OsConfig,
     req: EditRequest,
 ) -> Result<Option<DetachedEditor>, EditError> {
     match editor::resolve(os, req.line) {
         Some(cmd) if cmd.suspend => {
-            let editor_outcome = run_with_terminal_suspended(terminal, keyboard_enhanced, || {
-                run_editor_blocking(&cmd, &req)
-            })
-            .map_err(EditError::Terminal)?;
+            let editor_outcome =
+                run_with_terminal_suspended(terminal, input, keyboard_enhanced, || {
+                    run_editor_blocking(&cmd, &req)
+                })
+                .map_err(EditError::Terminal)?;
             editor_outcome.map(|()| None).map_err(EditError::Editor)
         }
         Some(cmd) => run_editor_detached(&cmd, &req)

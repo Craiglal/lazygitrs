@@ -79,9 +79,12 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
         return Ok(());
     }
 
-    // Open the working-tree version of the selected file in the editor
+    // e / o — same as the Files tab, but on the working-tree copy of the path.
     if matches_key(key, &keybindings.universal.edit) {
         return open_in_editor(gui);
+    }
+    if matches_key(key, &keybindings.universal.open_file) {
+        return open_in_default_program(gui);
     }
 
     // Copy to clipboard
@@ -92,37 +95,55 @@ pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) 
     Ok(())
 }
 
-/// Open the selected commit file in the editor. A commit's blob cannot be
-/// edited in place, so this opens the working-tree copy of the same path.
-fn open_in_editor(gui: &mut Gui) -> Result<()> {
+/// Working-tree path of the selected commit file, with its repo-relative path
+/// for error messages. Directory nodes select nothing.
+fn selected_commit_file_path(gui: &Gui) -> Option<(std::path::PathBuf, String)> {
     let selected = gui.context_mgr.selected_active();
 
     // Tree view maps a node to a file index; list view selects directly.
     let file_idx = if gui.show_commit_file_tree {
         gui.commit_file_tree_nodes
             .get(selected)
-            .and_then(|n| n.file_index)
+            .and_then(|n| if n.is_dir { None } else { n.file_index })
     } else {
         Some(selected)
-    };
-    let Some(idx) = file_idx else { return Ok(()) };
+    }?;
 
     let model = gui.model.lock().unwrap();
-    let Some(file) = model.commit_files.get(idx) else {
-        return Ok(());
-    };
-    let rel_path = file.current_path().to_string();
+    let rel_path = model.commit_files.get(file_idx)?.current_path().to_string();
     drop(model);
 
-    let abs_path_buf = gui.git.repo_path().join(&rel_path);
-    if !abs_path_buf.exists() {
+    Some((gui.git.repo_path().join(&rel_path), rel_path))
+}
+
+/// Open the selected commit file in the editor. A commit's blob cannot be
+/// edited in place, so this opens the working-tree copy of the same path.
+fn open_in_editor(gui: &mut Gui) -> Result<()> {
+    let Some((abs_path, rel_path)) = selected_commit_file_path(gui) else {
+        return Ok(());
+    };
+    if !abs_path.exists() {
         anyhow::bail!("no longer in the working tree: {rel_path}");
     }
 
     gui.pending_interactive = Some(Interactive::Edit(EditRequest::at(
-        abs_path_buf.to_string_lossy().to_string(),
+        abs_path.to_string_lossy().to_string(),
         None,
     )));
+    Ok(())
+}
+
+/// Open the working-tree copy of the selected commit file in the default program.
+fn open_in_default_program(gui: &mut Gui) -> Result<()> {
+    let Some((abs_path, rel_path)) = selected_commit_file_path(gui) else {
+        return Ok(());
+    };
+    if !abs_path.exists() {
+        anyhow::bail!("no longer in the working tree: {rel_path}");
+    }
+
+    let open_template = &gui.config.user_config.os.open;
+    crate::config::user_config::OsConfig::run_template(open_template, &abs_path.to_string_lossy())?;
     Ok(())
 }
 

@@ -54,7 +54,7 @@
   - Files:
     - [x] In 'Files', the original lazygit has `e` to open file in editor and `o` to open file in default program.
     - [x] In 'Files', the original lazygit has `<c-o>` to copy the diff of the selected file to clipboard (we have this in `y` menu, but the direct shortcut may be missing).
-    - [ ] Full `$EDITOR` integration — committing with `C` (editor mode) currently has a limitation where it can't suspend the TUI to open a real terminal editor.
+    - [x] Full `$EDITOR` integration — `e`/`o` now suspend the TUI for terminal editors (`hx`/`nvim`/`vim` via `editPreset` / `$EDITOR`). Commit-with-`C` (editor mode) still uses the in-app editor path.
   - Remotes:
     - [x] In 'Remotes', pressing `Enter` should drill into remote branches. Then from a remote branch: `<space>` to checkout, `M` to merge, `r` to rebase onto it, `d` to delete remote branch.
   - Submodules:
@@ -310,3 +310,7 @@ Where I observed this behavior: I noticed this for the "Commit Message" and "Des
 - [ ] Checking out pull requests branches, by pressing space I think? `gh pr checkout` and also doing `P` or `p` from the pr head? I was thinking a bunhc of settings to do `P` and then see something like a a custom push command there like push to a different origin etc. Idk tbh what UX i want here.
 
 - [x] IN filetree view, the "M" or "A" or "??" should be slightly more indented. in Files.. Because currently it's lesser indented than the ▶︎ characters, visually makes u think it's at the root, which is bad UX.
+
+- [x] lazygitrs upgrade
+
+- [x] Be able to fallback w/ confirm alert when "c" checkout a new branch that doesnt exist.
