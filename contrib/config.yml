@@ -25,7 +25,13 @@ git:
     - colorArg: always
       pager: 'delta --dark --paging=never --line-numbers --hyperlinks --hyperlinks-file-link-format="lazygit-edit://{path}:{line}"'
   commit:
-    generateCommand: '$HOME/.local/bin/ai-lazygitrs-commit'
+    # OpenRouter rather than DeepSeek direct, whose API retains prompts; OpenRouter
+    # can route to zero-data-retention endpoints only. glm-5.3-flash is the cheapest
+    # model that still writes accurate messages over a 1M-token context (~$0.003 a
+    # commit), and it rejects reasoning_effort=none, hence `low`. The helper reads its
+    # bearer token from DEEPSEEK_API_KEY, so the OpenRouter key is aliased here instead
+    # of being exported globally under a DeepSeek name.
+    generateCommand: 'AI_COMMIT_API_URL=https://openrouter.ai/api/v1/chat/completions AI_COMMIT_MODEL=z-ai/glm-5.3-flash AI_COMMIT_REASONING_EFFORT=low DEEPSEEK_API_KEY="$AI_QUOTA_OPENROUTER_KEY" $HOME/.local/bin/ai-lazygitrs-commit'
 
 customCommands:
   # W is claimed by lazygitrs' built-in diff/compare mode (src/gui/mod.rs)
