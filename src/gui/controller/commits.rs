@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Result;
 use crossterm::event::KeyEvent;
@@ -9,7 +10,7 @@ use crate::git::rebase::RebaseAction;
 use crate::gui::Gui;
 use crate::gui::popup::{
     BodySoftWrap, ChecklistItem, CommitInputFocus, CommitInputKind, ListPickerItem, MenuItem,
-    PopupState, make_textarea,
+    MessageKind, PopupState, make_textarea,
 };
 use crate::model::Branch;
 use crate::os::platform::Platform;
@@ -502,9 +503,12 @@ fn drop_commit(gui: &mut Gui) -> Result<()> {
 
 /// Open the Interactive Rebase planner with the user's current commit
 /// selection pre-marked with `action`. Selection comes from range-select
-/// (`v`) when active; otherwise it's just the focused commit. The rebase
-/// base is the parent of the oldest selected commit, so unselected newer
-/// commits are kept as `pick`.
+/// (`v`) when active; otherwise it's just the focused commit.
+///
+/// The rebase base is the *real first-parent* of the oldest selected commit
+/// (not `commits[idx+1]`). The commits panel is loaded with `git log --all`,
+/// so adjacent rows are not necessarily related — using list index as parent
+/// previously marked/stopped on the wrong commit.
 fn apply_action_to_selection(gui: &mut Gui, action: RebaseAction) -> Result<()> {
     let selected = gui.context_mgr.selected_active();
     let (lo, hi) = if let Some(anchor) = gui.range_select_anchor {
@@ -515,31 +519,113 @@ fn apply_action_to_selection(gui: &mut Gui, action: RebaseAction) -> Result<()> 
 
     let model = gui.model.lock().unwrap();
 
-    if model.commits.get(lo).is_none() {
+    if model.commits.get(lo).is_none() || model.commits.get(hi).is_none() {
         return Ok(());
     }
 
-    let base_idx = hi + 1;
-    let base_commit = match model.commits.get(base_idx) {
-        Some(c) => c.clone(),
-        None => {
+    // Newest-first list: higher index = older. Collect selected hashes and
+    // resolve the oldest selected commit's real first-parent as the base.
+    let selected_hashes: HashSet<String> = model.commits[lo..=hi]
+        .iter()
+        .map(|c| c.hash.clone())
+        .collect();
+    let oldest = &model.commits[hi];
+    let base_hash = match oldest.parents.first() {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
             drop(model);
             gui.popup = PopupState::Message {
                 title: "Interactive rebase".to_string(),
-                message: "Cannot rebase past the oldest visible commit.".to_string(),
+                message: "Cannot rebase the root commit (no parent).".to_string(),
                 kind: crate::gui::popup::MessageKind::Error,
             };
             return Ok(());
         }
     };
-
-    let commits_to_rebase: Vec<_> = model.commits[0..=hi].to_vec();
     let branch_name = model.head_branch_name.clone();
-    let selected_hashes: HashSet<String> = model.commits[lo..=hi]
+
+    // Prefer the model copy of the base when present; otherwise synthesize.
+    let base_from_model = model
+        .commits
         .iter()
-        .map(|c| c.hash.clone())
-        .collect();
+        .find(|c| {
+            c.hash == base_hash || base_hash.starts_with(&c.hash) || c.hash.starts_with(&base_hash)
+        })
+        .cloned();
     drop(model);
+
+    // Only include commits reachable from HEAD above the base. This excludes
+    // unrelated `--all` commits that happen to sit between selected rows.
+    let rebase_hashes = match gui.git.rebase_commit_range(&base_hash) {
+        Ok(h) => h,
+        Err(e) => {
+            gui.popup = PopupState::Message {
+                title: "Interactive rebase".to_string(),
+                message: format!("Failed to determine rebase range: {e}"),
+                kind: crate::gui::popup::MessageKind::Error,
+            };
+            return Ok(());
+        }
+    };
+    if rebase_hashes.is_empty() {
+        gui.popup = PopupState::Message {
+            title: "Interactive rebase".to_string(),
+            message: "Nothing to rebase above the selected commit.".to_string(),
+            kind: crate::gui::popup::MessageKind::Error,
+        };
+        return Ok(());
+    }
+
+    // Resolve each hash in the HEAD range to a Commit. Prefer the already-
+    // loaded model entry; fall back to git metadata for commits outside the
+    // currently loaded page (pagination / deep history).
+    let model_commits = {
+        let model = gui.model.lock().unwrap();
+        model.commits.clone()
+    };
+    let mut commits_to_rebase = Vec::with_capacity(rebase_hashes.len());
+    for hash in &rebase_hashes {
+        if let Some(c) = model_commits.iter().find(|c| &c.hash == hash) {
+            commits_to_rebase.push(c.clone());
+        } else {
+            let msg = gui.git.commit_subject(hash).unwrap_or_default();
+            let author = gui.git.commit_author_name(hash).unwrap_or_default();
+            commits_to_rebase.push(synthetic_commit(hash, &msg, &author));
+        }
+    }
+
+    if commits_to_rebase.is_empty() {
+        gui.popup = PopupState::Message {
+            title: "Interactive rebase".to_string(),
+            message: "Selected commit is not reachable from HEAD — cannot rebase it.".to_string(),
+            kind: crate::gui::popup::MessageKind::Error,
+        };
+        return Ok(());
+    }
+
+    // Ensure at least one selected commit is in the range (guards against
+    // selecting a commit that is not an ancestor of HEAD).
+    if !commits_to_rebase
+        .iter()
+        .any(|c| selected_hashes.contains(&c.hash))
+    {
+        gui.popup = PopupState::Message {
+            title: "Interactive rebase".to_string(),
+            message: "Selected commit is not on the current branch tip — cannot rebase it."
+                .to_string(),
+            kind: crate::gui::popup::MessageKind::Error,
+        };
+        return Ok(());
+    }
+
+    let base_commit = match base_from_model {
+        Some(c) => c,
+        None => {
+            let msg = gui.git.commit_subject(&base_hash).unwrap_or_default();
+            let author = gui.git.commit_author_name(&base_hash).unwrap_or_default();
+            synthetic_commit(&base_hash, &msg, &author)
+        }
+    };
 
     gui.range_select_anchor = None;
 
@@ -552,9 +638,35 @@ fn apply_action_to_selection(gui: &mut Gui, action: RebaseAction) -> Result<()> 
         }
     }
 
-    gui.rebase_mode.selected = lo;
+    // Focus the first (newest-first) selected entry in the planner.
+    if let Some(idx) = gui
+        .rebase_mode
+        .entries
+        .iter()
+        .position(|e| selected_hashes.contains(&e.hash))
+    {
+        gui.rebase_mode.selected = idx;
+    }
 
     Ok(())
+}
+
+fn synthetic_commit(hash: &str, message: &str, author: &str) -> crate::model::Commit {
+    use crate::model::commit::{CommitStatus, Divergence};
+    crate::model::Commit {
+        hash: hash.to_string(),
+        name: message.to_string(),
+        status: CommitStatus::Pushed,
+        action: String::new(),
+        tags: Vec::new(),
+        refs: Vec::new(),
+        extra_info: String::new(),
+        author_name: author.to_string(),
+        author_email: String::new(),
+        unix_timestamp: 0,
+        parents: Vec::new(),
+        divergence: Divergence::None,
+    }
 }
 
 fn move_commit_up(gui: &mut Gui) -> Result<()> {
@@ -1065,25 +1177,21 @@ pub fn show_filtering_menu(gui: &mut Gui) -> Result<()> {
 }
 
 fn show_path_filter_input(gui: &mut Gui) -> Result<()> {
-    let items = gui
-        .git
-        .load_commit_filter_paths()?
-        .into_iter()
-        .map(|path| ListPickerItem {
-            value: path.clone(),
-            label: path,
-            category: String::new(),
-        })
-        .collect();
-    gui.show_list_picker(
-        "Filter by path",
-        items,
-        "Path",
-        Box::new(|gui, path| {
-            gui.commit_path_filter = nonempty(path);
-            apply_commit_filters_and_focus(gui)
-        }),
-    );
+    // Don't block the UI on `git ls-files` / log --name-only — load async.
+    if gui.filter_paths_rx.is_some() {
+        return Ok(());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    gui.filter_paths_rx = Some(rx);
+    gui.popup = PopupState::Message {
+        title: "Filter by path".to_string(),
+        message: "Loading paths…".to_string(),
+        kind: MessageKind::Info,
+    };
+    let git = Arc::clone(&gui.git);
+    std::thread::spawn(move || {
+        let _ = tx.send(git.load_commit_filter_paths());
+    });
     Ok(())
 }
 
@@ -1127,11 +1235,15 @@ fn apply_author_filters(gui: &mut Gui, authors: Vec<String>) -> Result<()> {
     apply_commit_filters_and_focus(gui)
 }
 
-fn apply_commit_filters_and_focus(gui: &mut Gui) -> Result<()> {
+pub(crate) fn apply_commit_filters_and_focus(gui: &mut Gui) -> Result<()> {
     apply_commit_filters(gui)?;
     gui.context_mgr
         .set_active(crate::gui::context::ContextId::Commits);
     Ok(())
+}
+
+pub(crate) fn nonempty_for_filter(value: &str) -> Option<String> {
+    nonempty(value)
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -1207,7 +1319,8 @@ fn branch_filter_menu_label(gui: &Gui) -> String {
 }
 
 fn apply_commit_filters(gui: &mut Gui) -> Result<()> {
-    gui.needs_refresh = true;
+    // Scoped async commit reload — matches lazygit (no full model refresh).
+    gui.reload_filtered_commits_async();
     Ok(())
 }
 

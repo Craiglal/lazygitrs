@@ -243,6 +243,7 @@ fn existing_local_branch_items(
             value: branch.to_string(),
             label: branch.to_string(),
             category: "Local Branches".to_string(),
+            description: None,
         })
         .collect()
 }
@@ -274,6 +275,7 @@ fn worktree_base_ref_items(gui: &Gui) -> Vec<ListPickerItem> {
             value: String::new(),
             label,
             category,
+            description: None,
         });
     }
 
@@ -285,6 +287,7 @@ fn worktree_base_ref_items(gui: &Gui) -> Vec<ListPickerItem> {
             value: branch.name.clone(),
             label: branch.name.clone(),
             category: "Branches".to_string(),
+            description: None,
         });
     }
 
@@ -295,6 +298,7 @@ fn worktree_base_ref_items(gui: &Gui) -> Vec<ListPickerItem> {
                 value: full_name.clone(),
                 label: full_name,
                 category: "Remote Branches".to_string(),
+                description: None,
             });
         }
     }
@@ -304,6 +308,7 @@ fn worktree_base_ref_items(gui: &Gui) -> Vec<ListPickerItem> {
             value: tag.name.clone(),
             label: tag.name.clone(),
             category: "Tags".to_string(),
+            description: None,
         });
     }
 
@@ -312,6 +317,7 @@ fn worktree_base_ref_items(gui: &Gui) -> Vec<ListPickerItem> {
             value: commit.hash.clone(),
             label: format!("{} {}", commit.short_hash(), commit.name),
             category: "Commits".to_string(),
+            description: None,
         });
     }
 
@@ -376,6 +382,7 @@ mod tests {
             value: "feature".to_string(),
             label: "feature".to_string(),
             category: "Local Branches".to_string(),
+            description: None,
         }];
 
         assert!(is_allowed_existing_local_branch("feature", &items));

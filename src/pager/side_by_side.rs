@@ -24,6 +24,9 @@ pub struct ParsedDiff {
     pub new_content: String,
     pub lines: Vec<DiffLine>,
     pub hunk_starts: Vec<usize>,
+    /// Parallel to `hunk_starts`: true when the hunk comes from the staged
+    /// (`--cached`) diff, false for unstaged. Empty = unknown/unstaged.
+    pub hunk_staged: Vec<bool>,
     pub hunk_line_offsets: Vec<(usize, usize, usize)>,
     pub sections: Vec<FileSection>,
     pub file_exists_on_disk: bool,
@@ -299,6 +302,9 @@ pub struct DiffViewState {
     pub horizontal_scroll: usize,
     pub lines: Vec<DiffLine>,
     pub hunk_starts: Vec<usize>,
+    /// Parallel to `hunk_starts`: true when the hunk is staged. Empty for
+    /// non-Files diffs (commits, stash, …), where everything is unstaged.
+    pub hunk_staged: Vec<bool>,
     pub filename: String,
     pub old_content: String,
     pub new_content: String,
@@ -314,6 +320,10 @@ pub struct DiffViewState {
     pub view_layout: DiffViewLayout,
     /// Whether long lines are wrapped to fit the panel width.
     pub wrap: bool,
+    /// Last unified content width used for wrap/scroll accounting.
+    /// Updated on each render so scroll helpers can compute visual rows
+    /// without a live layout.
+    pub last_content_width: usize,
     /// Whether the currently viewed file exists in the working tree on disk.
     pub file_exists_on_disk: bool,
     /// Hunk line number offsets for unified diffs. Each entry is
@@ -335,8 +345,6 @@ pub struct DiffViewState {
     pub block_mode_active: bool,
     /// Currently selected revert-button hunk index (for keyboard cycling).
     pub selected_revert_hunk: Option<usize>,
-    /// Hunk index that was just staged from block mode and should get transient feedback.
-    staged_feedback_hunk: Option<usize>,
     /// Hunk index currently under the mouse cursor (for tooltip rendering).
     pub hovered_revert_hunk: Option<usize>,
     /// Pre-revert file snapshots, most-recent last. Bounded by
@@ -356,6 +364,7 @@ impl Default for DiffViewState {
             horizontal_scroll: 0,
             lines: Vec::new(),
             hunk_starts: Vec::new(),
+            hunk_staged: Vec::new(),
             filename: String::new(),
             old_content: String::new(),
             new_content: String::new(),
@@ -366,6 +375,7 @@ impl Default for DiffViewState {
             side_view: DiffSideView::Both,
             view_layout: DiffViewLayout::SideBySide,
             wrap: false,
+            last_content_width: 0,
             file_exists_on_disk: false,
             hunk_line_offsets: Vec::new(),
             search_active: false,
@@ -375,7 +385,6 @@ impl Default for DiffViewState {
             search_textarea: None,
             block_mode_active: false,
             selected_revert_hunk: None,
-            staged_feedback_hunk: None,
             hovered_revert_hunk: None,
             revert_undo_stack: Vec::new(),
             revert_undo_high_water: 0,
@@ -404,7 +413,18 @@ impl DiffViewState {
     }
 
     pub fn toggle_view_layout(&mut self) {
-        self.view_layout = self.view_layout.toggled();
+        // Convert scroll between DiffLine-index (split) and visual-row (unified)
+        // so the same content stays near the top after toggling.
+        let width = self.last_content_width.max(1);
+        if self.view_layout == DiffViewLayout::SideBySide {
+            let line = self.scroll_offset.min(self.lines.len().saturating_sub(1));
+            self.view_layout = DiffViewLayout::Unified;
+            self.scroll_offset = self.unified_visual_row_for_line(line, width);
+        } else {
+            let line = self.current_scroll_line();
+            self.view_layout = DiffViewLayout::SideBySide;
+            self.scroll_offset = line;
+        }
         self.horizontal_scroll = 0;
         self.selection = None;
     }
@@ -440,6 +460,127 @@ impl DiffViewState {
             }
         }
         &self.filename
+    }
+
+    /// True when this diff contains per-file separator lines (multi-file diff).
+    pub fn has_file_headers(&self) -> bool {
+        self.lines.iter().any(|l| l.file_header.is_some())
+    }
+
+    fn header_idx_at_or_before(&self, line_idx: usize) -> Option<usize> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let clamped = line_idx.min(self.lines.len().saturating_sub(1));
+        for i in (0..=clamped).rev() {
+            if self
+                .lines
+                .get(i)
+                .and_then(|l| l.file_header.as_ref())
+                .is_some()
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Sticky header for a given DiffLine index.
+    /// Returns `(header_line_idx, header_text)` when `line_idx` is content
+    /// scrolled past its file header (so the header is no longer visible).
+    /// Returns `None` when the top row already is a header or when this
+    /// is a single-file diff with no separators.
+    pub fn sticky_header_for_line(&self, line_idx: usize) -> Option<(usize, &str)> {
+        if !self.has_file_headers() {
+            return None;
+        }
+        let line = self.lines.get(line_idx)?;
+        if line.file_header.is_some() {
+            return None;
+        }
+        let h_idx = self.header_idx_at_or_before(line_idx)?;
+        let header = self.lines.get(h_idx)?.file_header.as_ref()?;
+        Some((h_idx, header.as_str()))
+    }
+
+    fn sticky_for_unified_with_width(&self, content_width: usize) -> Option<(usize, &str)> {
+        let w = content_width.max(1);
+        let (line_idx, _, _) = self.unified_line_at_visual_row(self.scroll_offset, w)?;
+        self.sticky_header_for_line(line_idx)
+    }
+
+    /// Header text to pin to the first row of the viewport, if any.
+    /// Split layouts use `scroll_offset` directly; unified maps the visual
+    /// scroll row back to a DiffLine first.
+    pub fn sticky_file_header(&self) -> Option<&str> {
+        if self.view_layout == DiffViewLayout::Unified {
+            let w = self.last_content_width.max(1);
+            self.sticky_for_unified_with_width(w).map(|(_, h)| h)
+        } else {
+            self.sticky_header_for_line(self.scroll_offset)
+                .map(|(_, h)| h)
+        }
+    }
+
+    /// DiffLine index of the header currently pinned by [`Self::sticky_file_header`].
+    pub fn sticky_header_line_idx(&self) -> Option<usize> {
+        if self.view_layout == DiffViewLayout::Unified {
+            let w = self.last_content_width.max(1);
+            self.sticky_for_unified_with_width(w).map(|(idx, _)| idx)
+        } else {
+            self.sticky_header_for_line(self.scroll_offset)
+                .map(|(idx, _)| idx)
+        }
+    }
+
+    /// True when `row` is the pinned sticky header row for this layout.
+    /// Used to skip highlight/selection work on the pinned row and to
+    /// adjust row -> line mapping for the reserved top row.
+    pub fn is_sticky_row(&self, row: u16, layout: &DiffPanelLayout) -> bool {
+        if row != layout.inner_y {
+            return false;
+        }
+        if self.view_layout == DiffViewLayout::Unified {
+            let content_width = layout
+                .new_content_end_x
+                .saturating_sub(layout.new_content_x) as usize;
+            self.sticky_for_unified_with_width(content_width.max(1))
+                .is_some()
+        } else {
+            self.sticky_header_for_line(self.scroll_offset).is_some()
+        }
+    }
+
+    /// Best-effort DiffLine index for a terminal row when hit-testing fails
+    /// (past end of diff). Mirrors [`Self::line_chunk_at_row`] including the
+    /// reserved sticky row so callers don't drift by one.
+    pub fn fallback_line_idx_for_row(&self, row: u16, layout: &DiffPanelLayout) -> usize {
+        if row < layout.inner_y {
+            return 0;
+        }
+        let raw_off = (row - layout.inner_y) as usize;
+        if self.view_layout == DiffViewLayout::Unified {
+            let content_width = layout
+                .new_content_end_x
+                .saturating_sub(layout.new_content_x) as usize;
+            let sticky = self
+                .sticky_for_unified_with_width(content_width.max(1))
+                .is_some();
+            let adj = raw_off.saturating_sub(if sticky { 1 } else { 0 });
+            // Map the adjusted visual offset precisely instead of guessing.
+            if let Some((line_idx, _, _)) =
+                self.unified_line_chunk_panel_from(self.scroll_offset, adj, content_width.max(1))
+            {
+                return line_idx;
+            }
+            return self.lines.len();
+        }
+        let sticky = self.sticky_header_for_line(self.scroll_offset).is_some();
+        let adj = raw_off.saturating_sub(if sticky { 1 } else { 0 });
+        if sticky && raw_off == 0 {
+            return self.sticky_header_line_idx().unwrap_or(self.scroll_offset);
+        }
+        self.scroll_offset.saturating_add(adj)
     }
 
     /// Activate search mode with an empty query.
@@ -540,10 +681,10 @@ impl DiffViewState {
     /// Scroll so the current search match is visible.
     pub fn scroll_to_current_match(&mut self) {
         if let Some(m) = self.search_matches.get(self.search_match_idx) {
-            let line = m.line_idx;
-            // Scroll so the match line is visible (roughly centered)
-            if line < self.scroll_offset || line >= self.scroll_offset + 20 {
-                self.scroll_offset = line.saturating_sub(5);
+            let target = self.scroll_target_for_line(m.line_idx);
+            // Scroll so the match line is visible (roughly centered).
+            if target < self.scroll_offset || target >= self.scroll_offset + 20 {
+                self.scroll_offset = target.saturating_sub(5);
             }
         }
     }
@@ -568,6 +709,7 @@ impl DiffViewState {
             new_content: new.to_string(),
             lines,
             hunk_starts,
+            hunk_staged: Vec::new(),
             hunk_line_offsets: Vec::new(),
             sections,
             file_exists_on_disk,
@@ -612,6 +754,130 @@ impl DiffViewState {
         parsed
     }
 
+    /// Parse a `git diff HEAD` buffer for a file that has both staged and
+    /// unstaged changes, classifying each hunk via `unstaged_diff`.
+    ///
+    /// True single buffer: one coherent set of line numbers, no separator,
+    /// no duplicated context. Both diffs share worktree (new-side)
+    /// numbering, so a HEAD hunk overlapping no unstaged hunk is fully
+    /// staged; anything touching unstaged work counts as unstaged.
+    pub fn parse_head_with_staged(
+        filename: &str,
+        head_diff: &str,
+        unstaged_diff: &str,
+        tab_width: usize,
+        file_exists_on_disk: bool,
+    ) -> ParsedDiff {
+        let mut parsed =
+            Self::parse_diff_output(filename, head_diff, tab_width, file_exists_on_disk);
+        parsed.hunk_staged = head_block_staged_flags(head_diff, unstaged_diff, tab_width);
+        if parsed.hunk_staged.len() != parsed.hunk_starts.len() {
+            parsed.hunk_staged = vec![false; parsed.hunk_starts.len()];
+        }
+        parsed
+    }
+
+    /// File-relative (old, new) line spans for every visual change block of
+    /// a raw unified diff. Used to map a hunk the user acts on in the HEAD
+    /// buffer onto the matching block(s) of the staged/unstaged diff that
+    /// patch slicing consumes.
+    pub fn block_spans_for_diff(diff_text: &str, tab_width: usize) -> Vec<BlockSpan> {
+        let lines = diff_lines_from_unified_or_rename_only(diff_text, tab_width);
+        let hunks = parse_hunk_headers(diff_text);
+        let file_header_count = lines.iter().take_while(|l| l.file_header.is_some()).count();
+        let offsets = build_hunk_line_offsets(&hunks, &lines, file_header_count);
+        Self::block_spans(&lines, &offsets)
+    }
+
+    /// File-relative spans for visual change blocks from already-parsed
+    /// lines. `old`/`new` are `None` for pure insertions/deletions; the
+    /// `*_point` gap positions still allow matching those blocks across
+    /// diffs that share a side (worktree for unstaged, HEAD for staged).
+    pub fn block_spans(
+        lines: &[DiffLine],
+        hunk_line_offsets: &[(usize, usize, usize)],
+    ) -> Vec<BlockSpan> {
+        let offsets_at = |idx: usize| {
+            let mut offsets = (0usize, 0usize);
+            for &(start_idx, old_off, new_off) in hunk_line_offsets {
+                if start_idx <= idx {
+                    offsets = (old_off, new_off);
+                } else {
+                    break;
+                }
+            }
+            offsets
+        };
+        let file_num = |idx: usize, new_side: bool| -> Option<usize> {
+            let (old_off, new_off) = offsets_at(idx);
+            let line = lines.get(idx)?;
+            if new_side {
+                line.new_line.as_ref().map(|(n, _)| *n + new_off)
+            } else {
+                line.old_line.as_ref().map(|(n, _)| *n + old_off)
+            }
+        };
+
+        let mut spans = Vec::new();
+        let mut start = 0usize;
+        while start < lines.len() {
+            if lines[start].file_header.is_some()
+                || matches!(lines[start].change_type, ChangeType::Equal)
+            {
+                start += 1;
+                continue;
+            }
+            let mut end = start;
+            while end < lines.len()
+                && lines[end].file_header.is_none()
+                && !matches!(lines[end].change_type, ChangeType::Equal)
+            {
+                end += 1;
+            }
+            let mut old_range: Option<(usize, usize)> = None;
+            let mut new_range: Option<(usize, usize)> = None;
+            for idx in start..end {
+                let line = &lines[idx];
+                if matches!(line.change_type, ChangeType::Delete | ChangeType::Modified) {
+                    if let Some(n) = file_num(idx, false) {
+                        old_range = Some(match old_range {
+                            None => (n, n),
+                            Some((lo, hi)) => (lo.min(n), hi.max(n)),
+                        });
+                    }
+                }
+                if matches!(line.change_type, ChangeType::Insert | ChangeType::Modified) {
+                    if let Some(n) = file_num(idx, true) {
+                        new_range = Some(match new_range {
+                            None => (n, n),
+                            Some((lo, hi)) => (lo.min(n), hi.max(n)),
+                        });
+                    }
+                }
+            }
+            let gap_point = |new_side: bool| -> usize {
+                for idx in (0..start).rev() {
+                    if let Some(n) = file_num(idx, new_side) {
+                        return n + 1;
+                    }
+                }
+                0
+            };
+            spans.push(BlockSpan {
+                old: old_range,
+                new: new_range,
+                old_point: old_range
+                    .map(|(lo, _)| lo)
+                    .unwrap_or_else(|| gap_point(false)),
+                new_point: new_range
+                    .map(|(lo, _)| lo)
+                    .unwrap_or_else(|| gap_point(true)),
+            });
+            start = end;
+        }
+        spans
+    }
+
     /// Parse raw diff output into a ParsedDiff on any thread (no &self needed).
     pub fn parse_diff_output(
         filename: &str,
@@ -640,6 +906,7 @@ impl DiffViewState {
                 old_content: old,
                 new_content: new,
                 lines,
+                hunk_staged: Vec::new(),
                 hunk_starts,
                 hunk_line_offsets,
                 sections,
@@ -664,6 +931,7 @@ impl DiffViewState {
                     old_segments: None,
                     new_segments: None,
                     file_header: Some((*file_name).clone()),
+                    preview_placeholder: None,
                     section_index: section_idx,
                 });
 
@@ -691,6 +959,7 @@ impl DiffViewState {
                 old_content: String::new(),
                 new_content: String::new(),
                 lines,
+                hunk_staged: Vec::new(),
                 hunk_starts,
                 hunk_line_offsets,
                 sections,
@@ -711,10 +980,10 @@ impl DiffViewState {
         self.new_content = parsed.new_content;
         self.lines = parsed.lines;
         self.hunk_starts = parsed.hunk_starts;
+        self.hunk_staged = parsed.hunk_staged;
         self.hunk_line_offsets = parsed.hunk_line_offsets;
         self.sections = parsed.sections;
         self.file_exists_on_disk = parsed.file_exists_on_disk;
-        self.clear_staged_hunk_feedback();
         self.selected_revert_hunk = if same_file {
             prev_selected_revert_hunk.filter(|&i| i < self.hunk_starts.len())
         } else {
@@ -726,7 +995,7 @@ impl DiffViewState {
             None
         };
         if same_file {
-            let max = self.lines.len().saturating_sub(1);
+            let max = self.max_scroll();
             self.scroll_offset = self.scroll_offset.min(max);
         } else {
             self.scroll_offset = 0;
@@ -748,11 +1017,11 @@ impl DiffViewState {
         self.new_content = new.to_string();
         self.lines = super::diff_algo::compute_side_by_side(old, new, self.tab_width);
         self.hunk_starts = super::diff_algo::find_hunk_starts(&self.lines);
+        self.hunk_staged.clear();
         self.hunk_line_offsets = Vec::new(); // Full content — no offsets needed
-        self.clear_staged_hunk_feedback();
         if same_file {
             // Clamp scroll in case the diff got shorter
-            let max = self.lines.len().saturating_sub(1);
+            let max = self.max_scroll();
             self.scroll_offset = self.scroll_offset.min(max);
         } else {
             self.scroll_offset = 0;
@@ -800,6 +1069,7 @@ impl DiffViewState {
             self.new_content = new.clone();
             self.lines = diff_lines_from_unified_or_rename_only(diff_output, self.tab_width);
             self.hunk_starts = super::diff_algo::find_hunk_starts(&self.lines);
+            self.hunk_staged.clear();
             let hunks = parse_hunk_headers(diff_output);
             self.hunk_line_offsets = build_hunk_line_offsets(&hunks, &self.lines, 0);
             self.sections = vec![FileSection {
@@ -807,7 +1077,7 @@ impl DiffViewState {
                 new_highlighter: FileHighlighter::new(&new, actual_name),
             }];
             if same_file {
-                let max = self.lines.len().saturating_sub(1);
+                let max = self.max_scroll();
                 self.scroll_offset = self.scroll_offset.min(max);
             } else {
                 self.scroll_offset = 0;
@@ -855,6 +1125,7 @@ impl DiffViewState {
                     old_segments: None,
                     new_segments: None,
                     file_header: Some((*file_name).clone()),
+                    preview_placeholder: None,
                     section_index: section_idx,
                 });
 
@@ -878,6 +1149,7 @@ impl DiffViewState {
 
             self.sections = build_file_sections_parallel(&section_meta);
             self.hunk_starts = super::diff_algo::find_hunk_starts(&self.lines);
+            self.hunk_staged.clear();
             self.selected_revert_hunk = if same_file {
                 self.selected_revert_hunk
                     .filter(|&i| i < self.hunk_starts.len())
@@ -892,7 +1164,7 @@ impl DiffViewState {
             };
 
             if same_file {
-                let max = self.lines.len().saturating_sub(1);
+                let max = self.max_scroll();
                 self.scroll_offset = self.scroll_offset.min(max);
             }
         }
@@ -903,7 +1175,7 @@ impl DiffViewState {
     }
 
     pub fn scroll_down(&mut self, amount: usize) {
-        let max = self.lines.len().saturating_sub(1);
+        let max = self.max_scroll();
         self.scroll_offset = (self.scroll_offset + amount).min(max);
     }
 
@@ -915,124 +1187,166 @@ impl DiffViewState {
         self.horizontal_scroll += amount;
     }
 
-    pub fn next_hunk(&mut self) {
-        if let Some(next) = self.hunk_starts.iter().find(|&&h| h > self.scroll_offset) {
-            self.scroll_offset = *next;
-        }
+    /// Max scroll offset (last visual/DiffLine row can reach the top).
+    pub fn max_scroll(&self) -> usize {
+        self.total_scroll_rows().saturating_sub(1)
     }
 
-    pub fn prev_hunk(&mut self) {
-        if let Some(prev) = self
-            .hunk_starts
-            .iter()
-            .rev()
-            .find(|&&h| h < self.scroll_offset)
-        {
-            self.scroll_offset = *prev;
-        }
-    }
-
-    /// Return the one-based hunk at the current viewport position and the
-    /// total number of hunks. Context before the first hunk is considered part
-    /// of the first hunk so the indicator starts at `1/N`.
-    pub fn hunk_position(&self) -> Option<(usize, usize)> {
-        let total = self.hunk_starts.len();
-        if total == 0 {
-            return None;
-        }
-
-        let current = self
-            .hunk_starts
-            .partition_point(|&start| start <= self.scroll_offset)
-            .max(1);
-        Some((current, total))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// Map a terminal row within the diff panel inner area to `(line_idx, chunk_idx)`.
-    /// `chunk_idx` is the wrapped-chunk position within the line (0 = first visual
-    /// row). Always 0 when wrapping is off.
-    pub fn line_chunk_at_row(&self, row: u16, layout: &DiffPanelLayout) -> Option<(usize, usize)> {
-        if row < layout.inner_y || row >= layout.inner_end_y {
-            return None;
-        }
-        let target_off = (row - layout.inner_y) as usize;
-
+    /// Total scrollable rows for the active layout.
+    /// Unified uses the flattened delete-then-insert visual stream.
+    fn total_scroll_rows(&self) -> usize {
         if self.view_layout == DiffViewLayout::Unified {
-            let content_width = layout
-                .new_content_end_x
-                .saturating_sub(layout.new_content_x) as usize;
-            return self
-                .unified_line_chunk_panel_at_offset(target_off, content_width)
-                .map(|(line_idx, chunk_idx, _)| (line_idx, chunk_idx));
+            self.unified_total_visual_rows(self.last_content_width.max(1))
+        } else {
+            self.lines.len()
         }
+    }
 
-        if !self.wrap {
-            let idx = self.scroll_offset + target_off;
-            return if idx < self.lines.len() {
-                Some((idx, 0))
-            } else {
-                None
-            };
+    /// DiffLine index currently at the top of the viewport.
+    fn current_scroll_line(&self) -> usize {
+        if self.view_layout == DiffViewLayout::Unified {
+            self.unified_line_at_visual_row(self.scroll_offset, self.last_content_width.max(1))
+                .map(|(line_idx, _, _)| line_idx)
+                .unwrap_or(0)
+        } else {
+            self.scroll_offset
         }
+    }
 
-        let panel_width = layout
-            .old_content_end_x
-            .saturating_sub(layout.old_content_x) as usize;
-        let right_content_width = layout
-            .new_content_end_x
-            .saturating_sub(layout.new_content_x) as usize;
+    /// Scroll offset that puts `line_idx` at the top of the viewport.
+    fn scroll_target_for_line(&self, line_idx: usize) -> usize {
+        if self.view_layout == DiffViewLayout::Unified {
+            self.unified_visual_row_for_line(line_idx, self.last_content_width.max(1))
+        } else {
+            line_idx
+        }
+    }
 
-        let mut acc = 0usize;
-        for (offset, diff_line) in self.lines[self.scroll_offset..].iter().enumerate() {
-            let line_idx = self.scroll_offset + offset;
-            let num_rows = line_visual_height(diff_line, panel_width, right_content_width);
-            if target_off < acc + num_rows {
-                return Some((line_idx, target_off - acc));
+    /// Visual row where `line_idx` begins in the unified stream.
+    fn unified_visual_row_for_line(&self, line_idx: usize, content_width: usize) -> usize {
+        let mut row = 0usize;
+        let mut idx = 0usize;
+        while idx < self.lines.len() {
+            if idx == line_idx {
+                return row;
             }
-            acc += num_rows;
+            let diff_line = &self.lines[idx];
+            if !is_unified_change_line(diff_line) {
+                row += unified_line_visual_height(diff_line, content_width, self);
+                idx += 1;
+                continue;
+            }
+            let block_end = next_unified_change_block_end(&self.lines, idx);
+            if line_idx < block_end {
+                // Target is inside this reordered block: all deletes first,
+                // then all inserts. A DiffLine's "start" is its first visible
+                // contribution (delete for Modified/Delete, insert for Insert).
+                if self.side_view != DiffSideView::NewOnly {
+                    for i in idx..block_end {
+                        let line = &self.lines[i];
+                        if !matches!(line.change_type, ChangeType::Delete | ChangeType::Modified) {
+                            continue;
+                        }
+                        if i == line_idx {
+                            return row;
+                        }
+                        row += unified_line_row_count(&line.old_line, content_width, self);
+                    }
+                }
+                if self.side_view != DiffSideView::OldOnly {
+                    for i in idx..block_end {
+                        let line = &self.lines[i];
+                        if !matches!(line.change_type, ChangeType::Insert | ChangeType::Modified) {
+                            continue;
+                        }
+                        if i == line_idx {
+                            // Modified already returned above on its delete row.
+                            // Insert-only lands here.
+                            return row;
+                        }
+                        row += unified_line_row_count(&line.new_line, content_width, self);
+                    }
+                }
+                return row;
+            }
+            row += self.unified_block_visual_rows(idx, block_end, content_width);
+            idx = block_end;
         }
-        None
+        row
     }
 
-    /// Map a terminal row to a diff line and the side whose content is rendered
-    /// on that visual row. In unified mode, modified lines render old chunks
-    /// followed by new chunks, so the panel cannot be inferred from X alone.
-    pub fn line_chunk_panel_at_row(
+    /// Map a unified visual row to `(line_idx, chunk_idx, panel)`.
+    fn unified_line_at_visual_row(
         &self,
-        row: u16,
-        layout: &DiffPanelLayout,
-        fallback_panel: DiffPanel,
+        visual_row: usize,
+        content_width: usize,
     ) -> Option<(usize, usize, DiffPanel)> {
-        let (line_idx, chunk_idx) = self.line_chunk_at_row(row, layout)?;
-        if self.view_layout != DiffViewLayout::Unified {
-            return Some((line_idx, chunk_idx, fallback_panel));
-        }
-
-        let content_width = layout
-            .new_content_end_x
-            .saturating_sub(layout.new_content_x) as usize;
-        self.unified_line_chunk_panel_at_offset((row - layout.inner_y) as usize, content_width)
+        self.unified_line_chunk_panel_from(0, visual_row, content_width)
     }
 
-    fn unified_line_chunk_panel_at_offset(
+    fn unified_total_visual_rows(&self, content_width: usize) -> usize {
+        let mut row = 0usize;
+        let mut idx = 0usize;
+        while idx < self.lines.len() {
+            let diff_line = &self.lines[idx];
+            if !is_unified_change_line(diff_line) {
+                row += unified_line_visual_height(diff_line, content_width, self);
+                idx += 1;
+                continue;
+            }
+            let block_end = next_unified_change_block_end(&self.lines, idx);
+            row += self.unified_block_visual_rows(idx, block_end, content_width);
+            idx = block_end;
+        }
+        row
+    }
+
+    fn unified_block_visual_rows(
         &self,
+        block_start: usize,
+        block_end: usize,
+        content_width: usize,
+    ) -> usize {
+        let mut rows = 0usize;
+        if self.side_view != DiffSideView::NewOnly {
+            for idx in block_start..block_end {
+                let line = &self.lines[idx];
+                if matches!(line.change_type, ChangeType::Delete | ChangeType::Modified) {
+                    rows += unified_line_row_count(&line.old_line, content_width, self);
+                }
+            }
+        }
+        if self.side_view != DiffSideView::OldOnly {
+            for idx in block_start..block_end {
+                let line = &self.lines[idx];
+                if matches!(line.change_type, ChangeType::Insert | ChangeType::Modified) {
+                    rows += unified_line_row_count(&line.new_line, content_width, self);
+                }
+            }
+        }
+        rows
+    }
+
+    /// Like `unified_line_chunk_panel_at_offset`, but starting from absolute
+    /// visual row `start_visual` (0 = top of file) and seeking `target_off`
+    /// rows past that.
+    fn unified_line_chunk_panel_from(
+        &self,
+        start_visual: usize,
         target_off: usize,
         content_width: usize,
     ) -> Option<(usize, usize, DiffPanel)> {
+        let target = start_visual + target_off;
         let mut acc = 0usize;
-        let mut line_idx = self.scroll_offset;
+        let mut line_idx = 0usize;
 
         while line_idx < self.lines.len() {
             let diff_line = &self.lines[line_idx];
 
             if !is_unified_change_line(diff_line) {
                 let num_rows = unified_line_visual_height(diff_line, content_width, self);
-                if target_off < acc + num_rows {
-                    return Some((line_idx, target_off - acc, DiffPanel::New));
+                if target < acc + num_rows {
+                    return Some((line_idx, target - acc, DiffPanel::New));
                 }
                 acc += num_rows;
                 line_idx += 1;
@@ -1048,8 +1362,8 @@ impl DiffViewState {
                         continue;
                     }
                     let num_rows = unified_line_row_count(&line.old_line, content_width, self);
-                    if target_off < acc + num_rows {
-                        return Some((idx, target_off - acc, DiffPanel::Old));
+                    if target < acc + num_rows {
+                        return Some((idx, target - acc, DiffPanel::Old));
                     }
                     acc += num_rows;
                 }
@@ -1062,8 +1376,8 @@ impl DiffViewState {
                         continue;
                     }
                     let num_rows = unified_line_row_count(&line.new_line, content_width, self);
-                    if target_off < acc + num_rows {
-                        let local_chunk_idx = target_off - acc;
+                    if target < acc + num_rows {
+                        let local_chunk_idx = target - acc;
                         let chunk_idx = if matches!(line.change_type, ChangeType::Modified)
                             && self.side_view != DiffSideView::NewOnly
                         {
@@ -1084,6 +1398,191 @@ impl DiffViewState {
         None
     }
 
+    pub fn next_hunk(&mut self) {
+        if self.hunk_starts.is_empty() {
+            return;
+        }
+        let current_line = self.current_scroll_line();
+        if let Some(next) = self.hunk_starts.iter().find(|&&h| h > current_line) {
+            self.scroll_offset = self.scroll_target_for_line(*next);
+        } else if let Some(&first) = self.hunk_starts.first() {
+            // Wrap past the last hunk to the first so { / } always cycles.
+            self.scroll_offset = self.scroll_target_for_line(first);
+        }
+    }
+
+    pub fn prev_hunk(&mut self) {
+        if self.hunk_starts.is_empty() {
+            return;
+        }
+        let current_line = self.current_scroll_line();
+        if let Some(prev) = self.hunk_starts.iter().rev().find(|&&h| h < current_line) {
+            self.scroll_offset = self.scroll_target_for_line(*prev);
+        } else if let Some(&last) = self.hunk_starts.last() {
+            // Wrap before the first hunk to the last so { / } always cycles.
+            self.scroll_offset = self.scroll_target_for_line(last);
+        }
+    }
+
+    /// Return the one-based hunk at the current viewport position and the
+    /// total number of hunks. Context before the first hunk is considered part
+    /// of the first hunk so the indicator starts at `1/N`.
+    pub fn hunk_position(&self) -> Option<(usize, usize)> {
+        let total = self.hunk_starts.len();
+        if total == 0 {
+            return None;
+        }
+
+        let current = self
+            .hunk_starts
+            .partition_point(|&start| start <= self.current_scroll_line())
+            .max(1);
+        Some((current, total))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Map a terminal row within the diff panel inner area to `(line_idx, chunk_idx)`.
+    /// `chunk_idx` is the wrapped-chunk position within the line (0 = first visual
+    /// row). Always 0 when wrapping is off.
+    pub fn line_chunk_at_row(&self, row: u16, layout: &DiffPanelLayout) -> Option<(usize, usize)> {
+        if row < layout.inner_y || row >= layout.inner_end_y {
+            return None;
+        }
+
+        if self.view_layout == DiffViewLayout::Unified {
+            let content_width = layout
+                .new_content_end_x
+                .saturating_sub(layout.new_content_x) as usize;
+            if let Some((h_idx, _)) = self.sticky_for_unified_with_width(content_width.max(1)) {
+                if row == layout.inner_y {
+                    return Some((h_idx, 0));
+                }
+                let target_off = (row - layout.inner_y - 1) as usize;
+                return self
+                    .unified_line_chunk_panel_at_offset(target_off, content_width)
+                    .map(|(line_idx, chunk_idx, _)| (line_idx, chunk_idx));
+            }
+            let target_off = (row - layout.inner_y) as usize;
+            return self
+                .unified_line_chunk_panel_at_offset(target_off, content_width)
+                .map(|(line_idx, chunk_idx, _)| (line_idx, chunk_idx));
+        }
+
+        // Split layouts: the first row may be a pinned sticky header.
+        if let Some((h_idx, _)) = self.sticky_header_for_line(self.scroll_offset) {
+            if row == layout.inner_y {
+                return Some((h_idx, 0));
+            }
+            let target_off = (row - layout.inner_y - 1) as usize;
+            if !self.wrap {
+                let idx = self.scroll_offset + target_off;
+                return if idx < self.lines.len() {
+                    Some((idx, 0))
+                } else {
+                    None
+                };
+            }
+            let panel_width = layout
+                .old_content_end_x
+                .saturating_sub(layout.old_content_x) as usize;
+            let right_content_width = layout
+                .new_content_end_x
+                .saturating_sub(layout.new_content_x)
+                as usize;
+            let mut acc = 0usize;
+            // Guard when scroll_offset is past the end (e.g. transient reload).
+            if self.scroll_offset >= self.lines.len() {
+                return None;
+            }
+            for (offset, diff_line) in self.lines[self.scroll_offset..].iter().enumerate() {
+                let line_idx = self.scroll_offset + offset;
+                let num_rows = line_visual_height(diff_line, panel_width, right_content_width);
+                if target_off < acc + num_rows {
+                    return Some((line_idx, target_off - acc));
+                }
+                acc += num_rows;
+            }
+            return None;
+        }
+
+        let target_off = (row - layout.inner_y) as usize;
+        if !self.wrap {
+            let idx = self.scroll_offset + target_off;
+            return if idx < self.lines.len() {
+                Some((idx, 0))
+            } else {
+                None
+            };
+        }
+
+        let panel_width = layout
+            .old_content_end_x
+            .saturating_sub(layout.old_content_x) as usize;
+        let right_content_width = layout
+            .new_content_end_x
+            .saturating_sub(layout.new_content_x) as usize;
+
+        let mut acc = 0usize;
+        if self.scroll_offset >= self.lines.len() {
+            return None;
+        }
+        for (offset, diff_line) in self.lines[self.scroll_offset..].iter().enumerate() {
+            let line_idx = self.scroll_offset + offset;
+            let num_rows = line_visual_height(diff_line, panel_width, right_content_width);
+            if target_off < acc + num_rows {
+                return Some((line_idx, target_off - acc));
+            }
+            acc += num_rows;
+        }
+        None
+    }
+
+    /// Map a terminal row to a diff line and the side whose content is rendered
+    /// on that visual row. In unified mode, modified lines render old chunks
+    /// followed by new chunks, so the panel cannot be inferred from X alone.
+    pub fn line_chunk_panel_at_row(
+        &self,
+        row: u16,
+        layout: &DiffPanelLayout,
+        fallback_panel: DiffPanel,
+    ) -> Option<(usize, usize, DiffPanel)> {
+        if row < layout.inner_y || row >= layout.inner_end_y {
+            return None;
+        }
+        if self.view_layout == DiffViewLayout::Unified {
+            let content_width = layout
+                .new_content_end_x
+                .saturating_sub(layout.new_content_x) as usize;
+            if self
+                .sticky_for_unified_with_width(content_width.max(1))
+                .is_some()
+            {
+                if row == layout.inner_y {
+                    let (h_idx, _) = self.sticky_for_unified_with_width(content_width.max(1))?;
+                    return Some((h_idx, 0, fallback_panel));
+                }
+                let adj = (row - layout.inner_y - 1) as usize;
+                return self.unified_line_chunk_panel_at_offset(adj, content_width);
+            }
+            let off = (row - layout.inner_y) as usize;
+            return self.unified_line_chunk_panel_at_offset(off, content_width);
+        }
+        let (line_idx, chunk_idx) = self.line_chunk_at_row(row, layout)?;
+        Some((line_idx, chunk_idx, fallback_panel))
+    }
+
+    fn unified_line_chunk_panel_at_offset(
+        &self,
+        target_off: usize,
+        content_width: usize,
+    ) -> Option<(usize, usize, DiffPanel)> {
+        // `scroll_offset` is a visual-row index in unified layout.
+        self.unified_line_chunk_panel_from(self.scroll_offset, target_off, content_width)
+    }
+
     /// Return true when the given line index is the first line of a diff hunk.
     pub fn is_hunk_start_line(&self, line_idx: usize) -> bool {
         self.hunk_starts.binary_search(&line_idx).is_ok()
@@ -1094,66 +1593,47 @@ impl DiffViewState {
         self.hunk_starts.binary_search(&line_idx).ok()
     }
 
-    /// For the visual hunk at `block_idx`, return the (old, new) line-number
-    /// ranges (inclusive) the block covers in the underlying file. Either
-    /// side may be `None` when the block is a pure insertion (no `-` lines)
-    /// or pure deletion (no `+` lines). Used to slice a sub-patch out of the
-    /// raw unified diff so revert affects only this visual block, not the
-    /// surrounding `@@` hunk that may contain other change blocks.
-    pub fn visual_block_line_ranges(
-        &self,
-        block_idx: usize,
-    ) -> Option<(Option<(usize, usize)>, Option<(usize, usize)>)> {
-        let start = *self.hunk_starts.get(block_idx)?;
-        let mut end = start;
-        while end < self.lines.len() && !matches!(self.lines[end].change_type, ChangeType::Equal) {
-            end += 1;
-        }
-        // DiffLine line numbers are content-relative (positions inside the
-        // concatenated old/new strings produced by parse_unified_diff), but
-        // the unified-diff walker we feed these ranges to tracks file-relative
-        // line numbers. `hunk_line_offsets` provides the per-`@@` deltas we
-        // need to bridge the two.
-        let (old_offset, new_offset) = self.line_number_offsets_at(start);
-        let mut old_range: Option<(usize, usize)> = None;
-        let mut new_range: Option<(usize, usize)> = None;
-        for line in &self.lines[start..end] {
-            if matches!(line.change_type, ChangeType::Delete | ChangeType::Modified) {
-                if let Some((n, _)) = &line.old_line {
-                    let n = *n + old_offset;
-                    old_range = Some(match old_range {
-                        None => (n, n),
-                        Some((lo, hi)) => (lo.min(n), hi.max(n)),
-                    });
-                }
-            }
-            if matches!(line.change_type, ChangeType::Insert | ChangeType::Modified) {
-                if let Some((n, _)) = &line.new_line {
-                    let n = *n + new_offset;
-                    new_range = Some(match new_range {
-                        None => (n, n),
-                        Some((lo, hi)) => (lo.min(n), hi.max(n)),
-                    });
-                }
-            }
-        }
-        Some((old_range, new_range))
+    /// True when hunk `hunk_idx` comes from the staged diff. Missing entries
+    /// (other contexts, legacy state) count as unstaged.
+    pub fn is_staged_hunk(&self, hunk_idx: usize) -> bool {
+        self.hunk_staged.get(hunk_idx).copied().unwrap_or(false)
     }
 
-    /// Find the `@@` hunk that owns the DiffLine at `line_idx` and return
-    /// its (old, new) content→file line-number offsets. Returns (0, 0) when
-    /// no hunk metadata is available (e.g. the `load(...)` raw-content path,
-    /// where content and file numbering already coincide).
-    fn line_number_offsets_at(&self, line_idx: usize) -> (usize, usize) {
-        let mut offsets = (0usize, 0usize);
-        for &(start_idx, old_off, new_off) in &self.hunk_line_offsets {
-            if start_idx <= line_idx {
-                offsets = (old_off, new_off);
-            } else {
-                break;
-            }
+    /// `(staged, unstaged)` hunk counts. Returns `None` when the view has
+    /// no staged/unstaged classification (commits, stash, …).
+    pub fn staged_counts(&self) -> Option<(usize, usize)> {
+        if self.hunk_staged.len() != self.hunk_starts.len() || self.hunk_starts.is_empty() {
+            return None;
         }
-        offsets
+        let staged = self.hunk_staged.iter().filter(|&&s| s).count();
+        Some((staged, self.hunk_starts.len() - staged))
+    }
+
+    /// Zero-based hunk index owning `line_idx`, or `None` for file headers
+    /// and context lines outside any change block.
+    pub fn hunk_index_for_line(&self, line_idx: usize) -> Option<usize> {
+        let line = self.lines.get(line_idx)?;
+        if line.file_header.is_some() || line.change_type == ChangeType::Equal {
+            return None;
+        }
+        let pos = self.hunk_starts.partition_point(|&start| start <= line_idx);
+        if pos == 0 {
+            return None;
+        }
+        Some(pos - 1)
+    }
+
+    /// True when `line_idx` sits in a staged hunk. Context/header lines
+    /// (no owning hunk) count as staged so their `Reset` backgrounds pass
+    /// through undimmed — as does every line when the view carries no
+    /// staged/unstaged classification (commits, stash, …).
+    pub fn is_staged_line(&self, line_idx: usize) -> bool {
+        if self.hunk_staged.len() != self.hunk_starts.len() {
+            return true;
+        }
+        self.hunk_index_for_line(line_idx)
+            .map(|i| self.is_staged_hunk(i))
+            .unwrap_or(true)
     }
 
     /// Enter modal change-block mode and select the nearest visible block.
@@ -1166,38 +1646,6 @@ impl DiffViewState {
     pub fn exit_block_mode(&mut self) {
         self.block_mode_active = false;
         self.selected_revert_hunk = None;
-        self.clear_staged_hunk_feedback();
-    }
-
-    /// Mark a hunk as just staged, giving the renderer a transient visual cue.
-    pub fn mark_hunk_staged_for_feedback(&mut self, hunk_idx: usize) {
-        self.staged_feedback_hunk = Some(hunk_idx);
-    }
-
-    pub fn is_hunk_staged_for_feedback(&self, hunk_idx: usize) -> bool {
-        self.staged_feedback_hunk == Some(hunk_idx)
-    }
-
-    pub fn is_line_staged_for_feedback(&self, line_idx: usize) -> bool {
-        let Some(hunk_idx) = self.hunk_index_containing_line(line_idx) else {
-            return false;
-        };
-        self.is_hunk_staged_for_feedback(hunk_idx)
-    }
-
-    fn hunk_index_containing_line(&self, line_idx: usize) -> Option<usize> {
-        if self.hunk_starts.is_empty() {
-            return None;
-        }
-        match self.hunk_starts.binary_search(&line_idx) {
-            Ok(idx) => Some(idx),
-            Err(0) => None,
-            Err(insert_idx) => Some(insert_idx - 1),
-        }
-    }
-
-    fn clear_staged_hunk_feedback(&mut self) {
-        self.staged_feedback_hunk = None;
     }
 
     /// Jump to the next hunk and select it as the revert target. Always
@@ -1214,11 +1662,11 @@ impl DiffViewState {
             None => self
                 .hunk_starts
                 .iter()
-                .position(|&h| h > self.scroll_offset)
+                .position(|&h| h > self.current_scroll_line())
                 .unwrap_or(0),
         };
         self.selected_revert_hunk = Some(next);
-        self.scroll_offset = self.hunk_starts[next];
+        self.scroll_offset = self.scroll_target_for_line(self.hunk_starts[next]);
     }
 
     /// Jump to the previous hunk and select it as the revert target.
@@ -1234,11 +1682,11 @@ impl DiffViewState {
             None => self
                 .hunk_starts
                 .iter()
-                .rposition(|&h| h < self.scroll_offset)
+                .rposition(|&h| h < self.current_scroll_line())
                 .unwrap_or(self.hunk_starts.len() - 1),
         };
         self.selected_revert_hunk = Some(prev);
-        self.scroll_offset = self.hunk_starts[prev];
+        self.scroll_offset = self.scroll_target_for_line(self.hunk_starts[prev]);
     }
 
     /// Get the highlighters for a given section index.
@@ -1252,12 +1700,34 @@ impl DiffViewState {
     }
 }
 
+/// Keep the rightmost `budget` columns of `text`, prefixed with `…` when
+/// truncated. Tail-preserving so `src/gui/mod.rs` still reads as `…i/mod.rs`.
+fn truncate_front_ellipsis(text: &str, budget: usize) -> String {
+    if Span::raw(text.to_string()).width() <= budget {
+        return text.to_string();
+    }
+    if budget == 0 {
+        return String::new();
+    }
+    let mut kept = String::new();
+    let mut width = 1; // the `…` prefix
+    for ch in text.chars().rev() {
+        let cw = Span::raw(ch.to_string()).width().max(1);
+        if width + cw > budget {
+            break;
+        }
+        kept.insert(0, ch);
+        width += cw;
+    }
+    format!("…{kept}")
+}
+
 /// Render a side-by-side diff view into the given area.
 /// Uses direct buffer writes instead of per-cell Paragraph widgets for performance.
 pub fn render_diff(
     frame: &mut Frame,
     area: Rect,
-    state: &DiffViewState,
+    state: &mut DiffViewState,
     theme: &Theme,
     focused: bool,
     diff_loading: bool,
@@ -1289,35 +1759,89 @@ pub fn render_diff(
         DiffSideView::NewOnly => " [new] ",
         DiffSideView::Both => "",
     };
+    // Conflict previews carry stage metadata; block mode shows its key hints.
     let title_suffix = state
         .title_suffix
         .as_ref()
         .map(|suffix| format!(" — {suffix}"))
         .unwrap_or_default();
     let mode_label = if state.block_mode_active {
-        if state.staged_feedback_hunk.is_some() {
-            "  BLOCK MODE: ✓ staged · j/k move · s stage · r revert · q/Esc exit"
-        } else {
-            "  BLOCK MODE: j/k move · s stage · r revert · q/Esc exit"
-        }
+        "  BLOCK MODE: j/k move · s stage/unstage · r revert · q/Esc exit"
     } else {
         ""
     };
-    let title = if side_label.is_empty() {
-        format!(" {}{}{} ", state.filename, title_suffix, mode_label)
-    } else {
-        format!(
-            " {}{}{}{} ",
-            state.filename, side_label, title_suffix, mode_label
-        )
+    // Single-list Files view: `README.md  2 Staged  0 Unstaged`, reusing
+    // the `MM` badge colors (staged green, unstaged yellow) so the two
+    // counts read as the same index/worktree split as the file list.
+    // Overflow: the right `[c/t]` hunk counter wins over the left title.
+    // Reserve its width first, then ellipsis-truncate the filename to fit;
+    // only drop the staged counts when even a stub filename won't fit.
+    let hunk_pos = state.hunk_position();
+    let right_width = hunk_pos
+        .map(|(c, t)| Line::from(format!(" [{c}/{t}] ")).width())
+        .unwrap_or(0);
+    let available = area.width.saturating_sub(2) as usize;
+    let left_budget = available.saturating_sub(right_width + 1);
+    let leading = " ";
+    let trailing = " ";
+    let fixed = leading.len()
+        + side_label.len()
+        + Span::raw(title_suffix.as_str()).width()
+        + Span::raw(mode_label).width()
+        + trailing.len();
+    let counts_width = match state.staged_counts() {
+        Some((s, u)) => format!(" {s} Staged").len() + format!(" {u} Unstaged").len(),
+        None => 0,
     };
+    // Minimum readable filename stub (`…a.rs`-sized) before counts give way.
+    const MIN_FILENAME: usize = 4;
+    let keep_counts = state.staged_counts().is_some()
+        && left_budget.saturating_sub(fixed + counts_width)
+            >= MIN_FILENAME.min(state.filename.len());
+    let active_counts_width = if keep_counts { counts_width } else { 0 };
+    let filename_budget = left_budget.saturating_sub(fixed + active_counts_width);
+    let mut filename = state.filename.clone();
+    if Span::raw(filename.clone()).width() > filename_budget {
+        filename = truncate_front_ellipsis(&filename, filename_budget);
+    }
+    let mut title_spans = vec![Span::raw(format!(
+        "{leading}{filename}{side_label}{title_suffix}"
+    ))];
+    if keep_counts {
+        if let Some((s, u)) = state.staged_counts() {
+            // Zero counts mute to dimmed so the nonzero side pops.
+            let staged_fg = if s == 0 {
+                theme.text_dimmed
+            } else {
+                theme.file_staged.fg.unwrap_or(theme.text_dimmed)
+            };
+            let unstaged_fg = if u == 0 {
+                theme.text_dimmed
+            } else {
+                theme.file_unstaged.fg.unwrap_or(theme.text_dimmed)
+            };
+            title_spans.push(Span::styled(
+                format!(" {s} Staged"),
+                Style::default().fg(staged_fg),
+            ));
+            title_spans.push(Span::styled(
+                format!(" {u} Unstaged"),
+                Style::default().fg(unstaged_fg),
+            ));
+        }
+    }
+    if !mode_label.is_empty() {
+        title_spans.push(Span::raw(mode_label));
+    }
+    title_spans.push(Span::raw(trailing.to_string()));
+    let title = Line::from(title_spans);
 
     let mut block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 
-    if let Some((current, total)) = state.hunk_position() {
+    if let Some((current, total)) = hunk_pos {
         block = block.title(
             Line::from(Span::styled(
                 format!(" [{current}/{total}] "),
@@ -1367,6 +1891,25 @@ pub fn render_diff(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Only a lone unavailable file fills the viewport. In multi-file buffers,
+    // the five placeholder rows below remain ordinary scrollable rows.
+    if state
+        .lines
+        .iter()
+        .all(|line| line.preview_placeholder.is_some())
+    {
+        let message = state
+            .lines
+            .iter()
+            .find_map(|line| {
+                line.preview_placeholder
+                    .filter(|message| !message.trim().is_empty())
+            })
+            .unwrap_or("");
+        render_preview_placeholder(frame.buffer_mut(), inner, message, theme);
+        return;
+    }
+
     if inner.width < 10 || inner.height < 2 {
         return;
     }
@@ -1404,17 +1947,36 @@ pub fn render_diff(
         let show_panel = single_side.unwrap_or(DiffPanel::New); // new-file defaults to New
         let content_width = inner.width.saturating_sub(gutter_width);
 
+        // Sticky file header: pin the current file's separator to the first
+        // row when scrolled past it in a multi-file diff.
+        let sticky = state.sticky_file_header().map(|s| s.to_string());
         let mut row = 0usize;
-        for (idx_offset, diff_line) in state.lines[state.scroll_offset..].iter().enumerate() {
+        if let Some(ref header) = sticky {
+            render_file_header(buf, inner.x, inner.y, inner.width, header, theme);
+            row = 1;
+        }
+        let start = state.scroll_offset.min(state.lines.len());
+        for (idx_offset, diff_line) in state.lines[start..].iter().enumerate() {
             if row >= visible_height {
                 break;
             }
-            let line_idx = state.scroll_offset + idx_offset;
+            let line_idx = start + idx_offset;
 
             // Handle file header separator lines
             if let Some(ref header) = diff_line.file_header {
                 let y = inner.y + row as u16;
                 render_file_header(buf, inner.x, y, inner.width, header, theme);
+                row += 1;
+                continue;
+            }
+
+            if let Some(message) = diff_line.preview_placeholder {
+                render_preview_placeholder(
+                    buf,
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                    message,
+                    theme,
+                );
                 row += 1;
                 continue;
             }
@@ -1440,6 +2002,7 @@ pub fn render_diff(
                 ),
             };
 
+            let staged = state.is_staged_line(line_idx);
             let bg = if is_new_file {
                 theme.diff_add_bg
             } else {
@@ -1451,6 +2014,7 @@ pub fn render_diff(
                     _ => Color::Reset,
                 }
             };
+            let bg = dim_unstaged_bg(bg, staged, theme);
             let gutter_bg = if is_new_file {
                 theme.diff_add_gutter_bg
             } else {
@@ -1462,6 +2026,7 @@ pub fn render_diff(
                     _ => Color::Reset,
                 }
             };
+            let gutter_bg = dim_unstaged_bg(gutter_bg, staged, theme);
             let gutter_fg = if is_new_file {
                 theme.diff_add_gutter_fg
             } else {
@@ -1490,6 +2055,7 @@ pub fn render_diff(
                     bg,
                     theme,
                     usize::MAX / 2,
+                    staged,
                 );
                 let wrapped = wrap_spans(&spans, content_width as usize);
                 for (chunk_idx, chunk) in wrapped.iter().enumerate() {
@@ -1503,7 +2069,7 @@ pub fn render_diff(
                         "   · ".to_string()
                     };
                     buf_write_str(buf, inner.x, y, &gutter_text, gutter_style, gutter_width);
-                    buf_write_spans(buf, inner.x + gutter_width, y, chunk, content_width, 0);
+                    buf_write_spans(buf, inner.x + gutter_width, y, chunk, content_width, 0, bg);
                     row += 1;
                 }
             } else {
@@ -1519,6 +2085,7 @@ pub fn render_diff(
                         bg,
                         theme,
                         content_width as usize,
+                        staged,
                     );
                     buf_write_spans(
                         buf,
@@ -1527,6 +2094,7 @@ pub fn render_diff(
                         &spans,
                         content_width,
                         state.horizontal_scroll,
+                        bg,
                     );
                 } else {
                     let fill: String = std::iter::repeat(' ')
@@ -1562,12 +2130,20 @@ pub fn render_diff(
 
         let mut hover_tooltip_y: Option<u16> = None;
 
+        // Sticky file header: pin the current file's separator to the first
+        // row when scrolled past it in a multi-file diff.
+        let sticky = state.sticky_file_header().map(|s| s.to_string());
         let mut row = 0usize;
-        for (idx_offset, diff_line) in state.lines[state.scroll_offset..].iter().enumerate() {
+        if let Some(ref header) = sticky {
+            render_file_header(buf, inner.x, inner.y, inner.width, header, theme);
+            row = 1;
+        }
+        let start = state.scroll_offset.min(state.lines.len());
+        for (idx_offset, diff_line) in state.lines[start..].iter().enumerate() {
             if row >= visible_height {
                 break;
             }
-            let line_idx = state.scroll_offset + idx_offset;
+            let line_idx = start + idx_offset;
 
             // Handle file header separator lines
             if let Some(ref header) = diff_line.file_header {
@@ -1582,17 +2158,21 @@ pub fn render_diff(
                 .highlighters_for_section(diff_line.section_index)
                 .unwrap_or((&default_hl, &default_hl));
 
-            let (mut left_bg, mut right_bg) = line_bg_colors(diff_line.change_type, theme);
-            let (mut left_gutter_bg, mut right_gutter_bg) =
-                gutter_bg_colors(diff_line.change_type, theme);
-            if diff_line.change_type != ChangeType::Equal
-                && state.is_line_staged_for_feedback(line_idx)
-            {
-                left_bg = Color::Rgb(16, 64, 32);
-                right_bg = Color::Rgb(16, 64, 32);
-                left_gutter_bg = Color::Rgb(16, 64, 32);
-                right_gutter_bg = Color::Rgb(16, 64, 32);
+            if let Some(message) = diff_line.preview_placeholder {
+                render_preview_placeholder(
+                    buf,
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                    message,
+                    theme,
+                );
+                row += 1;
+                continue;
             }
+
+            let staged = state.is_staged_line(line_idx);
+            let (left_bg, right_bg) = line_bg_colors(diff_line.change_type, theme, staged);
+            let (left_gutter_bg, right_gutter_bg) =
+                gutter_bg_colors(diff_line.change_type, theme, staged);
             let (left_gutter_fg, right_gutter_fg) = gutter_fg_colors(diff_line.change_type, theme);
             let gutter_style = Style::default().fg(left_gutter_fg).bg(left_gutter_bg);
             let right_gutter_style = Style::default().fg(right_gutter_fg).bg(right_gutter_bg);
@@ -1624,6 +2204,7 @@ pub fn render_diff(
                         left_bg,
                         theme,
                         usize::MAX / 2,
+                        staged,
                     );
                     wrap_spans(&spans, panel_width as usize)
                 };
@@ -1639,6 +2220,7 @@ pub fn render_diff(
                         right_bg,
                         theme,
                         usize::MAX / 2,
+                        staged,
                     );
                     wrap_spans(&spans, right_content_width as usize)
                 };
@@ -1679,7 +2261,7 @@ pub fn render_diff(
                     );
                     if is_insert {
                         let slash: String =
-                            std::iter::repeat('/').take(panel_width as usize).collect();
+                            std::iter::repeat('╱').take(panel_width as usize).collect();
                         buf_write_str(
                             buf,
                             inner.x + gutter_width,
@@ -1689,7 +2271,15 @@ pub fn render_diff(
                             panel_width,
                         );
                     } else if let Some(chunk) = left_wrapped.get(chunk_idx) {
-                        buf_write_spans(buf, inner.x + gutter_width, y, chunk, panel_width, 0);
+                        buf_write_spans(
+                            buf,
+                            inner.x + gutter_width,
+                            y,
+                            chunk,
+                            panel_width,
+                            0,
+                            left_bg,
+                        );
                     } else {
                         let fill: String =
                             std::iter::repeat(' ').take(panel_width as usize).collect();
@@ -1711,25 +2301,9 @@ pub fn render_diff(
                     } else {
                         None
                     };
-                    let marker_is_hovered = show_marker
-                        && marker_hunk_idx.is_some()
-                        && marker_hunk_idx == state.hovered_revert_hunk;
                     let (divider_char, marker_style) = if show_marker {
-                        let is_selected = marker_hunk_idx == state.selected_revert_hunk;
-                        let is_staged = marker_hunk_idx
-                            .is_some_and(|hunk_idx| state.is_hunk_staged_for_feedback(hunk_idx));
-                        // Hover wins over selection so the hover state is always
-                        // visible — even on a hunk that's currently selected.
-                        let fg = if is_staged {
-                            Color::Green
-                        } else if marker_is_hovered {
-                            theme.accent_secondary
-                        } else if is_selected {
-                            theme.accent
-                        } else {
-                            theme.separator
-                        };
-                        let glyph = if is_staged { "✓" } else { "󰧛" };
+                        let hunk_idx = marker_hunk_idx.unwrap_or(usize::MAX);
+                        let (glyph, fg) = hunk_marker_glyph_and_fg(state, hunk_idx, theme);
                         (glyph, Style::default().fg(fg).add_modifier(Modifier::BOLD))
                     } else {
                         ("│", divider_style)
@@ -1753,7 +2327,7 @@ pub fn render_diff(
                         gutter_width,
                     );
                     if is_delete {
-                        let slash: String = std::iter::repeat('/')
+                        let slash: String = std::iter::repeat('╱')
                             .take(right_content_width as usize)
                             .collect();
                         buf_write_str(
@@ -1765,7 +2339,15 @@ pub fn render_diff(
                             right_content_width,
                         );
                     } else if let Some(chunk) = right_wrapped.get(chunk_idx) {
-                        buf_write_spans(buf, right_content_x, y, chunk, right_content_width, 0);
+                        buf_write_spans(
+                            buf,
+                            right_content_x,
+                            y,
+                            chunk,
+                            right_content_width,
+                            0,
+                            right_bg,
+                        );
                     } else {
                         let fill: String = std::iter::repeat(' ')
                             .take(right_content_width as usize)
@@ -1791,7 +2373,7 @@ pub fn render_diff(
                 // Left content
                 let left_spans = if is_insert {
                     let slash_fill: String =
-                        std::iter::repeat('/').take(panel_width as usize).collect();
+                        std::iter::repeat('╱').take(panel_width as usize).collect();
                     vec![Span::styled(
                         slash_fill,
                         Style::default().fg(theme.diff_line_number).bg(left_bg),
@@ -1806,6 +2388,7 @@ pub fn render_diff(
                         left_bg,
                         theme,
                         panel_width as usize,
+                        staged,
                     )
                 };
                 buf_write_spans(
@@ -1815,6 +2398,7 @@ pub fn render_diff(
                     &left_spans,
                     panel_width,
                     state.horizontal_scroll,
+                    left_bg,
                 );
 
                 // Divider or revert marker.
@@ -1825,23 +2409,9 @@ pub fn render_diff(
                 } else {
                     None
                 };
-                let marker_is_hovered = show_marker
-                    && marker_hunk_idx.is_some()
-                    && marker_hunk_idx == state.hovered_revert_hunk;
                 let (divider_char, marker_style) = if show_marker {
-                    let is_selected = marker_hunk_idx == state.selected_revert_hunk;
-                    let is_staged = marker_hunk_idx
-                        .is_some_and(|hunk_idx| state.is_hunk_staged_for_feedback(hunk_idx));
-                    let fg = if is_staged {
-                        Color::Green
-                    } else if marker_is_hovered {
-                        theme.accent_secondary
-                    } else if is_selected {
-                        theme.accent
-                    } else {
-                        theme.separator
-                    };
-                    let glyph = if is_staged { "✓" } else { "󰧛" };
+                    let hunk_idx = marker_hunk_idx.unwrap_or(usize::MAX);
+                    let (glyph, fg) = hunk_marker_glyph_and_fg(state, hunk_idx, theme);
                     (glyph, Style::default().fg(fg).add_modifier(Modifier::BOLD))
                 } else {
                     ("│", divider_style)
@@ -1868,7 +2438,7 @@ pub fn render_diff(
                 // Right content
                 let right_spans = if is_delete {
                     let slash_fill: String =
-                        std::iter::repeat('/').take(panel_width as usize).collect();
+                        std::iter::repeat('╱').take(panel_width as usize).collect();
                     vec![Span::styled(
                         slash_fill,
                         Style::default().fg(theme.diff_line_number).bg(right_bg),
@@ -1883,6 +2453,7 @@ pub fn render_diff(
                         right_bg,
                         theme,
                         panel_width as usize,
+                        staged,
                     )
                 };
                 buf_write_spans(
@@ -1892,6 +2463,7 @@ pub fn render_diff(
                     &right_spans,
                     right_content_width,
                     state.horizontal_scroll,
+                    right_bg,
                 );
 
                 row += 1;
@@ -1901,6 +2473,9 @@ pub fn render_diff(
         if let Some(y) = hover_tooltip_y {
             let show_key = state.hovered_revert_hunk.is_some()
                 && state.hovered_revert_hunk == state.selected_revert_hunk;
+            let staged = state
+                .hovered_revert_hunk
+                .is_some_and(|i| state.is_staged_hunk(i));
             render_revert_tooltip(
                 buf,
                 div_x + divider_width,
@@ -1908,6 +2483,7 @@ pub fn render_diff(
                 right_content_width + gutter_width,
                 theme,
                 show_key,
+                staged,
             );
         }
     }
@@ -1916,7 +2492,7 @@ pub fn render_diff(
 fn render_unified_diff_body(
     buf: &mut Buffer,
     inner: Rect,
-    state: &DiffViewState,
+    state: &mut DiffViewState,
     theme: &Theme,
     visible_height: usize,
     show_revert_markers: bool,
@@ -1928,9 +2504,23 @@ fn render_unified_diff_body(
     if content_width == 0 {
         return;
     }
+    state.last_content_width = content_width as usize;
 
+    // Skip `scroll_offset` visual rows from the start of the flattened stream
+    // (all deletes in a change block, then all inserts) so mid-block scrolling
+    // does not drop earlier paired lines.
+    let mut skip = state.scroll_offset;
+    // Sticky file header: pin the current file's separator to the first row
+    // when scrolled past it in a multi-file diff.
+    let sticky = state
+        .sticky_for_unified_with_width(content_width as usize)
+        .map(|(_, h)| h.to_string());
     let mut row = 0usize;
-    let mut line_idx = state.scroll_offset;
+    if let Some(ref header) = sticky {
+        render_file_header(buf, inner.x, inner.y, inner.width, header, theme);
+        row = 1;
+    }
+    let mut line_idx = 0usize;
     while line_idx < state.lines.len() {
         if row >= visible_height {
             break;
@@ -1938,6 +2528,11 @@ fn render_unified_diff_body(
         let diff_line = &state.lines[line_idx];
 
         if let Some(ref header) = diff_line.file_header {
+            if skip > 0 {
+                skip -= 1;
+                line_idx += 1;
+                continue;
+            }
             let y = inner.y + row as u16;
             render_file_header(buf, inner.x, y, inner.width, header, theme);
             row += 1;
@@ -1945,7 +2540,29 @@ fn render_unified_diff_body(
             continue;
         }
 
+        if let Some(message) = diff_line.preview_placeholder {
+            if skip > 0 {
+                skip -= 1;
+            } else {
+                render_preview_placeholder(
+                    buf,
+                    Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
+                    message,
+                    theme,
+                );
+                row += 1;
+            }
+            line_idx += 1;
+            continue;
+        }
+
         if diff_line.change_type == ChangeType::Equal {
+            let height = unified_line_visual_height(diff_line, content_width as usize, state);
+            if skip >= height {
+                skip -= height;
+                line_idx += 1;
+                continue;
+            }
             let default_hl = FileHighlighter::default();
             let (_, new_highlighter) = state
                 .highlighters_for_section(diff_line.section_index)
@@ -1957,6 +2574,9 @@ fn render_unified_diff_body(
                 .as_ref()
                 .or(diff_line.old_line.as_ref())
                 .map(|(n, text)| (*n, text.as_str()));
+            // Consume leading wrap rows that fall before the viewport.
+            let start_chunk = skip;
+            skip = 0;
             render_unified_row(
                 buf,
                 inner,
@@ -1977,12 +2597,15 @@ fn render_unified_diff_body(
                 content_width,
                 None,
                 theme,
+                start_chunk,
+                true,
             );
             line_idx += 1;
             continue;
         }
 
         let block_end = next_unified_change_block_end(&state.lines, line_idx);
+        let block_staged = state.is_staged_line(line_idx);
         let mut marker_hunk_idx = if show_revert_markers && state.is_hunk_start_line(line_idx) {
             state.hunk_index_for_start_line(line_idx)
         } else {
@@ -1998,31 +2621,45 @@ fn render_unified_diff_body(
                 if !matches!(line.change_type, ChangeType::Delete | ChangeType::Modified) {
                     continue;
                 }
+                let height = unified_line_row_count(&line.old_line, content_width as usize, state);
+                if skip >= height {
+                    skip -= height;
+                    // Still consume the hunk marker so it only shows on the
+                    // first visible row of the block.
+                    marker_hunk_idx.take();
+                    continue;
+                }
+                let start_chunk = skip;
+                skip = 0;
                 let default_hl = FileHighlighter::default();
                 let (old_highlighter, _) = state
                     .highlighters_for_section(line.section_index)
                     .unwrap_or((&default_hl, &default_hl));
-                let staged_feedback_bg = staged_feedback_bg_for_line(state, idx);
+                let old_num = state.file_line_number(idx, DiffPanel::Old);
+                let old_line = line.old_line.as_ref().map(|(n, text)| (*n, text.as_str()));
+                let old_segments = line.old_segments.clone();
                 render_unified_row(
                     buf,
                     inner,
                     &mut row,
                     visible_height,
                     state,
-                    state.file_line_number(idx, DiffPanel::Old),
+                    old_num,
                     None,
                     '-',
-                    line.old_line.as_ref().map(|(n, text)| (*n, text.as_str())),
-                    &line.old_segments,
+                    old_line,
+                    &old_segments,
                     ChangeType::Delete,
                     true,
                     old_highlighter,
-                    staged_feedback_bg.unwrap_or(theme.diff_remove_bg),
-                    staged_feedback_bg.unwrap_or(theme.diff_remove_gutter_bg),
+                    dim_unstaged_bg(theme.diff_remove_bg, block_staged, theme),
+                    dim_unstaged_bg(theme.diff_remove_gutter_bg, block_staged, theme),
                     theme.diff_remove_gutter_fg,
                     content_width,
                     marker_hunk_idx.take(),
                     theme,
+                    start_chunk,
+                    block_staged,
                 );
             }
         }
@@ -2036,11 +2673,21 @@ fn render_unified_diff_body(
                 if !matches!(line.change_type, ChangeType::Insert | ChangeType::Modified) {
                     continue;
                 }
+                let height = unified_line_row_count(&line.new_line, content_width as usize, state);
+                if skip >= height {
+                    skip -= height;
+                    marker_hunk_idx.take();
+                    continue;
+                }
+                let start_chunk = skip;
+                skip = 0;
                 let default_hl = FileHighlighter::default();
                 let (_, new_highlighter) = state
                     .highlighters_for_section(line.section_index)
                     .unwrap_or((&default_hl, &default_hl));
-                let staged_feedback_bg = staged_feedback_bg_for_line(state, idx);
+                let new_num = state.file_line_number(idx, DiffPanel::New);
+                let new_line = line.new_line.as_ref().map(|(n, text)| (*n, text.as_str()));
+                let new_segments = line.new_segments.clone();
                 render_unified_row(
                     buf,
                     inner,
@@ -2048,35 +2695,26 @@ fn render_unified_diff_body(
                     visible_height,
                     state,
                     None,
-                    state.file_line_number(idx, DiffPanel::New),
+                    new_num,
                     '+',
-                    line.new_line.as_ref().map(|(n, text)| (*n, text.as_str())),
-                    &line.new_segments,
+                    new_line,
+                    &new_segments,
                     ChangeType::Insert,
                     false,
                     new_highlighter,
-                    staged_feedback_bg.unwrap_or(theme.diff_add_bg),
-                    staged_feedback_bg.unwrap_or(theme.diff_add_gutter_bg),
+                    dim_unstaged_bg(theme.diff_add_bg, block_staged, theme),
+                    dim_unstaged_bg(theme.diff_add_gutter_bg, block_staged, theme),
                     theme.diff_add_gutter_fg,
                     content_width,
                     marker_hunk_idx.take(),
                     theme,
+                    start_chunk,
+                    block_staged,
                 );
             }
         }
 
         line_idx = block_end;
-    }
-}
-
-/// Transient green wash for a change line whose hunk was just staged from
-/// block mode. Only change lines qualify; context lines keep their theme
-/// background so the staged block stays visually delimited.
-fn staged_feedback_bg_for_line(state: &DiffViewState, line_idx: usize) -> Option<Color> {
-    if state.is_line_staged_for_feedback(line_idx) {
-        Some(Color::Rgb(16, 64, 32))
-    } else {
-        None
     }
 }
 
@@ -2101,6 +2739,8 @@ fn render_unified_row(
     content_width: u16,
     marker_hunk_idx: Option<usize>,
     theme: &Theme,
+    start_chunk: usize,
+    staged: bool,
 ) {
     if *row >= visible_height {
         return;
@@ -2134,6 +2774,7 @@ fn render_unified_row(
         } else {
             content_width as usize
         },
+        staged,
     );
     let rows = if state.wrap {
         wrap_spans(&spans, content_width as usize)
@@ -2141,7 +2782,7 @@ fn render_unified_row(
         vec![spans]
     };
 
-    for (chunk_idx, chunk) in rows.iter().enumerate() {
+    for (chunk_idx, chunk) in rows.iter().enumerate().skip(start_chunk) {
         if *row >= visible_height {
             break;
         }
@@ -2153,19 +2794,7 @@ fn render_unified_row(
 
         if chunk_idx == 0 {
             if let Some(hunk_idx) = marker_hunk_idx {
-                let is_hovered = Some(hunk_idx) == state.hovered_revert_hunk;
-                let is_selected = Some(hunk_idx) == state.selected_revert_hunk;
-                let is_staged = state.is_hunk_staged_for_feedback(hunk_idx);
-                let fg = if is_staged {
-                    Color::Green
-                } else if is_hovered {
-                    theme.accent_secondary
-                } else if is_selected {
-                    theme.accent
-                } else {
-                    theme.separator
-                };
-                let glyph = if is_staged { "✓" } else { "󰧛" };
+                let (glyph, fg) = hunk_marker_glyph_and_fg(state, hunk_idx, theme);
                 buf_write_str(
                     buf,
                     prefix_x,
@@ -2200,6 +2829,7 @@ fn render_unified_row(
             } else {
                 state.horizontal_scroll
             },
+            bg,
         );
         *row += 1;
     }
@@ -2213,6 +2843,30 @@ fn unified_line_number_text(num: Option<usize>, chunk_idx: usize) -> String {
     }
 }
 
+/// Glyph + foreground for a hunk marker: blue `󰧛` for unstaged hunks,
+/// green `✓` for staged hunks. No hover color — hover only shows the
+/// tooltip, selection alone drives the highlight.
+fn hunk_marker_glyph_and_fg(
+    state: &DiffViewState,
+    hunk_idx: usize,
+    theme: &Theme,
+) -> (&'static str, Color) {
+    let is_selected = Some(hunk_idx) == state.selected_revert_hunk;
+    let fg = if is_selected {
+        theme.accent
+    } else if state.is_staged_hunk(hunk_idx) {
+        theme.file_staged.fg.unwrap_or(Color::Green)
+    } else {
+        theme.separator
+    };
+    let glyph = if state.is_staged_hunk(hunk_idx) {
+        "✓"
+    } else {
+        "󰧛"
+    };
+    (glyph, fg)
+}
+
 fn render_revert_tooltip(
     buf: &mut Buffer,
     x: u16,
@@ -2220,6 +2874,7 @@ fn render_revert_tooltip(
     max_width: u16,
     theme: &Theme,
     show_key: bool,
+    staged: bool,
 ) {
     let tip_style = Style::default().bg(theme.selected_bg).fg(theme.text_strong);
     let key_style = Style::default()
@@ -2227,14 +2882,15 @@ fn render_revert_tooltip(
         .fg(theme.accent_secondary)
         .add_modifier(Modifier::BOLD);
 
-    let parts: Vec<(&str, Style)> = if show_key {
-        vec![
-            (" ", tip_style),
-            ("enter", key_style),
-            (" Revert hunk ", tip_style),
-        ]
+    let label = if staged {
+        " Staged hunk "
     } else {
-        vec![(" Revert hunk ", tip_style)]
+        " Hunk menu "
+    };
+    let parts: Vec<(&str, Style)> = if show_key {
+        vec![(" ", tip_style), ("enter", key_style), (label, tip_style)]
+    } else {
+        vec![(label, tip_style)]
     };
 
     let buf_area = buf.area();
@@ -2259,6 +2915,48 @@ fn render_revert_tooltip(
 }
 
 /// Render a file header separator line spanning the full width.
+/// The same diagonal glyph and muted foreground used for absent diff sides.
+fn render_preview_placeholder(buf: &mut Buffer, area: Rect, message: &str, theme: &Theme) {
+    let area = area.intersection(buf.area);
+    if area.is_empty() {
+        return;
+    }
+    let hatch = "╱".repeat(area.width as usize);
+    let hatch_style = Style::reset().fg(theme.diff_line_number);
+    for y in area.y..area.bottom() {
+        buf.set_stringn(area.x, y, &hatch, area.width as usize, hatch_style);
+    }
+    if message.is_empty() {
+        return;
+    }
+    // Keep the reason on one row even in narrow terminals; never wrap it into
+    // the next file's header. ASCII labels make clipping cell-width safe.
+    let label = if area.width as usize >= message.len() + 4 {
+        format!("  {message}  ")
+    } else {
+        message.chars().take(area.width as usize).collect()
+    };
+    let x = area.x + (area.width - label.len() as u16) / 2;
+    let y = area.y + area.height / 2;
+    let padding = " ".repeat(label.len());
+    for padding_y in y.saturating_sub(1).max(area.y)..=(y + 1).min(area.bottom() - 1) {
+        buf.set_stringn(
+            x,
+            padding_y,
+            &padding,
+            label.len(),
+            Style::reset().fg(theme.text_dimmed),
+        );
+    }
+    buf.set_stringn(
+        x,
+        y,
+        label,
+        area.width as usize,
+        Style::reset().fg(theme.text_dimmed),
+    );
+}
+
 fn render_file_header(buf: &mut Buffer, x: u16, y: u16, width: u16, filename: &str, theme: &Theme) {
     let buf_area = buf.area();
     if y < buf_area.y || y >= buf_area.y + buf_area.height {
@@ -2305,7 +3003,9 @@ fn buf_write_str(buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style, max
 }
 
 /// Write styled spans directly to the buffer at (x, y), clamped to max_width.
-/// `h_scroll` skips the first N display columns of content.
+/// `h_scroll` skips the first N display columns of content. Trailing cells
+/// up to `max_width` are filled with `fill_bg` so hunk backgrounds span the
+/// full panel width (lumen-style) instead of ending at the last character.
 #[inline]
 fn buf_write_spans(
     buf: &mut Buffer,
@@ -2314,6 +3014,7 @@ fn buf_write_spans(
     spans: &[Span<'_>],
     max_width: u16,
     h_scroll: usize,
+    fill_bg: Color,
 ) {
     let buf_area = buf.area();
     if y < buf_area.y || y >= buf_area.y + buf_area.height {
@@ -2340,6 +3041,16 @@ fn buf_write_spans(
                 cell.set_style(span.style);
             }
             col += width as u16;
+        }
+    }
+    if col < end_col {
+        let fill_style = Style::default().bg(fill_bg);
+        while col < end_col {
+            if let Some(cell) = buf.cell_mut((col, y)) {
+                cell.set_char(' ');
+                cell.set_style(fill_style);
+            }
+            col += 1;
         }
     }
 }
@@ -2559,25 +3270,44 @@ fn wrap_spans<'a>(spans: &[Span<'a>], width: usize) -> Vec<Vec<Span<'a>>> {
 }
 
 /// Get background colors for a diff line based on change type.
-fn line_bg_colors(change_type: ChangeType, theme: &Theme) -> (Color, Color) {
-    match change_type {
+/// Unstaged hunks recede toward the panel tone so staged hunks (full
+/// `diff_add_bg`/`diff_remove_bg`) pop. `Reset` passes through undimmed.
+fn line_bg_colors(change_type: ChangeType, theme: &Theme, staged: bool) -> (Color, Color) {
+    let (l, r) = match change_type {
         ChangeType::Equal => (Color::Reset, Color::Reset),
         ChangeType::Delete => (theme.diff_remove_bg, Color::Reset),
         ChangeType::Insert => (Color::Reset, theme.diff_add_bg),
         ChangeType::Modified => (theme.diff_remove_bg, theme.diff_add_bg),
+    };
+    (
+        dim_unstaged_bg(l, staged, theme),
+        dim_unstaged_bg(r, staged, theme),
+    )
+}
+
+/// Dim one background for an unstaged hunk. Staged rows and `Reset`
+/// (context) rows pass through untouched.
+fn dim_unstaged_bg(bg: Color, staged: bool, theme: &Theme) -> Color {
+    if staged || bg == Color::Reset {
+        return bg;
     }
+    crate::config::theme::mix_colors(bg, theme.diff_grid_bg, 150)
 }
 
 /// Get gutter background colors for a diff line. Slightly darker than the
 /// content background so the gutter visually separates from the code area
-/// (lumen-style).
-fn gutter_bg_colors(change_type: ChangeType, theme: &Theme) -> (Color, Color) {
-    match change_type {
+/// (lumen-style). Dims with the row for unstaged hunks.
+fn gutter_bg_colors(change_type: ChangeType, theme: &Theme, staged: bool) -> (Color, Color) {
+    let (l, r) = match change_type {
         ChangeType::Equal => (Color::Reset, Color::Reset),
         ChangeType::Delete => (theme.diff_remove_gutter_bg, Color::Reset),
         ChangeType::Insert => (Color::Reset, theme.diff_add_gutter_bg),
         ChangeType::Modified => (theme.diff_remove_gutter_bg, theme.diff_add_gutter_bg),
-    }
+    };
+    (
+        dim_unstaged_bg(l, staged, theme),
+        dim_unstaged_bg(r, staged, theme),
+    )
 }
 
 /// Foreground color for the gutter line number on the (left, right) side.
@@ -2601,6 +3331,7 @@ fn build_content_spans<'a>(
     bg: Color,
     theme: &Theme,
     max_width: usize,
+    staged: bool,
 ) -> Vec<Span<'a>> {
     let Some((line_num, text)) = line_data else {
         // Empty side — fill with background
@@ -2610,7 +3341,7 @@ fn build_content_spans<'a>(
 
     // If we have word-level segments, use those
     if let Some(segs) = segments {
-        return build_word_diff_spans(segs, is_old_side, bg, theme, max_width);
+        return build_word_diff_spans(segs, is_old_side, bg, theme, max_width, staged);
     }
 
     // Otherwise, try syntax highlighting
@@ -2650,6 +3381,7 @@ fn build_word_diff_spans<'a>(
     bg: Color,
     theme: &Theme,
     _max_width: usize,
+    staged: bool,
 ) -> Vec<Span<'a>> {
     segments
         .iter()
@@ -2663,7 +3395,7 @@ fn build_word_diff_spans<'a>(
                 Span::styled(
                     seg.text.clone(),
                     Style::default()
-                        .bg(emphasis_bg)
+                        .bg(dim_unstaged_bg(emphasis_bg, staged, theme))
                         .fg(theme.text_strong)
                         .add_modifier(Modifier::BOLD),
                 )
@@ -2727,10 +3459,14 @@ pub fn render_diff_search_highlights(
         if y >= pl.inner_end_y || y >= buf_area.y + buf_area.height {
             break;
         }
+        // Never highlight the pinned sticky header row.
+        if state.is_sticky_row(y, &pl) {
+            continue;
+        }
         let line_idx = state
             .line_chunk_at_row(y, &pl)
             .map(|(line_idx, _)| line_idx)
-            .unwrap_or(state.scroll_offset + row_offset);
+            .unwrap_or_else(|| state.fallback_line_idx_for_row(y, &pl));
 
         let is_current_line = current_match_line == Some(line_idx);
 
@@ -3026,7 +3762,7 @@ fn parse_unified_diff(diff: &str) -> (String, String) {
 
 fn diff_lines_from_unified_or_rename_only(diff: &str, tab_width: usize) -> Vec<DiffLine> {
     if is_binary_diff(diff) {
-        return binary_file_placeholder_lines(tab_width);
+        return binary_file_placeholder_lines();
     }
     if let Some((old_path, new_path)) = rename_only_paths(diff) {
         return rename_only_lines(&old_path, &new_path, tab_width);
@@ -3038,24 +3774,33 @@ fn diff_lines_from_unified_or_rename_only(diff: &str, tab_width: usize) -> Vec<D
 /// Git emits `Binary files A and B differ` (and similar) instead of hunks.
 fn is_binary_diff(diff: &str) -> bool {
     diff.lines().any(|line| {
-        let t = line.trim_start();
-        t.starts_with("Binary files ")
-            || t.starts_with("Binary file ")
-            || t.starts_with("GIT binary patch")
+        // Do not trim: a leading space marks ordinary hunk context, not metadata.
+        line.starts_with("Binary files ")
+            || line.starts_with("Binary file ")
+            || line.starts_with("GIT binary patch")
     })
 }
 
-fn binary_file_placeholder_lines(tab_width: usize) -> Vec<DiffLine> {
-    let msg = super::expand_tabs("Binary file (not viewable)", tab_width);
-    vec![DiffLine {
-        old_line: Some((1, msg.clone())),
-        new_line: Some((1, msg)),
+fn binary_file_placeholder_lines() -> Vec<DiffLine> {
+    [
+        "",
+        "                          ",
+        "Binary cannot be previewed",
+        "                          ",
+        "",
+    ]
+    .into_iter()
+    .map(|message| DiffLine {
+        old_line: None,
+        new_line: None,
         change_type: ChangeType::Equal,
         old_segments: None,
         new_segments: None,
         file_header: None,
+        preview_placeholder: Some(message),
         section_index: 0,
-    }]
+    })
+    .collect()
 }
 
 /// True when git emitted a rename/copy with no content hunks (pure move).
@@ -3093,6 +3838,7 @@ fn rename_only_lines(old_path: &str, new_path: &str, tab_width: usize) -> Vec<Di
         old_segments: None,
         new_segments: None,
         file_header: None,
+        preview_placeholder: None,
         section_index: 0,
     }]
 }
@@ -3130,6 +3876,72 @@ fn parse_hunk_headers(diff: &str) -> Vec<(usize, usize, usize, usize)> {
         hunks.push((old_start, new_start, old_count, new_count));
     }
     hunks
+}
+
+/// File-relative span of one visual change block.
+pub struct BlockSpan {
+    pub old: Option<(usize, usize)>,
+    pub new: Option<(usize, usize)>,
+    pub old_point: usize,
+    pub new_point: usize,
+}
+
+impl BlockSpan {
+    /// Effective inclusive span on one side, using the gap point for pure
+    /// insertions (`old`) and pure deletions (`new`).
+    pub fn eff(&self, new_side: bool) -> (usize, usize) {
+        if new_side {
+            self.new.unwrap_or((self.new_point, self.new_point))
+        } else {
+            self.old.unwrap_or((self.old_point, self.old_point))
+        }
+    }
+
+    /// True when both spans touch on the given side.
+    pub fn overlaps(&self, other: &BlockSpan, new_side: bool) -> bool {
+        let (lo1, hi1) = self.eff(new_side);
+        let (lo2, hi2) = other.eff(new_side);
+        lo1 <= hi2 && lo2 <= hi1
+    }
+}
+
+/// One `staged` flag per visual change block of a `git diff HEAD` buffer,
+/// in block order. Both diffs share worktree (new-side) numbering, so a
+/// HEAD block overlapping no unstaged block is fully staged; anything
+/// touching unstaged work counts as unstaged. Handles multi-file buffers
+/// by matching sections on filename; files missing from the unstaged diff
+/// are fully staged.
+pub fn head_block_staged_flags(
+    head_diff: &str,
+    unstaged_diff: &str,
+    tab_width: usize,
+) -> Vec<bool> {
+    let head_sections = parse_multi_file_diff(head_diff);
+    if head_sections.is_empty() {
+        return head_blocks_staged_flags(head_diff, unstaged_diff, tab_width);
+    }
+    let unstaged_sections = parse_multi_file_diff(unstaged_diff);
+    let mut flags = Vec::new();
+    for (name, body) in &head_sections {
+        let peer = unstaged_sections
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+            .unwrap_or("");
+        flags.extend(head_blocks_staged_flags(body, peer, tab_width));
+    }
+    flags
+}
+
+/// One `staged` flag per visual change block of a single-file
+/// `git diff HEAD` buffer.
+fn head_blocks_staged_flags(head_diff: &str, unstaged_diff: &str, tab_width: usize) -> Vec<bool> {
+    let head_spans = DiffViewState::block_spans_for_diff(head_diff, tab_width);
+    let unstaged_spans = DiffViewState::block_spans_for_diff(unstaged_diff, tab_width);
+    head_spans
+        .iter()
+        .map(|h| !unstaged_spans.iter().any(|u| h.overlaps(u, true)))
+        .collect()
 }
 
 /// Build the hunk line offset table from parsed hunk headers and
@@ -3206,8 +4018,69 @@ mod tests {
             old_segments: None,
             new_segments: None,
             file_header: None,
+            preview_placeholder: None,
             section_index: 0,
         }
+    }
+
+    #[test]
+    fn head_buffer_classifies_staged_hunks_without_separator() {
+        // Real `git diff HEAD` output: staged edit at line 2, unstaged edit
+        // at line 9, merged into a single `@@` by git. Block-level overlap
+        // still tells them apart.
+        let head = "diff --git a/f.txt b/f.txt\nindex f00c965..edee7ac 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,10 +1,10 @@\n 1\n-2\n+TWO\n 3\n 4\n 5\n 6\n 7\n 8\n-9\n+NINE\n 10\n";
+        let unstaged = "diff --git a/f.txt b/f.txt\nindex 9935360..edee7ac 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -6,5 +6,5 @@ TWO\n 6\n 7\n 8\n-9\n+NINE\n 10\n";
+        let parsed = DiffViewState::parse_head_with_staged("f.txt", head, unstaged, 4, true);
+        assert_eq!(parsed.hunk_starts.len(), 2);
+        assert_eq!(parsed.hunk_staged, vec![true, false]);
+        // No separator: a single coherent buffer.
+        assert!(
+            parsed.lines.iter().all(|l| l.file_header.is_none()),
+            "single buffer must not contain section separators"
+        );
+        let mut state = DiffViewState::new();
+        state.apply_parsed(parsed);
+        assert_eq!(state.staged_counts(), Some((1, 1)));
+        assert!(state.is_staged_hunk(0));
+        assert!(!state.is_staged_hunk(1));
+        // Staged hunk keeps full color; unstaged line dims.
+        assert!(state.is_staged_line(state.hunk_starts[0]));
+        assert!(!state.is_staged_line(state.hunk_starts[1]));
+    }
+
+    #[test]
+    fn staged_deletion_classifies_as_staged() {
+        // Staged deletion of line 2; unstaged edit of line 9.
+        let head = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,4 +1,3 @@\n 1\n-2\n 3\n 4\n@@ -7,4 +6,4 @@\n 7\n 8\n-9\n+NINE\n";
+        let unstaged = "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -5,5 +5,5 @@\n 6\n 7\n 8\n-9\n+NINE\n 10\n";
+        let parsed = DiffViewState::parse_head_with_staged("f.txt", head, unstaged, 4, true);
+        assert_eq!(parsed.hunk_staged, vec![true, false]);
+    }
+
+    #[test]
+    fn head_flags_mark_missing_unstaged_files_as_staged() {
+        // Multi-file HEAD buffer where b.txt has no unstaged counterpart.
+        let head = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\ndiff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,2 @@\n x\n-y\n+Y\n";
+        let unstaged =
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n";
+        let flags = head_block_staged_flags(head, unstaged, 4);
+        assert_eq!(flags, vec![false, true]);
+    }
+
+    #[test]
+    fn unclassified_diff_has_no_staged_counts() {
+        // Commits/stash carry no staged classification: full color, no counts.
+        let parsed = DiffViewState::parse_diff_output(
+            "f.txt",
+            "diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n@@ -1,2 +1,2 @@\n a\n-b\n+B\n",
+            4,
+            true,
+        );
+        assert!(parsed.hunk_staged.is_empty());
+        let mut state = DiffViewState::new();
+        state.apply_parsed(parsed);
+        assert_eq!(state.staged_counts(), None);
+        assert!(state.is_staged_line(state.hunk_starts[0]));
     }
 
     #[test]
@@ -3243,7 +4116,7 @@ mod tests {
                 render_diff(
                     frame,
                     Rect::new(0, 0, 40, 6),
-                    &state,
+                    &mut state,
                     &Theme::dark(),
                     true,
                     false,
@@ -3359,28 +4232,6 @@ mod tests {
     }
 
     #[test]
-    fn block_mode_staged_feedback_is_transient() {
-        let mut state = DiffViewState::new();
-        state.hunk_starts = vec![1, 3];
-
-        assert!(!state.is_hunk_staged_for_feedback(1));
-
-        state.mark_hunk_staged_for_feedback(1);
-        assert!(state.is_hunk_staged_for_feedback(1));
-        assert!(!state.is_hunk_staged_for_feedback(0));
-        assert!(!state.is_line_staged_for_feedback(2));
-        assert!(state.is_line_staged_for_feedback(3));
-        assert!(state.is_line_staged_for_feedback(10));
-
-        state.exit_block_mode();
-        assert!(!state.is_hunk_staged_for_feedback(1));
-
-        state.mark_hunk_staged_for_feedback(0);
-        state.reset_keep_prefs();
-        assert!(!state.is_hunk_staged_for_feedback(0));
-    }
-
-    #[test]
     fn conflict_preview_labels_deleted_sides() {
         let parsed = DiffViewState::parse_conflict_preview(
             "file.txt",
@@ -3411,7 +4262,7 @@ mod tests {
         render_unified_diff_body(
             &mut buf,
             Rect::new(0, 0, 80, 10),
-            &state,
+            &mut state,
             &Theme::dark(),
             10,
             false,
@@ -3443,7 +4294,7 @@ mod tests {
         render_unified_diff_body(
             &mut buf,
             Rect::new(0, 0, 120, 8),
-            &state,
+            &mut state,
             &Theme::dark(),
             8,
             false,
@@ -3461,6 +4312,63 @@ mod tests {
 
         assert!(row_text(&buf, 4).contains("Cell wrapping"));
         assert!(row_text(&buf, 5).contains("Currency input"));
+    }
+
+    #[test]
+    fn unified_mid_block_scroll_keeps_earlier_deletes_visible() {
+        // Regression: DiffLine-indexed scroll used to drop delete N and insert N
+        // together when scrolling through a Modified block, so earlier lines
+        // vanished as you scrolled down. Visual-row scroll keeps the flattened
+        // delete-then-insert stream contiguous.
+        let mut state = DiffViewState::new();
+        state.view_layout = DiffViewLayout::Unified;
+        state.last_content_width = 80;
+        let mut lines = Vec::new();
+        for i in 0..4 {
+            let mut line = diff_line(ChangeType::Modified);
+            line.old_line = Some((100 + i, format!("old {i}")));
+            line.new_line = Some((200 + i, format!("new {i}")));
+            lines.push(line);
+        }
+        state.lines = lines;
+
+        // Visual stream is: -old0 -old1 -old2 -old3 +new0 +new1 +new2 +new3
+        assert_eq!(state.unified_total_visual_rows(80), 8);
+
+        // Scroll past the first delete only.
+        state.scroll_offset = 1;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 6));
+        render_unified_diff_body(
+            &mut buf,
+            Rect::new(0, 0, 80, 6),
+            &mut state,
+            &Theme::dark(),
+            6,
+            false,
+        );
+
+        let signs: String = (0..6)
+            .map(|row| {
+                buf.cell((11, row))
+                    .and_then(|cell| cell.symbol().chars().next())
+                    .unwrap_or(' ')
+            })
+            .collect();
+        // First delete is scrolled off; remaining deletes then inserts stay.
+        assert_eq!(signs, "---+++");
+        // old 0 must be gone, old 1 still present.
+        let row_text = |row: u16| -> String {
+            (0..80)
+                .map(|x| {
+                    buf.cell((x, row))
+                        .and_then(|cell| cell.symbol().chars().next())
+                        .unwrap_or(' ')
+                })
+                .collect()
+        };
+        assert!(row_text(0).contains("old 1"));
+        assert!(!row_text(0).contains("old 0"));
+        assert!(row_text(3).contains("new 0"));
     }
 
     #[test]
@@ -3551,15 +4459,213 @@ mod tests {
                     index 0000000..e8ef7b2\n\
                     Binary files /dev/null and b/foo.png differ\n";
         let parsed = DiffViewState::parse_diff_output("foo.png", diff, 4, true);
-        assert!(!parsed.lines.is_empty());
-        let text = parsed.lines[0]
-            .new_line
-            .as_ref()
-            .map(|(_, s)| s.as_str())
-            .unwrap_or("");
-        assert!(
-            text.contains("not viewable") || text.contains("Binary file"),
-            "got {text:?}"
+        assert_eq!(parsed.lines.len(), 5);
+        assert_eq!(
+            parsed.lines[2].preview_placeholder,
+            Some("Binary cannot be previewed")
         );
+        assert!(
+            parsed
+                .lines
+                .iter()
+                .all(|line| line.old_line.is_none() && line.new_line.is_none())
+        );
+        assert!(parsed.hunk_starts.is_empty());
+        assert!(parsed.hunk_line_offsets.is_empty());
+    }
+
+    const BINARY_DIFF: &str =
+        "diff --git a/foo.png b/foo.png\nBinary files a/foo.png and b/foo.png differ\n";
+    const TEXT_DIFF: &str = "diff --git a/text.txt b/text.txt\n--- a/text.txt\n+++ b/text.txt\n@@ -1 +1 @@\n-old\n+new\n";
+
+    fn render_preview(state: &mut DiffViewState, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                render_diff(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    state,
+                    &Theme::dark(),
+                    true,
+                    false,
+                    true,
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    #[test]
+    fn lone_binary_fills_pane_in_every_layout() {
+        for layout in [DiffViewLayout::SideBySide, DiffViewLayout::Unified] {
+            for side in [
+                DiffSideView::Both,
+                DiffSideView::OldOnly,
+                DiffSideView::NewOnly,
+            ] {
+                let mut state = DiffViewState::new();
+                state.load_from_diff_output("foo.png", BINARY_DIFF);
+                state.view_layout = layout;
+                state.side_view = side;
+                let buf = render_preview(&mut state, 60, 12);
+                assert!(buffer_row(&buf, 6).contains("  Binary cannot be previewed  "));
+                for y in [1, 4, 8, 10] {
+                    assert_eq!(
+                        (1..59).map(|x| buf[(x, y)].symbol()).collect::<String>(),
+                        "╱".repeat(58)
+                    );
+                }
+                for y in [5, 7] {
+                    assert_eq!(
+                        buffer_row(&buf, y),
+                        format!("│{}{}{}│", "╱".repeat(14), " ".repeat(30), "╱".repeat(14))
+                    );
+                }
+                assert_eq!(buf[(1, 1)].fg, Theme::dark().diff_line_number);
+                assert!(state.file_line_number(1, DiffPanel::New).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_binary_placeholder_is_compact_in_every_layout() {
+        let diff = format!("{BINARY_DIFF}{TEXT_DIFF}{BINARY_DIFF}");
+        for layout in [DiffViewLayout::SideBySide, DiffViewLayout::Unified] {
+            for side in [
+                DiffSideView::Both,
+                DiffSideView::OldOnly,
+                DiffSideView::NewOnly,
+            ] {
+                for wrap in [false, true] {
+                    for width in [24, 80] {
+                        let mut state = DiffViewState::new();
+                        state.apply_parsed(DiffViewState::parse_diff_output(
+                            "mixed", &diff, 4, true,
+                        ));
+                        state.view_layout = layout;
+                        state.side_view = side;
+                        state.wrap = wrap;
+                        let buf = render_preview(&mut state, width, 18);
+                        assert!(buffer_row(&buf, 1).contains("foo.png"));
+                        assert!(buffer_row(&buf, 4).contains("Binary"));
+                        for y in [2, 6] {
+                            assert_eq!(
+                                (1..width - 1)
+                                    .map(|x| buf[(x, y)].symbol())
+                                    .collect::<String>(),
+                                "╱".repeat(width as usize - 2)
+                            );
+                        }
+                        for y in [3, 5] {
+                            let row = buffer_row(&buf, y);
+                            assert!(row.contains(&" ".repeat(30.min(width as usize - 2))));
+                            if width == 80 {
+                                assert!(row.contains('╱'));
+                            }
+                        }
+                        assert!(buffer_row(&buf, 7).contains("text.txt"));
+                        assert!(
+                            buffer_row(&buf, 8).contains(if side == DiffSideView::NewOnly {
+                                "new"
+                            } else {
+                                "old"
+                            })
+                        );
+                        // Exactly five rows per binary, not viewport-sized blocks.
+                        assert_eq!(
+                            state
+                                .lines
+                                .iter()
+                                .filter(|line| line.preview_placeholder.is_some())
+                                .count(),
+                            10
+                        );
+                        assert_eq!(state.hunk_starts, vec![7]);
+                        assert_eq!(state.file_line_number(7, DiffPanel::New), Some(1));
+                        let panel = DiffPanelLayout::compute(buf.area, &state);
+                        assert_eq!(state.line_chunk_at_row(7, &panel), Some((6, 0)));
+                        state.start_search();
+                        state.search_query = "Binary".to_string();
+                        state.update_search();
+                        assert!(state.search_matches.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scrolling_into_binary_keeps_sticky_header_and_next_file_aligned() {
+        for layout in [DiffViewLayout::SideBySide, DiffViewLayout::Unified] {
+            for wrap in [false, true] {
+                let mut state = DiffViewState::new();
+                state.load_from_diff_output("mixed", &format!("{BINARY_DIFF}{TEXT_DIFF}"));
+                state.view_layout = layout;
+                state.wrap = wrap;
+                state.scroll_offset = 3; // Middle row of the binary placeholder.
+                let buf = render_preview(&mut state, 80, 10);
+                assert!(buffer_row(&buf, 1).contains("foo.png"));
+                assert!(buffer_row(&buf, 2).contains("Binary cannot be previewed"));
+                assert!(buffer_row(&buf, 3).contains('╱'));
+                assert_eq!(
+                    (1..79).map(|x| buf[(x, 4)].symbol()).collect::<String>(),
+                    "╱".repeat(78)
+                );
+                assert!(buffer_row(&buf, 5).contains("text.txt"));
+                let panel = DiffPanelLayout::compute(buf.area, &state);
+                assert_eq!(state.line_chunk_at_row(5, &panel), Some((6, 0)));
+            }
+        }
+    }
+
+    #[test]
+    fn placeholder_clips_to_tiny_offset_areas() {
+        for width in 0..32 {
+            for height in 0..4 {
+                let mut buf = Buffer::empty(Rect::new(0, 0, 40, 8));
+                let area = Rect::new(3, 2, width, height);
+                render_preview_placeholder(
+                    &mut buf,
+                    area,
+                    "Binary cannot be previewed",
+                    &Theme::dark(),
+                );
+                for y in 0..8 {
+                    for x in 0..40 {
+                        if x < area.x || x >= area.right() || y < area.y || y >= area.bottom() {
+                            assert_eq!(buf[(x, y)].symbol(), " ");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_patch_is_placeholder_but_binary_words_in_source_are_not() {
+        let parsed = DiffViewState::parse_diff_output(
+            "foo.png",
+            "diff --git a/foo.png b/foo.png\nGIT binary patch\nliteral 3\nabc\n",
+            4,
+            true,
+        );
+        assert_eq!(
+            parsed.lines[2].preview_placeholder,
+            Some("Binary cannot be previewed")
+        );
+        let text = "diff --git a/text.txt b/text.txt\n--- a/text.txt\n+++ b/text.txt\n@@ -1,2 +1,2 @@\n Binary files are normal text here\n-old\n+new\n";
+        let parsed = DiffViewState::parse_diff_output("text.txt", text, 4, true);
+        assert!(
+            parsed
+                .lines
+                .iter()
+                .all(|line| line.preview_placeholder.is_none())
+        );
+        assert!(!parsed.hunk_starts.is_empty());
     }
 }

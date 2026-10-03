@@ -11,6 +11,9 @@ use crate::model::FileChangeStatus;
 use crate::os::platform::Platform;
 
 pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) -> Result<()> {
+    if super::diff_grep::is_diff_grep_key(key) {
+        return super::diff_grep::open_diff_grep_picker(gui);
+    }
     if super::commits::matches_key(key, &keybindings.commits.open_log_menu) {
         let selected = gui.context_mgr.selected_active();
         let selected_path = if gui.show_commit_file_tree {
@@ -116,9 +119,36 @@ fn selected_commit_file_path(gui: &Gui) -> Option<(std::path::PathBuf, String)> 
     Some((gui.git.repo_path().join(&rel_path), rel_path))
 }
 
+/// Absolute path of the selected directory node in commit-file tree view.
+fn selected_commit_dir_abs_path(gui: &Gui) -> Option<String> {
+    if !gui.show_commit_file_tree {
+        return None;
+    }
+    let selected = gui.context_mgr.selected_active();
+    let node = gui.commit_file_tree_nodes.get(selected)?;
+    if !node.is_dir {
+        return None;
+    }
+    if node.path == "." || node.path.is_empty() {
+        return Some(gui.git.repo_path().to_string_lossy().to_string());
+    }
+    Some(
+        gui.git
+            .repo_path()
+            .join(&node.path)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
 /// Open the selected commit file in the editor. A commit's blob cannot be
 /// edited in place, so this opens the working-tree copy of the same path.
 fn open_in_editor(gui: &mut Gui) -> Result<()> {
+    // Directories: open the folder in the editor.
+    if let Some(dir_abs) = selected_commit_dir_abs_path(gui) {
+        gui.pending_interactive = Some(Interactive::Edit(EditRequest::at(dir_abs, None)));
+        return Ok(());
+    }
     let Some((abs_path, rel_path)) = selected_commit_file_path(gui) else {
         return Ok(());
     };
@@ -135,6 +165,17 @@ fn open_in_editor(gui: &mut Gui) -> Result<()> {
 
 /// Open the working-tree copy of the selected commit file in the default program.
 fn open_in_default_program(gui: &mut Gui) -> Result<()> {
+    let open_template = &gui.config.user_config.os.open;
+    // Directories: open the folder with `os.open` (native file viewer by
+    // default), falling back to the platform opener.
+    if let Some(dir_abs) = selected_commit_dir_abs_path(gui) {
+        if open_template.is_empty() {
+            Platform::open_file(&dir_abs)?;
+        } else {
+            crate::config::user_config::OsConfig::run_template(open_template, &dir_abs)?;
+        }
+        return Ok(());
+    }
     let Some((abs_path, rel_path)) = selected_commit_file_path(gui) else {
         return Ok(());
     };
@@ -142,7 +183,6 @@ fn open_in_default_program(gui: &mut Gui) -> Result<()> {
         anyhow::bail!("no longer in the working tree: {rel_path}");
     }
 
-    let open_template = &gui.config.user_config.os.open;
     crate::config::user_config::OsConfig::run_template(open_template, &abs_path.to_string_lossy())?;
     Ok(())
 }

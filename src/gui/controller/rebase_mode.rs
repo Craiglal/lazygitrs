@@ -193,38 +193,128 @@ fn handle_in_progress_key(gui: &mut Gui, key: KeyEvent) -> Result<()> {
         return abort_rebase(gui);
     }
 
-    // Navigation (read-only, just for viewing)
     let entry_count = gui.rebase_mode.entries.len();
     if entry_count == 0 {
         return Ok(());
     }
 
+    // Navigation
     match key.code {
-        KeyCode::Char('j') | KeyCode::Down => {
+        KeyCode::Char('j') | KeyCode::Down if !key.modifiers.contains(KeyModifiers::ALT) => {
             if gui.rebase_mode.selected + 1 < entry_count {
                 gui.rebase_mode.selected += 1;
             }
+            let vh = gui.rebase_mode.visible_height;
+            gui.rebase_mode.ensure_visible(vh);
+            return Ok(());
         }
-        KeyCode::Char('k') | KeyCode::Up => {
+        KeyCode::Char('k') | KeyCode::Up if !key.modifiers.contains(KeyModifiers::ALT) => {
             if gui.rebase_mode.selected > 0 {
                 gui.rebase_mode.selected -= 1;
             }
+            let vh = gui.rebase_mode.visible_height;
+            gui.rebase_mode.ensure_visible(vh);
+            return Ok(());
         }
         KeyCode::Char('g') => {
             gui.rebase_mode.selected = 0;
+            let vh = gui.rebase_mode.visible_height;
+            gui.rebase_mode.ensure_visible(vh);
+            return Ok(());
         }
         KeyCode::Char('G') => {
             gui.rebase_mode.selected = entry_count.saturating_sub(1);
+            let vh = gui.rebase_mode.visible_height;
+            gui.rebase_mode.ensure_visible(vh);
+            return Ok(());
         }
         _ => {}
     }
-    let vh = gui.rebase_mode.visible_height;
-    gui.rebase_mode.ensure_visible(vh);
+
+    // Action shortcuts for remaining (Pending) commits — persisted to disk.
+    match key.code {
+        KeyCode::Char('p') => {
+            gui.rebase_mode.set_action(RebaseAction::Pick);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('r') => {
+            gui.rebase_mode.set_action(RebaseAction::Reword);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('e') => {
+            gui.rebase_mode.set_action(RebaseAction::Edit);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('s') => {
+            gui.rebase_mode.set_action(RebaseAction::Squash);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('f') => {
+            gui.rebase_mode.set_action(RebaseAction::Fixup);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('d') => {
+            gui.rebase_mode.set_action(RebaseAction::Drop);
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('l') | KeyCode::Right => {
+            gui.rebase_mode.cycle_action_forward();
+            return persist_in_progress_todo(gui);
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            gui.rebase_mode.cycle_action_backward();
+            return persist_in_progress_todo(gui);
+        }
+        _ => {}
+    }
+
+    // Reorder remaining pending entries (Alt+j/k or [ / ]).
+    if ((key.code == KeyCode::Up || key.code == KeyCode::Char('k'))
+        && key.modifiers.contains(KeyModifiers::ALT))
+        || key.code == KeyCode::Char('[')
+    {
+        gui.rebase_mode.move_up();
+        let vh = gui.rebase_mode.visible_height;
+        gui.rebase_mode.ensure_visible(vh);
+        return persist_in_progress_todo(gui);
+    }
+    if ((key.code == KeyCode::Down || key.code == KeyCode::Char('j'))
+        && key.modifiers.contains(KeyModifiers::ALT))
+        || key.code == KeyCode::Char(']')
+    {
+        gui.rebase_mode.move_down();
+        let vh = gui.rebase_mode.visible_height;
+        gui.rebase_mode.ensure_visible(vh);
+        return persist_in_progress_todo(gui);
+    }
 
     Ok(())
 }
 
+fn persist_in_progress_todo(gui: &mut Gui) -> Result<()> {
+    let pending = gui.rebase_mode.pending_actions_newest_first();
+    if let Err(e) = gui.git.write_rebase_todo(&pending) {
+        gui.popup = PopupState::Message {
+            title: "Rebase todo".to_string(),
+            message: format!("Failed to update rebase todo: {e}"),
+            kind: MessageKind::Error,
+        };
+    }
+    Ok(())
+}
+
 fn continue_rebase(gui: &mut Gui) -> Result<()> {
+    // Persist any in-memory todo edits before asking git to continue.
+    let pending = gui.rebase_mode.pending_actions_newest_first();
+    if let Err(e) = gui.git.write_rebase_todo(&pending) {
+        gui.popup = PopupState::Message {
+            title: "Continue failed".to_string(),
+            message: format!("Failed to update rebase todo: {e}"),
+            kind: MessageKind::Error,
+        };
+        return Ok(());
+    }
+
     match gui.git.continue_rebase() {
         Ok(()) => {
             // Don't exit rebase mode here. Resync immediately if Git paused
@@ -309,24 +399,11 @@ fn execute_rebase(gui: &mut Gui) -> Result<()> {
     let actions = gui.rebase_mode.build_actions();
     let base_hash = gui.rebase_mode.base_hash.clone();
 
-    // Validate: squash/fixup cannot be the first action
-    if let Some((_, first_action)) = actions.first() {
-        if *first_action == RebaseAction::Squash || *first_action == RebaseAction::Fixup {
-            gui.popup = PopupState::Message {
-                title: "Invalid rebase".to_string(),
-                message: format!(
-                    "Cannot {} the first commit — there is nothing to {} into.",
-                    first_action.as_str(),
-                    first_action.as_str(),
-                ),
-                kind: MessageKind::Error,
-            };
-            return Ok(());
-        }
-    }
-
     // Switch to InProgress phase so refresh() can detect completion
     // and show the success popup (or re-enter InProgress if paused).
+    // Squash/fixup of the oldest todo is allowed: git cannot start a todo
+    // with those actions, so rebase_interactive_batch picks the onto commit
+    // and rebases onto its parent instead.
     gui.rebase_mode.phase = crate::gui::modes::rebase_mode::RebasePhase::InProgress;
 
     match gui.git.rebase_interactive_batch(&base_hash, &actions) {
@@ -408,6 +485,18 @@ fn show_in_progress_help(gui: &mut Gui) {
         ],
     };
 
+    let actions_section = CommandSection {
+        title: "Remaining commits".into(),
+        entries: vec![
+            CommandEntry::keybinding(
+                "p / r / e / s / f / d".into(),
+                "Set pick/reword/edit/squash/fixup/drop".into(),
+            ),
+            CommandEntry::keybinding("h / l".into(), "Cycle action".into()),
+            CommandEntry::keybinding("[ / ]".into(), "Reorder remaining commits".into()),
+        ],
+    };
+
     let navigation_section = CommandSection {
         title: "Navigation".into(),
         entries: vec![
@@ -427,7 +516,12 @@ fn show_in_progress_help(gui: &mut Gui) {
     };
 
     gui.popup = PopupState::CommandPalette {
-        sections: vec![rebase_section, navigation_section, general_section],
+        sections: vec![
+            rebase_section,
+            actions_section,
+            navigation_section,
+            general_section,
+        ],
         selected: 0,
         search_textarea: crate::gui::popup::make_command_palette_search_textarea(),
         scroll_offset: 0,

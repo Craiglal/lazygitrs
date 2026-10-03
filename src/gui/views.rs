@@ -20,7 +20,7 @@ use crate::pager::side_by_side::{self, DiffPanel, DiffPanelLayout, DiffViewLayou
 use super::ScreenMode;
 use super::context::{ContextId, ContextManager, SideWindow};
 use super::layout::{self, LayoutState};
-use super::popup::{CommitInputFocus, PopupState};
+use super::popup::{CommitInputFocus, PopupState, list_picker_matching_indices};
 use super::presentation;
 
 pub fn render(
@@ -96,12 +96,7 @@ pub fn render(
         if diff_focused {
             // Diff is focused: show diff fullscreen
             if !diff_view.is_empty() {
-                let show_revert_markers = selected_file_has_unstaged_changes(
-                    model,
-                    ctx_mgr,
-                    show_file_tree,
-                    file_tree_nodes,
-                ) && !diff_view.hunk_starts.is_empty();
+                let show_revert_markers = ctx_mgr.active() == ContextId::Files;
                 side_by_side::render_diff(
                     frame,
                     fl.main_panel,
@@ -203,6 +198,24 @@ pub fn render(
                         );
                     }
                 }
+                ContextId::Worktrees | ContextId::Submodules => {
+                    let items = if ctx_id == ContextId::Worktrees {
+                        render_worktree_list(model, theme)
+                    } else {
+                        render_submodule_list(model, theme)
+                    };
+                    render_list_ctx(
+                        frame,
+                        fl.main_panel,
+                        block,
+                        items,
+                        selected,
+                        true,
+                        theme,
+                        ctx_mgr,
+                        ctx_id,
+                    );
+                }
                 ContextId::Branches => {
                     let items = presentation::branches::render_branch_list(
                         model,
@@ -291,6 +304,7 @@ pub fn render(
                         ctx_id,
                         commit_list_cache,
                         false,
+                        screen_mode != ScreenMode::Normal,
                     );
                 }
                 ContextId::Stash => {
@@ -322,6 +336,7 @@ pub fn render(
                         ctx_id,
                         commit_list_cache,
                         true,
+                        screen_mode != ScreenMode::Normal,
                     );
                 }
                 ContextId::CommitFiles | ContextId::StashFiles | ContextId::BranchCommitFiles => {
@@ -392,9 +407,11 @@ pub fn render(
                 commit_details_scroll,
             );
         }
-        render_status_bar(
+        render_search_bar_or_status_bar(
             frame,
             fl.status_bar,
+            search_state,
+            search_textarea,
             ctx_mgr,
             diff_view,
             theme,
@@ -496,31 +513,10 @@ pub fn render(
                 );
             }
             ContextId::Submodules => {
-                if model.submodules.is_empty() {
-                    let widget = Paragraph::new(" (no submodules)").block(block);
-                    frame.render_widget(widget, rect);
-                } else {
-                    let items: Vec<ListItem> = model
-                        .submodules
-                        .iter()
-                        .map(|sub| {
-                            let line = Line::from(vec![
-                                Span::styled(
-                                    format!("  {} ", sub.name),
-                                    Style::default().fg(theme.accent),
-                                ),
-                                Span::styled(
-                                    sub.path.clone(),
-                                    Style::default().fg(theme.text_dimmed),
-                                ),
-                            ]);
-                            ListItem::new(line)
-                        })
-                        .collect();
-                    render_list_ctx(
-                        frame, rect, block, items, selected, is_active, theme, ctx_mgr, ctx_id,
-                    );
-                }
+                let items = render_submodule_list(model, theme);
+                render_list_ctx(
+                    frame, rect, block, items, selected, is_active, theme, ctx_mgr, ctx_id,
+                );
             }
             ContextId::Branches => {
                 // If BranchCommits or BranchCommitFiles is active, render that instead
@@ -594,6 +590,7 @@ pub fn render(
                         ContextId::BranchCommits,
                         commit_list_cache,
                         true,
+                        screen_mode != ScreenMode::Normal,
                     );
                 } else {
                     let items = presentation::branches::render_branch_list(
@@ -683,6 +680,7 @@ pub fn render(
                         ContextId::BranchCommits,
                         commit_list_cache,
                         true,
+                        screen_mode != ScreenMode::Normal,
                     );
                 } else if ctx_mgr.active() == ContextId::RemoteBranches {
                     let rb_selected = ctx_mgr.selected(ContextId::RemoteBranches);
@@ -786,6 +784,7 @@ pub fn render(
                         ContextId::BranchCommits,
                         commit_list_cache,
                         true,
+                        screen_mode != ScreenMode::Normal,
                     );
                 } else {
                     let items = presentation::tags::render_tag_list(model, theme);
@@ -865,6 +864,7 @@ pub fn render(
                         ctx_id,
                         commit_list_cache,
                         false,
+                        screen_mode != ScreenMode::Normal,
                     );
                 }
             }
@@ -1011,9 +1011,7 @@ pub fn render(
                 .border_style(theme.active_border);
             render_status_main(frame, fl.main_panel, model, config, theme, status_block);
         } else if !diff_view.is_empty() {
-            let show_revert_markers =
-                selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
-                    && !diff_view.hunk_starts.is_empty();
+            let show_revert_markers = ctx_mgr.active() == ContextId::Files;
             side_by_side::render_diff(
                 frame,
                 fl.main_panel,
@@ -1070,73 +1068,20 @@ pub fn render(
     }
 
     // Render status bar (or search bar if search is active)
-    if let Some((query, match_count, current_match)) = search_state {
-        let match_info = if match_count > 0 {
-            format!(" {}/{}", current_match + 1, match_count)
-        } else if !query.is_empty() {
-            " (no matches)".to_string()
-        } else {
-            String::new()
-        };
-
-        if let Some(ta) = search_textarea {
-            // Render: "/" prefix + textarea + match info
-            // Split the status bar into three parts
-            let prefix_width = 2u16; // " /"
-            let suffix_text = match_info;
-            let suffix_width = suffix_text.len() as u16;
-            let ta_width = fl
-                .status_bar
-                .width
-                .saturating_sub(prefix_width + suffix_width);
-
-            // Prefix " /"
-            let prefix_rect = Rect::new(fl.status_bar.x, fl.status_bar.y, prefix_width, 1);
-            let prefix = Paragraph::new(Span::styled(
-                " /",
-                Style::default().fg(theme.accent_secondary),
-            ));
-            frame.render_widget(prefix, prefix_rect);
-
-            // Textarea
-            let ta_rect = Rect::new(fl.status_bar.x + prefix_width, fl.status_bar.y, ta_width, 1);
-            frame.render_widget(ta, ta_rect);
-
-            // Suffix (match info)
-            if !suffix_text.is_empty() {
-                let suffix_rect = Rect::new(
-                    fl.status_bar.x + prefix_width + ta_width,
-                    fl.status_bar.y,
-                    suffix_width,
-                    1,
-                );
-                let suffix = Paragraph::new(Span::styled(
-                    suffix_text,
-                    Style::default().fg(theme.accent_secondary),
-                ));
-                frame.render_widget(suffix, suffix_rect);
-            }
-        } else {
-            let bar = Paragraph::new(Span::styled(
-                format!(" /{}{}", query, match_info),
-                Style::default().fg(theme.accent_secondary),
-            ));
-            frame.render_widget(bar, fl.status_bar);
-        }
-    } else {
-        render_status_bar(
-            frame,
-            fl.status_bar,
-            ctx_mgr,
-            diff_view,
-            theme,
-            model,
-            diff_focused,
-            selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
-                && !diff_view.hunk_starts.is_empty(),
-            !cherry_pick_clipboard.is_empty(),
-        );
-    }
+    render_search_bar_or_status_bar(
+        frame,
+        fl.status_bar,
+        search_state,
+        search_textarea,
+        ctx_mgr,
+        diff_view,
+        theme,
+        model,
+        diff_focused,
+        selected_file_has_unstaged_changes(model, ctx_mgr, show_file_tree, file_tree_nodes)
+            && !diff_view.hunk_starts.is_empty(),
+        !cherry_pick_clipboard.is_empty(),
+    );
 
     // Render text selection highlight overlay and tooltip
     render_selection_overlay(frame, diff_view, fl.main_panel, theme);
@@ -1273,6 +1218,22 @@ fn wrap_popup_lines(message: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
+fn render_submodule_list<'a>(model: &Model, theme: &Theme) -> Vec<ListItem<'a>> {
+    model
+        .submodules
+        .iter()
+        .map(|sub| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", sub.name),
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(sub.path.clone(), Style::default().fg(theme.text_dimmed)),
+            ]))
+        })
+        .collect()
+}
+
 fn visible_popup_lines(wrapped: &[String], max_lines: usize) -> Vec<String> {
     if wrapped.len() <= max_lines {
         return wrapped.to_vec();
@@ -1379,6 +1340,341 @@ pub fn checklist_item_at(popup: &PopupState, area: Rect, col: u16, row: u16) -> 
     }
     let idx = (row - list_start) as usize;
     if idx < visible_count { Some(idx) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::merge_conflict::TextConflictBlock;
+    use crate::gui::popup::{ChecklistItem, MenuItem, MessageKind, PopupState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::layout::Rect;
+
+    fn render_tab(
+        model: &crate::model::Model,
+        context: super::ContextId,
+        mode: super::ScreenMode,
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut contexts = super::ContextManager::new();
+        contexts.set_active(context);
+        terminal
+            .draw(|frame| {
+                super::render(
+                    frame,
+                    model,
+                    &mut contexts,
+                    &super::LayoutState::default(),
+                    &PopupState::None,
+                    &crate::config::AppConfig {
+                        debug: false,
+                        version: String::new(),
+                        user_config: Default::default(),
+                        app_state: Default::default(),
+                        config_dir: Default::default(),
+                        state_dir: Default::default(),
+                        state_path: Default::default(),
+                    },
+                    &Theme::default(),
+                    &mut super::DiffViewState::default(),
+                    &mut super::presentation::commits::CommitListCache::default(),
+                    mode,
+                    false,
+                    &[],
+                    &Default::default(),
+                    false,
+                    None,
+                    None,
+                    &[],
+                    false,
+                    &[],
+                    false,
+                    &[],
+                    &Default::default(),
+                    "",
+                    "",
+                    "",
+                    "",
+                    super::ContextId::Commits,
+                    0,
+                    None,
+                    false,
+                    &[],
+                    None,
+                    false,
+                    false,
+                    &Default::default(),
+                    &Default::default(),
+                    &mut 0,
+                    &mut String::new(),
+                    false,
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(160)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn sample_worktree(
+        path: &str,
+        branch: &str,
+        current: bool,
+        main: bool,
+    ) -> crate::model::Worktree {
+        crate::model::Worktree {
+            path: path.into(),
+            branch: branch.into(),
+            hash: String::new(),
+            is_current: current,
+            is_main: main,
+        }
+    }
+
+    #[test]
+    fn worktrees_render_names_branches_and_main_label_in_every_mode() {
+        let model = crate::model::Model {
+            worktrees: vec![
+                sample_worktree("/repos/quarta", "feat/main", true, true),
+                sample_worktree(
+                    "/repos/worktree-pfparser",
+                    "experiment/parser",
+                    false,
+                    false,
+                ),
+            ],
+            ..Default::default()
+        };
+        for mode in [
+            super::ScreenMode::Normal,
+            super::ScreenMode::Half,
+            super::ScreenMode::Full,
+        ] {
+            let rows = render_tab(&model, super::ContextId::Worktrees, mode);
+            let main = rows.iter().find(|row| row.contains("* quarta")).unwrap();
+            assert!(main.contains("* quarta"));
+            assert!(main.contains("feat/main (main worktree)"));
+            assert!(!main.contains("/repos/"));
+            let linked = rows
+                .iter()
+                .find(|row| row.contains("worktree-pfparser experiment/parser"))
+                .unwrap();
+            assert!(linked.contains("worktree-pfparser experiment/parser"));
+            assert!(!linked.contains("(main worktree)"));
+            assert!(!linked.contains("/repos/"));
+            assert_eq!(main.find("feat/main"), linked.find("experiment/parser"));
+        }
+    }
+
+    #[test]
+    fn worktree_columns_use_unicode_display_width() {
+        let model = crate::model::Model {
+            worktrees: vec![
+                sample_worktree("/repos/树", "branch-one", false, false),
+                sample_worktree("/repos/abc", "branch-two", true, false),
+            ],
+            ..Default::default()
+        };
+        let rows = render_tab(&model, super::ContextId::Worktrees, super::ScreenMode::Full);
+        assert!(rows.iter().any(|row| row.contains("树   branch-one")));
+        assert!(rows.iter().any(|row| row.contains("* abc branch-two")));
+    }
+
+    #[test]
+    fn submodules_render_in_every_mode_and_empty_lists_stay_blank() {
+        let mut model = crate::model::Model::default();
+        for mode in [
+            super::ScreenMode::Normal,
+            super::ScreenMode::Half,
+            super::ScreenMode::Full,
+        ] {
+            let rows = render_tab(&model, super::ContextId::Submodules, mode);
+            assert!(!rows.join("\n").contains("(no submodules)"));
+        }
+        model.submodules.push(crate::git::submodule::Submodule {
+            name: "shared-lib".into(),
+            path: "vendor/shared-lib".into(),
+            url: String::new(),
+        });
+        for mode in [
+            super::ScreenMode::Normal,
+            super::ScreenMode::Half,
+            super::ScreenMode::Full,
+        ] {
+            let rows = render_tab(&model, super::ContextId::Submodules, mode);
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("shared-lib vendor/shared-lib"))
+            );
+        }
+    }
+
+    #[test]
+    fn command_log_is_hidden_when_main_panel_is_absent() {
+        assert_eq!(command_log_geometry(Rect::default(), 1), None);
+    }
+
+    #[test]
+    fn command_log_visible_lines_are_clamped_to_short_main_panel() {
+        let (rect, visible_lines) =
+            command_log_geometry(Rect::new(10, 4, 80, 2), 5).expect("log should fit");
+
+        assert_eq!(visible_lines, 1);
+        assert_eq!(rect, Rect::new(40, 4, 50, 3));
+    }
+
+    #[test]
+    fn long_error_message_popup_renders_in_short_terminal() {
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let message = (0..40)
+            .map(|i| {
+                format!(
+                    "hint: divergent branches need reconciliation before pull can continue ({i})"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let popup = PopupState::Message {
+            title: "Pull error".to_string(),
+            message,
+            kind: MessageKind::Error,
+        };
+
+        terminal
+            .draw(|frame| {
+                render_popup(
+                    frame,
+                    &popup,
+                    Rect::new(0, 0, 40, 8),
+                    0,
+                    &Theme::default(),
+                    false,
+                    false,
+                );
+            })
+            .expect("long popup message should render without panicking");
+    }
+
+    #[test]
+    fn conflict_blocks_popup_does_not_panic_on_short_terminal() {
+        let popup = PopupState::ConflictBlocks {
+            path: "file.txt".to_string(),
+            blocks: vec![TextConflictBlock {
+                index: 0,
+                context_before: String::new(),
+                base: Some("base\n".to_string()),
+                ours: "ours\n".to_string(),
+                theirs: "theirs\n".to_string(),
+                context_after: String::new(),
+            }],
+            choices: vec![None],
+            selected: 0,
+            scroll_offset: 0,
+        };
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_popup(
+                    frame,
+                    &popup,
+                    Rect::new(0, 0, 80, 10),
+                    0,
+                    &Theme::default(),
+                    false,
+                    false,
+                );
+            })
+            .unwrap();
+    }
+
+    fn sample_menu() -> PopupState {
+        PopupState::Menu {
+            title: "Copy".to_string(),
+            items: vec![
+                MenuItem {
+                    label: "commit hash".to_string(),
+                    description: String::new(),
+                    key: Some("c".to_string()),
+                    action: None,
+                },
+                MenuItem {
+                    label: "commit message".to_string(),
+                    description: String::new(),
+                    key: Some("m".to_string()),
+                    action: None,
+                },
+                MenuItem {
+                    label: "author name".to_string(),
+                    description: String::new(),
+                    key: Some("a".to_string()),
+                    action: None,
+                },
+            ],
+            selected: 0,
+            loading_index: None,
+        }
+    }
+
+    #[test]
+    fn menu_item_at_hits_first_and_second_options() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = sample_menu();
+        // height = 3 items + 2 borders = 5; y = (24-5)/2 = 9; list starts at y+1 = 10
+        let x = (area
+            .width
+            .saturating_sub((area.width * 60 / 100).min(60).max(30)))
+            / 2
+            + 2;
+        assert_eq!(menu_item_at(&popup, area, x, 10), Some(0));
+        assert_eq!(menu_item_at(&popup, area, x, 11), Some(1));
+        assert_eq!(menu_item_at(&popup, area, x, 12), Some(2));
+        assert_eq!(menu_item_at(&popup, area, x, 9), None); // border
+        assert_eq!(menu_item_at(&popup, area, x, 13), None); // below
+    }
+
+    #[test]
+    fn checklist_item_at_skips_search_and_separator() {
+        let area = Rect::new(0, 0, 80, 30);
+        let popup = PopupState::Checklist {
+            title: "Pick".to_string(),
+            items: vec![
+                ChecklistItem {
+                    label: "one".to_string(),
+                    checked: false,
+                    is_free_entry: false,
+                },
+                ChecklistItem {
+                    label: "two".to_string(),
+                    checked: true,
+                    is_free_entry: false,
+                },
+            ],
+            selected: 0,
+            search_textarea: crate::gui::popup::make_checklist_search_textarea(),
+            free_entry_category: None,
+            on_confirm: Box::new(|_gui, _ids| Ok(())),
+        };
+        // height = max(8, 2+6)=8; y=(30-8)/2=11; list_start=y+1+2=14
+        let x = (area
+            .width
+            .saturating_sub((area.width * 60 / 100).min(60).max(30)))
+            / 2
+            + 2;
+        assert_eq!(checklist_item_at(&popup, area, x, 14), Some(0));
+        assert_eq!(checklist_item_at(&popup, area, x, 15), Some(1));
+        assert_eq!(checklist_item_at(&popup, area, x, 12), None); // search row
+        assert_eq!(checklist_item_at(&popup, area, x, 13), None); // separator
+    }
 }
 
 /// Build a window title like " 4 Commit Files (abc1234 feat: some change) ".
@@ -1743,17 +2039,31 @@ fn render_status_main<'a>(
 }
 
 fn render_worktree_list<'a>(model: &Model, theme: &Theme) -> Vec<ListItem<'a>> {
-    model
+    let names: Vec<_> = model
         .worktrees
         .iter()
         .map(|wt| {
+            std::path::Path::new(&wt.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&wt.path)
+        })
+        .collect();
+    let name_width = names.iter().map(|name| name.width()).max().unwrap_or(0);
+    model
+        .worktrees
+        .iter()
+        .zip(names)
+        .map(|(wt, name)| {
             let marker = if wt.is_current { "* " } else { "  " };
             let line = Line::from(vec![
                 Span::styled(marker.to_string(), Style::default().fg(theme.accent)),
+                Span::styled(name.to_string(), Style::default().fg(theme.text)),
+                Span::raw(" ".repeat(name_width - name.width() + 1)),
                 Span::styled(wt.branch.clone(), Style::default().fg(theme.ref_head)),
                 Span::styled(
-                    format!(" {}", wt.path),
-                    Style::default().fg(theme.text_dimmed),
+                    if wt.is_main { " (main worktree)" } else { "" },
+                    Style::default().fg(theme.text),
                 ),
             ]);
             ListItem::new(line)
@@ -1836,6 +2146,7 @@ fn render_commit_list_ctx(
     ctx: ContextId,
     cache: &mut presentation::commits::CommitListCache,
     sub_commits: bool,
+    full: bool,
 ) {
     let total_len = if sub_commits {
         model.sub_commits.len()
@@ -1866,6 +2177,7 @@ fn render_commit_list_ctx(
             theme,
             offset,
             visible_height,
+            full,
             cache,
         )
     } else {
@@ -1875,6 +2187,7 @@ fn render_commit_list_ctx(
             cherry_picked,
             offset,
             visible_height,
+            full,
             cache,
         )
     };
@@ -2038,9 +2351,13 @@ fn get_info_content<'a>(model: &Model, ctx_mgr: &ContextManager) -> Vec<Line<'a>
                     Line::from(format!(" Commit: {}", commit.short_hash())),
                     Line::from(format!(
                         " Author: {} <{}>",
-                        commit.author_name, commit.author_email
+                        super::presentation::text::plain_text(&commit.author_name),
+                        super::presentation::text::plain_text(&commit.author_email)
                     )),
-                    Line::from(format!(" Message: {}", commit.name)),
+                    Line::from(format!(
+                        " Message: {}",
+                        super::presentation::text::plain_text(&commit.name)
+                    )),
                 ]
             } else {
                 vec![Line::from(" No commit selected")]
@@ -2134,6 +2451,80 @@ fn get_info_content<'a>(model: &Model, ctx_mgr: &ContextManager) -> Vec<Line<'a>
     }
 }
 
+fn render_search_bar_or_status_bar(
+    frame: &mut Frame,
+    status_bar: Rect,
+    search_state: Option<(&str, usize, usize)>,
+    search_textarea: Option<&tui_textarea::TextArea<'_>>,
+    ctx_mgr: &ContextManager,
+    diff_view: &DiffViewState,
+    theme: &Theme,
+    model: &Model,
+    diff_focused: bool,
+    diff_block_actions_available: bool,
+    has_copied_commits: bool,
+) {
+    if let Some((query, match_count, current_match)) = search_state {
+        let match_info = if match_count > 0 {
+            format!(" {}/{}", current_match + 1, match_count)
+        } else if !query.is_empty() {
+            " (no matches)".to_string()
+        } else {
+            String::new()
+        };
+
+        if let Some(ta) = search_textarea {
+            // Render: "/" prefix + textarea + match info
+            let prefix_width = 2u16; // " /"
+            let suffix_text = match_info;
+            let suffix_width = suffix_text.len() as u16;
+            let ta_width = status_bar.width.saturating_sub(prefix_width + suffix_width);
+
+            let prefix_rect = Rect::new(status_bar.x, status_bar.y, prefix_width, 1);
+            let prefix = Paragraph::new(Span::styled(
+                " /",
+                Style::default().fg(theme.accent_secondary),
+            ));
+            frame.render_widget(prefix, prefix_rect);
+
+            let ta_rect = Rect::new(status_bar.x + prefix_width, status_bar.y, ta_width, 1);
+            frame.render_widget(ta, ta_rect);
+
+            if !suffix_text.is_empty() {
+                let suffix_rect = Rect::new(
+                    status_bar.x + prefix_width + ta_width,
+                    status_bar.y,
+                    suffix_width,
+                    1,
+                );
+                let suffix = Paragraph::new(Span::styled(
+                    suffix_text,
+                    Style::default().fg(theme.accent_secondary),
+                ));
+                frame.render_widget(suffix, suffix_rect);
+            }
+        } else {
+            let bar = Paragraph::new(Span::styled(
+                format!(" /{}{}", query, match_info),
+                Style::default().fg(theme.accent_secondary),
+            ));
+            frame.render_widget(bar, status_bar);
+        }
+    } else {
+        render_status_bar(
+            frame,
+            status_bar,
+            ctx_mgr,
+            diff_view,
+            theme,
+            model,
+            diff_focused,
+            diff_block_actions_available,
+            has_copied_commits,
+        );
+    }
+}
+
 fn render_status_bar(
     frame: &mut Frame,
     rect: Rect,
@@ -2164,7 +2555,7 @@ fn render_status_bar(
         // hunk is actually selected (pressing it otherwise is a no-op).
         if ctx_mgr.active() == ContextId::Files {
             if diff_view.block_mode_active && diff_block_actions_available {
-                hints.insert(0, ("s", "stage block"));
+                hints.insert(0, ("s", "stage/unstage block"));
                 hints.insert(1, ("r", "revert block"));
                 hints.insert(2, ("j/k", "move block"));
                 hints.insert(3, ("q/esc", "exit block mode"));
@@ -2371,7 +2762,7 @@ pub fn render_selection_overlay(
             .map(|(line_idx, _, panel)| (line_idx, panel))
             .unwrap_or_else(|| {
                 (
-                    diff_view.scroll_offset + (top_row - pl.inner_y) as usize,
+                    diff_view.fallback_line_idx_for_row(top_row, &pl),
                     selection.panel,
                 )
             });
@@ -2463,7 +2854,7 @@ pub fn render_selection_overlay(
         let line_idx = diff_view
             .line_chunk_at_row(row, &pl)
             .map(|(line_idx, _)| line_idx)
-            .unwrap_or_else(|| diff_view.scroll_offset + (row - pl.inner_y) as usize);
+            .unwrap_or_else(|| diff_view.fallback_line_idx_for_row(row, &pl));
         if let Some(diff_line) = diff_view.lines.get(line_idx) {
             // Skip file header separator lines.
             if diff_line.file_header.is_some() {
@@ -2979,7 +3370,10 @@ pub fn render_popup(
         } => {
             // Two-field commit editor: summary (1 line) + body (multi-line)
             // Layout: border, summary label, summary input, body label, body textarea, hint, border
-            let ta_height = 16u16;
+            let ta_height = 16u16.min(area.height);
+            if ta_height < 3 || popup_width < 3 {
+                return;
+            }
             let ta_y = (area.height.saturating_sub(ta_height)) / 2;
             let ta_rect = Rect::new(x, ta_y, popup_width, ta_height);
             frame.render_widget(Clear, ta_rect);
@@ -3458,8 +3852,8 @@ pub fn render_popup(
         } => {
             // Collect all visible entries (filtered by search) as flat list with section headers
             let search = search_textarea.lines().join("");
-            let search_lower = search.to_lowercase();
-            let has_search = !search_lower.is_empty();
+            let tokens = super::popup::list_picker_search_tokens(&search);
+            let has_search = !tokens.is_empty();
 
             // Build flat display list: (is_header, key, description, executable)
             let mut display: Vec<(bool, String, String, bool)> = Vec::new();
@@ -3469,8 +3863,11 @@ pub fn render_popup(
                         .entries
                         .iter()
                         .filter(|e| {
-                            e.key.to_lowercase().contains(&search_lower)
-                                || e.description.to_lowercase().contains(&search_lower)
+                            super::popup::command_palette_entry_matches(
+                                &e.key,
+                                &e.description,
+                                &tokens,
+                            )
                         })
                         .collect()
                 } else {
@@ -3616,23 +4013,33 @@ pub fn render_popup(
                         if !has_search {
                             return vec![Span::styled(text.to_string(), base)];
                         }
-                        let lower = text.to_lowercase();
-                        if let Some(pos) = lower.find(&search_lower) {
-                            let before = &text[..pos];
-                            let matched = &text[pos..pos + search_lower.len()];
-                            let after = &text[pos + search_lower.len()..];
-                            let mut s = Vec::new();
-                            if !before.is_empty() {
-                                s.push(Span::styled(before.to_string(), base));
-                            }
-                            s.push(Span::styled(matched.to_string(), highlight_style));
-                            if !after.is_empty() {
-                                s.push(Span::styled(after.to_string(), base));
-                            }
-                            s
-                        } else {
-                            vec![Span::styled(text.to_string(), base)]
+                        // Highlight every query token (order-free), mirroring
+                        // the list-picker highlight.
+                        let ranges = super::popup::list_picker_highlight_ranges(text, &tokens);
+                        if ranges.is_empty() {
+                            return vec![Span::styled(text.to_string(), base)];
                         }
+                        let mut s = Vec::new();
+                        let mut cursor = 0usize;
+                        for (start, end) in ranges {
+                            if start > cursor {
+                                if let Some(chunk) = text.get(cursor..start) {
+                                    if !chunk.is_empty() {
+                                        s.push(Span::styled(chunk.to_string(), base));
+                                    }
+                                }
+                            }
+                            if let Some(chunk) = text.get(start..end) {
+                                s.push(Span::styled(chunk.to_string(), highlight_style));
+                            }
+                            cursor = end;
+                        }
+                        if let Some(rest) = text.get(cursor..) {
+                            if !rest.is_empty() {
+                                s.push(Span::styled(rest.to_string(), base));
+                            }
+                        }
+                        s
                     };
 
                     let mut spans = build_spans(&key_display, key_base_style);
@@ -3655,7 +4062,7 @@ pub fn render_popup(
             // Hint bar at bottom
             let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
             let hint = Line::from(vec![
-                Span::styled(" j/k", Style::default().fg(theme.accent_secondary)),
+                Span::styled(" ↑↓", Style::default().fg(theme.accent_secondary)),
                 Span::styled(": navigate  ", Style::default().fg(theme.text_dimmed)),
                 Span::styled("type", Style::default().fg(theme.accent_secondary)),
                 Span::styled(": search  ", Style::default().fg(theme.text_dimmed)),
@@ -3809,23 +4216,43 @@ fn render_list_picker(
     hints: &[(&str, &str)],
 ) {
     let search = core.search_textarea.lines().join("");
-    let search_lower = search.to_lowercase();
+    let search_lower = search.trim().to_lowercase();
+    let matching = list_picker_matching_indices(&core.items, &search);
 
-    // Build display rows: interleave category headers with items
-    let has_categories = core.items.iter().any(|i| !i.category.is_empty());
-    let mut display: Vec<(bool, String)> = Vec::new(); // (is_header, label)
+    // Build display rows from matching items only (search filters the list).
+    let has_categories = matching
+        .iter()
+        .any(|&i| core.items.get(i).is_some_and(|it| !it.category.is_empty()));
+    // (is_header, label, item_idx, description)
+    let mut display: Vec<(bool, String, Option<usize>, Option<String>)> = Vec::new();
     if has_categories {
         let mut last_cat = String::new();
-        for item in core.items.iter() {
+        for &ei in &matching {
+            let Some(item) = core.items.get(ei) else {
+                continue;
+            };
             if !item.category.is_empty() && item.category != last_cat {
-                display.push((true, item.category.clone()));
+                display.push((true, item.category.clone(), None, None));
                 last_cat = item.category.clone();
             }
-            display.push((false, item.label.clone()));
+            display.push((
+                false,
+                item.label.clone(),
+                Some(ei),
+                item.description.clone(),
+            ));
         }
     } else {
-        for item in core.items.iter() {
-            display.push((false, item.label.clone()));
+        for &ei in &matching {
+            let Some(item) = core.items.get(ei) else {
+                continue;
+            };
+            display.push((
+                false,
+                item.label.clone(),
+                Some(ei),
+                item.description.clone(),
+            ));
         }
     }
 
@@ -3887,22 +4314,15 @@ fn render_list_picker(
     let max_scroll = display.len().saturating_sub(list_height);
     let effective_scroll = core.scroll_offset.min(max_scroll);
 
-    let visible_display: Vec<&(bool, String)> = display
+    let visible_display: Vec<&(bool, String, Option<usize>, Option<String>)> = display
         .iter()
         .skip(effective_scroll)
         .take(list_height)
         .collect();
 
-    // Count how many non-header items are before the visible window
-    let mut entry_idx = 0usize;
-    for (is_header, _) in display.iter().take(effective_scroll) {
-        if !is_header {
-            entry_idx += 1;
-        }
-    }
-
+    let content_w = list_area.width as usize;
     let mut list_items: Vec<ListItem> = Vec::new();
-    for (is_header, label) in visible_display {
+    for (is_header, label, item_idx, description) in visible_display {
         if *is_header {
             let line = Line::from(vec![Span::styled(
                 format!(" {} ", label),
@@ -3912,8 +4332,7 @@ fn render_list_picker(
             )]);
             list_items.push(ListItem::new(line));
         } else {
-            let is_selected = entry_idx == core.selected;
-            entry_idx += 1;
+            let is_selected = *item_idx == Some(core.selected);
 
             let base_fg = if is_selected {
                 theme.text_strong
@@ -3929,31 +4348,38 @@ fn render_list_picker(
                 Style::default().fg(theme.accent_secondary),
             )];
 
-            // Build label spans with search match highlighting
+            // Build label spans with search match highlighting.
+            // Multi-word queries highlight every token in either order,
+            // mirroring `list_picker_matching_indices` (token-AND).
             if !search_lower.is_empty() {
-                let label_lower = label.to_lowercase();
-                if let Some(pos) = label_lower.find(&search_lower) {
-                    let before = &label[..pos];
-                    let matched = &label[pos..pos + search_lower.len()];
-                    let after = &label[pos + search_lower.len()..];
-                    if !before.is_empty() {
-                        spans.push(Span::styled(
-                            before.to_string(),
-                            Style::default().fg(base_fg),
-                        ));
-                    }
+                let tokens = super::popup::list_picker_search_tokens(&search);
+                let ranges = super::popup::list_picker_highlight_ranges(label, &tokens);
+                if ranges.is_empty() {
+                    spans.push(Span::styled(label.clone(), Style::default().fg(base_fg)));
+                } else {
                     let match_style = Style::default()
                         .fg(highlight_fg)
                         .add_modifier(Modifier::BOLD);
-                    spans.push(Span::styled(matched.to_string(), match_style));
-                    if !after.is_empty() {
-                        spans.push(Span::styled(
-                            after.to_string(),
-                            Style::default().fg(base_fg),
-                        ));
+                    let base_style = Style::default().fg(base_fg);
+                    let mut cursor = 0usize;
+                    for (s, e) in ranges {
+                        if s > cursor {
+                            if let Some(chunk) = label.get(cursor..s) {
+                                if !chunk.is_empty() {
+                                    spans.push(Span::styled(chunk.to_string(), base_style));
+                                }
+                            }
+                        }
+                        if let Some(chunk) = label.get(s..e) {
+                            spans.push(Span::styled(chunk.to_string(), match_style));
+                        }
+                        cursor = e;
                     }
-                } else {
-                    spans.push(Span::styled(label.clone(), Style::default().fg(base_fg)));
+                    if let Some(rest) = label.get(cursor..) {
+                        if !rest.is_empty() {
+                            spans.push(Span::styled(rest.to_string(), base_style));
+                        }
+                    }
                 }
             } else {
                 let style = if is_selected {
@@ -3962,6 +4388,22 @@ fn render_list_picker(
                     Style::default().fg(base_fg)
                 };
                 spans.push(Span::styled(label.clone(), style));
+            }
+
+            if let Some(desc) = description.as_deref().filter(|d| !d.is_empty()) {
+                let used: usize = spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                let desc_w = UnicodeWidthStr::width(desc);
+                let pad = content_w.saturating_sub(used).saturating_sub(desc_w);
+                if pad > 0 {
+                    spans.push(Span::raw(" ".repeat(pad)));
+                }
+                spans.push(Span::styled(
+                    desc.to_string(),
+                    Style::default().fg(theme.text_dimmed),
+                ));
             }
 
             let line = Line::from(spans);
@@ -4062,174 +4504,4 @@ fn render_commit_details_panel(
         compact,
         scroll,
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::git::merge_conflict::TextConflictBlock;
-    use crate::gui::popup::{ChecklistItem, MenuItem, MessageKind, PopupState};
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
-
-    #[test]
-    fn command_log_is_hidden_when_main_panel_is_absent() {
-        assert_eq!(command_log_geometry(Rect::default(), 1), None);
-    }
-
-    #[test]
-    fn command_log_visible_lines_are_clamped_to_short_main_panel() {
-        let (rect, visible_lines) =
-            command_log_geometry(Rect::new(10, 4, 80, 2), 5).expect("log should fit");
-
-        assert_eq!(visible_lines, 1);
-        assert_eq!(rect, Rect::new(40, 4, 50, 3));
-    }
-
-    #[test]
-    fn long_error_message_popup_renders_in_short_terminal() {
-        let backend = TestBackend::new(40, 8);
-        let mut terminal = Terminal::new(backend).expect("test terminal");
-        let message = (0..40)
-            .map(|i| {
-                format!(
-                    "hint: divergent branches need reconciliation before pull can continue ({i})"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let popup = PopupState::Message {
-            title: "Pull error".to_string(),
-            message,
-            kind: MessageKind::Error,
-        };
-
-        terminal
-            .draw(|frame| {
-                render_popup(
-                    frame,
-                    &popup,
-                    Rect::new(0, 0, 40, 8),
-                    0,
-                    &Theme::default(),
-                    false,
-                    false,
-                );
-            })
-            .expect("long popup message should render without panicking");
-    }
-
-    #[test]
-    fn conflict_blocks_popup_does_not_panic_on_short_terminal() {
-        let popup = PopupState::ConflictBlocks {
-            path: "file.txt".to_string(),
-            blocks: vec![TextConflictBlock {
-                index: 0,
-                context_before: String::new(),
-                base: Some("base\n".to_string()),
-                ours: "ours\n".to_string(),
-                theirs: "theirs\n".to_string(),
-                context_after: String::new(),
-            }],
-            choices: vec![None],
-            selected: 0,
-            scroll_offset: 0,
-        };
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = Terminal::new(backend).unwrap();
-
-        terminal
-            .draw(|frame| {
-                render_popup(
-                    frame,
-                    &popup,
-                    Rect::new(0, 0, 80, 10),
-                    0,
-                    &Theme::default(),
-                    false,
-                    false,
-                );
-            })
-            .unwrap();
-    }
-
-    fn sample_menu() -> PopupState {
-        PopupState::Menu {
-            title: "Copy".to_string(),
-            items: vec![
-                MenuItem {
-                    label: "commit hash".to_string(),
-                    description: String::new(),
-                    key: Some("c".to_string()),
-                    action: None,
-                },
-                MenuItem {
-                    label: "commit message".to_string(),
-                    description: String::new(),
-                    key: Some("m".to_string()),
-                    action: None,
-                },
-                MenuItem {
-                    label: "author name".to_string(),
-                    description: String::new(),
-                    key: Some("a".to_string()),
-                    action: None,
-                },
-            ],
-            selected: 0,
-            loading_index: None,
-        }
-    }
-
-    #[test]
-    fn menu_item_at_hits_first_and_second_options() {
-        let area = Rect::new(0, 0, 80, 24);
-        let popup = sample_menu();
-        // height = 3 items + 2 borders = 5; y = (24-5)/2 = 9; list starts at y+1 = 10
-        let x = (area
-            .width
-            .saturating_sub((area.width * 60 / 100).min(60).max(30)))
-            / 2
-            + 2;
-        assert_eq!(menu_item_at(&popup, area, x, 10), Some(0));
-        assert_eq!(menu_item_at(&popup, area, x, 11), Some(1));
-        assert_eq!(menu_item_at(&popup, area, x, 12), Some(2));
-        assert_eq!(menu_item_at(&popup, area, x, 9), None); // border
-        assert_eq!(menu_item_at(&popup, area, x, 13), None); // below
-    }
-
-    #[test]
-    fn checklist_item_at_skips_search_and_separator() {
-        let area = Rect::new(0, 0, 80, 30);
-        let popup = PopupState::Checklist {
-            title: "Pick".to_string(),
-            items: vec![
-                ChecklistItem {
-                    label: "one".to_string(),
-                    checked: false,
-                    is_free_entry: false,
-                },
-                ChecklistItem {
-                    label: "two".to_string(),
-                    checked: true,
-                    is_free_entry: false,
-                },
-            ],
-            selected: 0,
-            search_textarea: crate::gui::popup::make_checklist_search_textarea(),
-            free_entry_category: None,
-            on_confirm: Box::new(|_gui, _ids| Ok(())),
-        };
-        // height = max(8, 2+6)=8; y=(30-8)/2=11; list_start=y+1+2=14
-        let x = (area
-            .width
-            .saturating_sub((area.width * 60 / 100).min(60).max(30)))
-            / 2
-            + 2;
-        assert_eq!(checklist_item_at(&popup, area, x, 14), Some(0));
-        assert_eq!(checklist_item_at(&popup, area, x, 15), Some(1));
-        assert_eq!(checklist_item_at(&popup, area, x, 12), None); // search row
-        assert_eq!(checklist_item_at(&popup, area, x, 13), None); // separator
-    }
 }

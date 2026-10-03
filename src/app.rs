@@ -37,10 +37,11 @@ fn relaunch_repo(path: &Path, debug: bool) -> Result<()> {
 pub struct App {
     pub config: AppConfig,
     pub repo_path: PathBuf,
+    pub filter_path: Option<PathBuf>,
 }
 
 impl App {
-    pub fn new(repo_path: PathBuf, debug: bool) -> Result<Self> {
+    pub fn new(repo_path: PathBuf, debug: bool, filter_path: Option<PathBuf>) -> Result<Self> {
         let config = AppConfig::load(debug)?;
 
         // Validate git repo
@@ -48,7 +49,11 @@ impl App {
             anyhow::bail!("'{}' is not a git repository", repo_path.display());
         }
 
-        Ok(Self { config, repo_path })
+        Ok(Self {
+            config,
+            repo_path,
+            filter_path,
+        })
     }
 
     pub fn run(mut self) -> Result<()> {
@@ -61,7 +66,9 @@ impl App {
 
         let debug = self.config.debug;
 
-        let mut gui = Gui::new(self.config, git)?;
+        // Pass `-f` into Gui::new so the initial model stream loads filtered
+        // commits immediately (no wait for full refresh + second git log).
+        let mut gui = Gui::new(self.config, git, self.filter_path)?;
         gui.run()?;
 
         if let Some(path) = gui.take_pending_repo_open() {

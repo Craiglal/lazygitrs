@@ -13,6 +13,9 @@ use crate::os::platform::Platform;
 use crate::pager::side_by_side::DiffPanel;
 
 pub fn handle_key(gui: &mut Gui, key: KeyEvent, keybindings: &KeybindingConfig) -> Result<()> {
+    if super::diff_grep::is_diff_grep_key(key) {
+        return super::diff_grep::open_diff_grep_picker(gui);
+    }
     if super::commits::matches_key(key, &keybindings.commits.open_log_menu) {
         return super::commits::show_files_filtering_menu(gui);
     }
@@ -562,7 +565,35 @@ fn copy_to_clipboard_menu(gui: &mut Gui) -> Result<()> {
     Ok(())
 }
 
+/// Absolute path of the selected directory node in tree view, if any.
+/// Returns None for file nodes or when the tree view is off.
+fn selected_dir_abs_path(gui: &Gui) -> Option<String> {
+    if !gui.show_file_tree {
+        return None;
+    }
+    let selected = gui.context_mgr.selected_active();
+    let node = gui.file_tree_nodes.get(selected)?;
+    if !node.is_dir {
+        return None;
+    }
+    if node.path == "." || node.path.is_empty() {
+        return Some(gui.git.repo_path().to_string_lossy().to_string());
+    }
+    Some(
+        gui.git
+            .repo_path()
+            .join(&node.path)
+            .to_string_lossy()
+            .to_string(),
+    )
+}
+
 fn open_in_editor(gui: &mut Gui) -> Result<()> {
+    // Directories: open the folder in the editor (e.g. `code <dir>`).
+    if let Some(dir_abs) = selected_dir_abs_path(gui) {
+        gui.pending_interactive = Some(Interactive::Edit(EditRequest::at(dir_abs, None)));
+        return Ok(());
+    }
     let Some(file_idx) = gui.selected_file_index() else {
         return Ok(());
     };
@@ -598,6 +629,17 @@ fn open_in_editor(gui: &mut Gui) -> Result<()> {
 }
 
 fn open_in_default_program(gui: &mut Gui) -> Result<()> {
+    // Directories: open the folder with `os.open` (native file viewer by
+    // default), falling back to the platform opener.
+    if let Some(dir_abs) = selected_dir_abs_path(gui) {
+        let open_template = &gui.config.user_config.os.open;
+        if open_template.is_empty() {
+            Platform::open_file(&dir_abs)?;
+        } else {
+            crate::config::user_config::OsConfig::run_template(open_template, &dir_abs)?;
+        }
+        return Ok(());
+    }
     let Some(file_idx) = gui.selected_file_index() else {
         return Ok(());
     };
@@ -731,24 +773,19 @@ fn discard_file(gui: &mut Gui) -> Result<()> {
             if node.is_dir {
                 let child_indices = node.child_file_indices.clone();
                 let model = gui.model.lock().unwrap();
-                let files_info: Vec<(String, bool)> = child_indices
+                let files: Vec<_> = child_indices
                     .iter()
-                    .filter_map(|&i| {
-                        model
-                            .files
-                            .get(i)
-                            .map(|f| (f.current_path().to_string(), f.added))
-                    })
+                    .filter_map(|&i| model.files.get(i).cloned())
                     .collect();
                 let dir_name = node.name.clone();
                 drop(model);
 
-                if files_info.is_empty() {
+                if files.is_empty() {
                     return Ok(());
                 }
 
                 if !gui.config.user_config.gui.skip_discard_change_warning {
-                    let files_info_clone = files_info.clone();
+                    let files_clone = files.clone();
                     gui.popup = PopupState::Menu {
                         title: format!("Discard all changes in '{}'?", dir_name),
                         items: vec![
@@ -757,9 +794,7 @@ fn discard_file(gui: &mut Gui) -> Result<()> {
                                 description: "discard all changes".to_string(),
                                 key: Some("d".to_string()),
                                 action: Some(Box::new(move |gui| {
-                                    for (name, added) in &files_info_clone {
-                                        gui.git.discard_file(name, *added)?;
-                                    }
+                                    gui.git.discard_files(&files_clone)?;
                                     gui.needs_refresh = true;
                                     Ok(())
                                 })),
@@ -775,9 +810,7 @@ fn discard_file(gui: &mut Gui) -> Result<()> {
                         loading_index: None,
                     };
                 } else {
-                    for (name, added) in &files_info {
-                        gui.git.discard_file(name, *added)?;
-                    }
+                    gui.git.discard_files(&files)?;
                     gui.needs_refresh = true;
                 }
                 return Ok(());

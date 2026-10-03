@@ -1,6 +1,7 @@
 use anyhow::Result;
 use crossterm::event::KeyEvent;
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 use crate::git::merge_conflict::{ResolveChoice, TextConflictBlock};
 
@@ -12,39 +13,26 @@ fn is_word_char(c: char) -> bool {
 
 /// Synchronize a free-entry row and keep it selected. Used where the typed
 /// value is valid on its own and suggestions are optional completions.
+///
+/// An empty `free_entry_category` opts out of the synthetic row (e.g. the
+/// diff-grep dialog only confirms real matches): no row is inserted or
+/// stripped — real items with empty categories are left alone — and the
+/// selection is just kept on a matching item.
 pub fn sync_list_picker_prefer_free_entry(core: &mut ListPickerCore, free_entry_category: &str) {
     sync_list_picker_free_entry(core, free_entry_category);
-    if !core.search_textarea.lines().join("").trim().is_empty() {
+    if !free_entry_category.is_empty() && !core.search_textarea.lines().join("").trim().is_empty() {
         core.selected = 0;
     }
 }
 
-/// Reverse hard-wrapping in an externally-formatted commit body so it can be
-/// loaded into a soft-wrapped editor without spurious mid-paragraph line breaks.
+/// Normalize an externally-sourced commit body for the soft-wrapped editor.
 ///
-/// Convention: blank lines separate paragraphs; consecutive non-blank lines
-/// inside a paragraph are joined back into one logical line. Used when loading
-/// AI-generated messages, clipboard pastes via the menu, and history entries.
+/// Soft-wrap is display-only (`BodySoftWrap` / `WrapLayout`), so logical
+/// newlines from AI output, clipboard pastes, and history must be preserved.
+/// Joining consecutive lines used to collapse bullet lists into one line
+/// (`- a\n- b` → `- a - b`); we only normalize `\r\n` / trailing `\r`.
 pub fn unwrap_commit_body(text: &str) -> String {
-    let mut paragraphs: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for line in text.lines() {
-        if line.trim().is_empty() {
-            if !current.is_empty() {
-                paragraphs.push(std::mem::take(&mut current));
-            }
-            // Multiple blank lines collapse into one paragraph break.
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(line);
-        }
-    }
-    if !current.is_empty() {
-        paragraphs.push(current);
-    }
-    paragraphs.join("\n\n")
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Source-of-truth for the commit body when soft-wrap is in effect. The body
@@ -80,6 +68,7 @@ impl WrapLayout {
         let mut para_start = 0usize;
         let paragraphs: Vec<&str> = raw.split('\n').collect();
         let total_paragraphs = paragraphs.len();
+        let wrap_width = wrap_width.max(1);
         for (p_idx, para) in paragraphs.iter().enumerate() {
             let chars: Vec<char> = para.chars().collect();
             if chars.is_empty() {
@@ -88,40 +77,51 @@ impl WrapLayout {
                     raw_start: para_start,
                     char_len: 0,
                 });
-            } else if wrap_width == 0 {
-                lines.push(WrapLine {
-                    text: para.to_string(),
-                    raw_start: para_start,
-                    char_len: chars.len(),
-                });
             } else {
                 let mut start = 0usize;
                 while start < chars.len() {
-                    let remaining = chars.len() - start;
-                    if remaining <= wrap_width {
-                        let text: String = chars[start..].iter().collect();
-                        lines.push(WrapLine {
-                            text,
-                            raw_start: para_start + start,
-                            char_len: remaining,
-                        });
-                        start = chars.len();
-                    } else {
-                        let window = &chars[start..start + wrap_width];
-                        let break_at = window.iter().rposition(|c| *c == ' ');
-                        let (line_end, consumed) = match break_at {
-                            Some(0) | None => (start + wrap_width, 0),
-                            Some(i) => (start + i, 1),
-                        };
-                        let text: String = chars[start..line_end].iter().collect();
-                        let len = line_end - start;
-                        lines.push(WrapLine {
-                            text,
-                            raw_start: para_start + start,
-                            char_len: len,
-                        });
-                        start = line_end + consumed;
+                    // Grow by display width (crabcode-style), not char count,
+                    // so wide glyphs don't force horizontal scroll.
+                    let mut end = start;
+                    let mut width = 0usize;
+                    let mut last_space: Option<usize> = None;
+                    while end < chars.len() {
+                        let ch = chars[end];
+                        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if end > start && width + ch_width > wrap_width {
+                            break;
+                        }
+                        if ch == ' ' {
+                            last_space = Some(end);
+                        }
+                        width += ch_width;
+                        end += 1;
+                        if width >= wrap_width {
+                            break;
+                        }
                     }
+                    if end == start {
+                        // Pathological zero-width / over-wide glyph: advance one char.
+                        end = (start + 1).min(chars.len());
+                    }
+
+                    let at_end = end >= chars.len();
+                    let (line_end, consumed) = if at_end {
+                        (end, 0)
+                    } else {
+                        match last_space {
+                            Some(i) if i > start => (i, 1),
+                            _ => (end, 0),
+                        }
+                    };
+                    let text: String = chars[start..line_end].iter().collect();
+                    let len = line_end - start;
+                    lines.push(WrapLine {
+                        text,
+                        raw_start: para_start + start,
+                        char_len: len,
+                    });
+                    start = line_end + consumed;
                 }
             }
             // Advance past this paragraph's chars + the \n separator (except after the last).
@@ -421,13 +421,23 @@ impl BodySoftWrap {
         self.cursor = layout.visual_to_cursor(row, col);
     }
 
+    /// Place the visual cursor on an already-projected `textarea` without
+    /// rebuilding it. Keeps the existing viewport so Up/Down only scroll when
+    /// the cursor would leave the visible area (browser-textarea behavior).
+    pub fn apply_cursor_into(&self, textarea: &mut TextArea<'static>, wrap_width: usize) {
+        let layout = WrapLayout::build(&self.raw, wrap_width.max(1));
+        let (row, col) = layout.cursor_to_visual(self.cursor);
+        textarea.move_cursor(CursorMove::Jump(row as u16, col as u16));
+    }
+
     /// Re-render `textarea` to display the current raw text soft-wrapped at
     /// `wrap_width`, and place the visual cursor where it logically belongs.
     ///
     /// We rebuild the textarea from scratch (rather than mutating in place)
     /// because tui_textarea's internal viewport/scroll state can get stuck
     /// past the end of content after a terminal resize. A fresh TextArea
-    /// always starts with a clean viewport.
+    /// always starts with a clean viewport. Prefer [`Self::apply_cursor_into`]
+    /// for pure cursor moves so scroll is preserved.
     pub fn render_into(&self, textarea: &mut TextArea<'static>, wrap_width: usize) {
         let layout = WrapLayout::build(&self.raw, wrap_width.max(1));
         let lines: Vec<String> = layout.lines.iter().map(|l| l.text.clone()).collect();
@@ -658,6 +668,24 @@ pub fn make_commit_summary_textarea() -> TextArea<'static> {
     make_textarea("Required")
 }
 
+/// Replace the summary textarea contents with `text`, cursor at end.
+///
+/// Always rebuilds a fresh `TextArea` so horizontal `scroll_top` is reset.
+/// Reusing select_all/cut/insert_str can leave a stale scroll past the new
+/// end (tui-textarea's `next_scroll_top` then clamps to `cursor`, showing
+/// empty space to the right of the text).
+pub fn set_commit_summary_text(textarea: &mut TextArea<'static>, text: &str) {
+    let mut fresh = make_commit_summary_textarea();
+    // Preserve focus/cursor styling from the existing widget.
+    fresh.set_cursor_style(textarea.cursor_style());
+    fresh.set_cursor_line_style(textarea.cursor_line_style());
+    fresh.set_style(textarea.style());
+    if !text.is_empty() {
+        fresh.insert_str(text);
+    }
+    *textarea = fresh;
+}
+
 pub fn make_commit_body_textarea() -> TextArea<'static> {
     let mut ta = make_textarea("Optional");
     // Body starts unfocused — hide cursor
@@ -743,6 +771,50 @@ impl CommandEntry {
 }
 
 #[cfg(test)]
+mod commit_body_wrap_tests {
+    use super::{BodySoftWrap, WrapLayout, unwrap_commit_body};
+
+    #[test]
+    fn unwrap_preserves_newlines_and_bullets() {
+        let raw = "- something\n- something 2\n\nparagraph\n";
+        assert_eq!(
+            unwrap_commit_body(raw),
+            "- something\n- something 2\n\nparagraph\n"
+        );
+    }
+
+    #[test]
+    fn unwrap_normalizes_crlf() {
+        assert_eq!(unwrap_commit_body("a\r\nb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn wrap_layout_keeps_logical_newlines_as_rows() {
+        let layout = WrapLayout::build("- something\n- something 2", 80);
+        assert_eq!(layout.line_count(), 2);
+        assert_eq!(layout.as_textarea_text(), "- something\n- something 2");
+    }
+
+    #[test]
+    fn wrap_layout_breaks_on_display_width_not_char_count() {
+        // Two wide chars (width 2 each) should wrap before a third at width 4.
+        let layout = WrapLayout::build("あああ", 4);
+        assert_eq!(layout.line_count(), 2);
+        assert_eq!(layout.as_textarea_text(), "ああ\nあ");
+    }
+
+    #[test]
+    fn soft_wrap_preserves_raw_newlines_while_rendering() {
+        let mut state = BodySoftWrap::new();
+        state.set_text("- something\n- something 2");
+        let mut ta = super::make_commit_body_textarea();
+        state.render_into(&mut ta, 80);
+        assert_eq!(state.raw(), "- something\n- something 2");
+        assert_eq!(ta.lines().join("\n"), "- something\n- something 2");
+    }
+}
+
+#[cfg(test)]
 mod command_entry_tests {
     use super::{CommandAction, CommandEntry};
     use crossterm::event::{KeyCode, KeyModifiers};
@@ -802,6 +874,8 @@ pub struct ListPickerItem {
     pub label: String,
     /// Section/category header (e.g. "Branches", "Tags"). Empty for flat lists.
     pub category: String,
+    /// Optional right-aligned dimmed label (e.g. "light" / "dark" for themes).
+    pub description: Option<String>,
 }
 
 /// Shared state for searchable list picker popups (RefPicker, ThemePicker, etc.).
@@ -827,10 +901,29 @@ pub fn remove_free_entry_item(items: &mut Vec<ListPickerItem>, free_entry_catego
 /// After the search textarea changes, sync the free-entry synthetic item and
 /// update selection to the first matching real item (or the free-entry row).
 ///
+/// An empty `free_entry_category` disables the synthetic row entirely (used
+/// by pickers like diff-grep that only confirm real matches): items are left
+/// untouched and selection is clamped to matches. Callers must check the
+/// selection is a real match before confirming (zero matches = no-op).
+///
 /// Scroll offset is left to the caller when matches exist (key vs paste differ);
 /// when search is cleared, `scroll_offset` is reset to 0.
 pub fn sync_list_picker_free_entry(core: &mut ListPickerCore, free_entry_category: &str) {
     let new_search = core.search_textarea.lines().join("");
+    if free_entry_category.is_empty() {
+        if new_search.trim().is_empty() {
+            if !core.items.is_empty() {
+                core.selected = 0;
+            }
+            core.scroll_offset = 0;
+        } else {
+            let matching = list_picker_matching_indices(&core.items, &new_search);
+            if let Some(sel) = list_picker_clamp_selection_to_matches(&matching, core.selected) {
+                core.selected = sel;
+            }
+        }
+        return;
+    }
     remove_free_entry_item(&mut core.items, free_entry_category);
 
     let new_lower = new_search.to_lowercase();
@@ -842,13 +935,16 @@ pub fn sync_list_picker_free_entry(core: &mut ListPickerCore, free_entry_categor
                 value: trimmed.clone(),
                 label: trimmed,
                 category: free_entry_category.to_string(),
+                description: None,
             },
         );
 
-        if let Some(idx) = core.items.iter().skip(1).position(|i| {
-            i.label.to_lowercase().contains(&new_lower)
-                || i.value.to_lowercase().contains(&new_lower)
-        }) {
+        if let Some(idx) = core
+            .items
+            .iter()
+            .skip(1)
+            .position(|i| list_picker_item_matches(i, new_lower.trim()))
+        {
             core.selected = idx + 1;
         } else {
             core.selected = 0;
@@ -856,6 +952,182 @@ pub fn sync_list_picker_free_entry(core: &mut ListPickerCore, free_entry_categor
     } else {
         core.selected = 0;
         core.scroll_offset = 0;
+    }
+}
+
+/// Whether a list-picker row matches the current search (empty search = all).
+/// Multi-word queries are order-independent: every whitespace-separated token
+/// must appear as a case-insensitive substring of label or value.
+pub fn list_picker_item_matches(item: &ListPickerItem, search_lower: &str) -> bool {
+    if search_lower.is_empty() {
+        return true;
+    }
+    let label = item.label.to_lowercase();
+    let value = item.value.to_lowercase();
+    search_lower
+        .split_whitespace()
+        .all(|tok| label.contains(tok) || value.contains(tok))
+}
+
+/// Lowercased whitespace-separated tokens of a picker query, in order.
+/// Empty / whitespace-only queries yield no tokens (match-all).
+pub fn list_picker_search_tokens(search: &str) -> Vec<String> {
+    search
+        .split_whitespace()
+        .map(|t| t.to_lowercase())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Whether a `?` command-palette entry matches pre-tokenized `tokens`.
+/// Every token must appear in the key or the description (order-free),
+/// mirroring the list-picker token-AND behavior. Empty tokens = match-all.
+pub fn command_palette_entry_matches(key: &str, description: &str, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    let key_lower = key.to_lowercase();
+    let desc_lower = description.to_lowercase();
+    tokens
+        .iter()
+        .all(|tok| key_lower.contains(tok) || desc_lower.contains(tok))
+}
+
+/// Byte ranges in `label` covered by any of `tokens` (already lowercased),
+/// matched case-insensitively. Sorted, non-overlapping (overlaps merged).
+///
+/// Ranges index the original `label` so the caller can slice it directly for
+/// highlighting. A hit is only reported when the original slice lowercases
+/// back to the token, which keeps byte indices valid for non-ASCII text
+/// (slices that don't round-trip are skipped).
+pub fn list_picker_highlight_ranges(label: &str, tokens: &[String]) -> Vec<(usize, usize)> {
+    if tokens.is_empty() || label.is_empty() {
+        return Vec::new();
+    }
+    let lower = label.to_lowercase();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for tok in tokens {
+        if tok.is_empty() {
+            continue;
+        }
+        for (start, _) in lower.match_indices(tok.as_str()) {
+            let end = start + tok.len();
+            let Some(slice) = label.get(start..end) else {
+                continue;
+            };
+            if slice.to_lowercase() != *tok {
+                continue;
+            }
+            ranges.push((start, end));
+        }
+    }
+    if ranges.is_empty() {
+        return ranges;
+    }
+    ranges.sort();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        merged.push((s, e));
+    }
+    merged
+}
+
+/// Indices into `items` that match `search` (trimmed, case-insensitive,
+/// order-independent tokens). Lowercases the query once and each item once.
+pub fn list_picker_matching_indices(items: &[ListPickerItem], search: &str) -> Vec<usize> {
+    let search_lower = search.trim().to_lowercase();
+    if search_lower.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let tokens: Vec<&str> = search_lower.split_whitespace().collect();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            let label = item.label.to_lowercase();
+            let value = item.value.to_lowercase();
+            tokens
+                .iter()
+                .all(|tok| label.contains(tok) || value.contains(tok))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Display-row index for `sel` among only the matching items (plus category headers).
+pub fn list_picker_filtered_display_idx(
+    items: &[ListPickerItem],
+    matching: &[usize],
+    sel: usize,
+) -> usize {
+    let mut di = 0usize;
+    let mut last_cat = String::new();
+    for &ei in matching {
+        let Some(item) = items.get(ei) else {
+            continue;
+        };
+        if !item.category.is_empty() && item.category != last_cat {
+            di += 1;
+            last_cat = item.category.clone();
+        }
+        if ei == sel {
+            return di;
+        }
+        di += 1;
+    }
+    di
+}
+
+/// Next matching item index after `selected` (cycles within `matching`).
+pub fn list_picker_next_match(matching: &[usize], selected: usize) -> Option<usize> {
+    if matching.is_empty() {
+        return None;
+    }
+    match matching.iter().position(|&i| i == selected) {
+        Some(pos) => Some(matching[(pos + 1) % matching.len()]),
+        None => matching
+            .iter()
+            .copied()
+            .find(|&i| i > selected)
+            .or_else(|| matching.first().copied()),
+    }
+}
+
+/// Previous matching item index before `selected` (cycles within `matching`).
+pub fn list_picker_prev_match(matching: &[usize], selected: usize) -> Option<usize> {
+    if matching.is_empty() {
+        return None;
+    }
+    match matching.iter().position(|&i| i == selected) {
+        Some(0) => Some(matching[matching.len() - 1]),
+        Some(pos) => Some(matching[pos - 1]),
+        None => matching
+            .iter()
+            .rev()
+            .copied()
+            .find(|&i| i < selected)
+            .or_else(|| matching.last().copied()),
+    }
+}
+
+/// Keep `selected` on a matching row after the search string changes.
+pub fn list_picker_clamp_selection_to_matches(
+    matching: &[usize],
+    selected: usize,
+) -> Option<usize> {
+    if matching.is_empty() {
+        return None;
+    }
+    if matching.contains(&selected) {
+        Some(selected)
+    } else {
+        matching.first().copied()
     }
 }
 
@@ -894,6 +1166,7 @@ mod free_entry_tests {
             value: value.to_string(),
             label: value.to_string(),
             category: category.to_string(),
+            description: None,
         }
     }
 
@@ -988,6 +1261,164 @@ mod free_entry_tests {
     fn confirm_value_none_when_empty() {
         let core = core_with(vec![], "");
         assert!(list_picker_confirm_value(&core).is_none());
+    }
+
+    #[test]
+    fn matching_indices_filters_case_insensitively() {
+        let items = vec![
+            item("src/main.rs", ""),
+            item("README.md", ""),
+            item("src/gui/mod.rs", ""),
+        ];
+        assert_eq!(list_picker_matching_indices(&items, "gui"), vec![2]);
+        assert_eq!(list_picker_matching_indices(&items, "SRC"), vec![0, 2]);
+        assert_eq!(list_picker_matching_indices(&items, ""), vec![0, 1, 2]);
+        assert!(list_picker_matching_indices(&items, "zzz").is_empty());
+    }
+
+    #[test]
+    fn matching_is_order_independent() {
+        let items = vec![
+            item("KeyCode Enter handling", ""),
+            item("Enter KeyCode swapped", ""),
+            item("unrelated line", ""),
+        ];
+        // Both orders match the same two rows.
+        assert_eq!(
+            list_picker_matching_indices(&items, "KeyCode Enter"),
+            vec![0, 1]
+        );
+        assert_eq!(
+            list_picker_matching_indices(&items, "Enter KeyCode"),
+            vec![0, 1]
+        );
+        // Extra whitespace is ignored; all tokens must be present.
+        assert_eq!(
+            list_picker_matching_indices(&items, "  enter   keycode  "),
+            vec![0, 1]
+        );
+        assert_eq!(
+            list_picker_matching_indices(&items, "KeyCode unrelated"),
+            Vec::<usize>::new()
+        );
+    }
+
+    #[test]
+    fn highlight_ranges_cover_each_token_in_either_order() {
+        let tokens = list_picker_search_tokens("KeyCode Enter");
+        assert_eq!(tokens, vec!["keycode".to_string(), "enter".to_string()]);
+        // Token order in the query must not matter for the ranges.
+        let rev = list_picker_search_tokens("Enter KeyCode");
+        for label in ["KeyCode Enter handling", "Enter KeyCode swapped"] {
+            let a = list_picker_highlight_ranges(label, &tokens);
+            let b = list_picker_highlight_ranges(label, &rev);
+            assert_eq!(a, b);
+            assert_eq!(a.len(), 2);
+            // Ranges slice back to the original-cased text.
+            let joined: String = a
+                .iter()
+                .map(|(s, e)| label[*s..*e].to_string())
+                .collect::<Vec<_>>()
+                .join("|")
+                .to_lowercase();
+            assert!(joined.contains("keycode"), "{label} -> {joined}");
+            assert!(joined.contains("enter"), "{label} -> {joined}");
+        }
+        // Overlapping tokens merge into one range.
+        let tokens = list_picker_search_tokens("enter ent");
+        assert_eq!(
+            list_picker_highlight_ranges("Enter here", &tokens),
+            vec![(0, 5)]
+        );
+        // Empty query / no hits.
+        assert!(list_picker_highlight_ranges("abc", &[]).is_empty());
+        assert!(list_picker_highlight_ranges("abc", &list_picker_search_tokens("zzz")).is_empty());
+    }
+
+    #[test]
+    fn command_palette_matching_is_order_independent() {
+        let tokens = list_picker_search_tokens("diff grep");
+        assert!(command_palette_entry_matches(
+            "<c-f>",
+            "Grep diff contents",
+            &tokens
+        ));
+        let rev = list_picker_search_tokens("grep diff");
+        assert!(command_palette_entry_matches(
+            "<c-f>",
+            "Grep diff contents",
+            &rev
+        ));
+        // All tokens must be present; empty = match-all.
+        assert!(!command_palette_entry_matches(
+            "<c-f>",
+            "Grep diff contents",
+            &list_picker_search_tokens("diff zzz")
+        ));
+        assert!(command_palette_entry_matches(
+            "<c-f>",
+            "Grep diff contents",
+            &[]
+        ));
+        // Tokens may split across key and description.
+        assert!(command_palette_entry_matches(
+            "<c-f>",
+            "Grep diff contents",
+            &list_picker_search_tokens("c-f grep")
+        ));
+    }
+
+    #[test]
+    fn empty_category_disables_synthetic_row_and_clamps_to_matches() {
+        // Flat list with empty categories (like the diff-grep dialog): sync
+        // must not insert or strip any row.
+        let mut core = core_with(
+            vec![item("src/main.rs", ""), item("src/gui/mod.rs", "")],
+            "gui",
+        );
+        core.selected = 0;
+
+        sync_list_picker_free_entry(&mut core, "");
+
+        assert_eq!(core.items.len(), 2);
+        assert_eq!(core.selected, 1);
+        assert_eq!(core.items[core.selected].value, "src/gui/mod.rs");
+
+        // Zero matches: items untouched, selection left for the Enter guard.
+        let mut core = core_with(vec![item("src/main.rs", "")], "zzz");
+        sync_list_picker_free_entry(&mut core, "");
+        assert_eq!(core.items.len(), 1);
+        assert_eq!(core.items[0].value, "src/main.rs");
+
+        // Clearing the search resets to the top without touching items.
+        let mut core = core_with(vec![item("a", ""), item("b", "")], "");
+        core.selected = 1;
+        sync_list_picker_free_entry(&mut core, "");
+        assert_eq!(core.items.len(), 2);
+        assert_eq!(core.selected, 0);
+        assert_eq!(core.scroll_offset, 0);
+
+        // The prefer- variant also skips its force-select for empty category.
+        let mut core = core_with(vec![item("src/main.rs", "")], "zzz");
+        sync_list_picker_prefer_free_entry(&mut core, "");
+        assert_eq!(core.items.len(), 1);
+    }
+
+    #[test]
+    fn next_prev_match_cycle_within_filtered_set() {
+        let matching = vec![0usize, 3, 7];
+        assert_eq!(list_picker_next_match(&matching, 0), Some(3));
+        assert_eq!(list_picker_next_match(&matching, 7), Some(0));
+        assert_eq!(list_picker_prev_match(&matching, 7), Some(3));
+        assert_eq!(list_picker_prev_match(&matching, 0), Some(7));
+        assert_eq!(
+            list_picker_clamp_selection_to_matches(&matching, 5),
+            Some(0)
+        );
+        assert_eq!(
+            list_picker_clamp_selection_to_matches(&matching, 3),
+            Some(3)
+        );
     }
 }
 

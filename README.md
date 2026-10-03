@@ -83,16 +83,16 @@ lazygitrs upgrade 0.0.32   # specific version
   git:
     commit:
       # Using claude
-      generateCommand: "claude -p 'Generate a conventional commit message for this diff.' --no-session-persistence"
+      generateCommand: "claude -p 'Generate a conventional commit message for this diff. Do not hard-wrap lines; one bullet per line; blank line between paragraphs.' --no-session-persistence"
       # Using opencode
-      generateCommand: "opencode run 'Generate a conventional commit message for this diff.'"
+      generateCommand: "opencode run 'Generate a conventional commit message for this diff. Do not hard-wrap lines; one bullet per line; blank line between paragraphs.'"
       # Using codex
-      generateCommand: "codex exec --ephemeral 'Generate a conventional commit message for this diff.'"
+      generateCommand: "codex exec --ephemeral 'Generate a conventional commit message for this diff. Do not hard-wrap lines; one bullet per line; blank line between paragraphs.'"
       # DeepSeek via the bundled helper — see contrib/ai-commit.
       # `make setup` installs it and points the config here for you.
       generateCommand: "$HOME/.local/bin/ai-lazygitrs-commit"
       # Using modelcli
-      generateCommand: 'DIFF=$(git diff --cached) && modelcli "Generate a conventional commit message for this diff. Always provide a bulletpoint body. $DIFF"'
+      generateCommand: 'DIFF=$(git diff --cached) && modelcli "Generate a conventional commit message for this diff. Always provide a bulletpoint body. Do not hard-wrap lines; one bullet per line. $DIFF"'
   ```
 
 - [x] **Side-by-side + unified diffs** with syntax highlighting by default and unified as well, no pager hacks needed
@@ -107,6 +107,7 @@ lazygitrs upgrade 0.0.32   # specific version
   - [x] `git diff/compare` (global `W`) and then asks what branch/commit A and B, has quick search.
   - [x] `git rebase` (global `I`) and then asks rebase on top of what branch/commit.
   - [x] 🎨 Themes + Theme-Picker!
+- [x] **Grep diff contents** — `Ctrl-F` in Files / Commit Files / Compare searches hunk lines in-context, `Enter` jumps to the file in the current list.
 
 ### Configuration
 
@@ -146,6 +147,63 @@ lazygitrs ships with 30+ built-in color themes (Catppuccin, Dracula, Tokyo Night
   "background": "#1a1a2e"
 }
 ```
+
+### Editor integrations
+
+<details>
+<summary><strong>Helix</strong> — <code>Space G g</code> to open, <code>Space G f</code> for file history</summary>
+
+Add to `~/.config/helix/config.toml` — capital `G` keeps the built-in `space g` changed-file picker intact:
+
+```toml
+[keys.normal.space.G]
+g = [":insert-output lazygitrs", ":redraw"]
+f = [":insert-output lazygitrs -f '%{file_path_absolute}'", ":redraw"]
+```
+
+Absolute path matters — `-f` resolves it to repo-relative (e.g. `apps/nextjs/next.config.ts` in a monorepo).
+
+For `e` (edit back in hx) — `~/.config/lazygitrs/config.yml`:
+
+```yaml
+os:
+  editPreset: "helix"
+```
+
+For `o` (open), leave the default — OS opener (Finder for folders on macOS).
+
+</details>
+
+<details>
+<summary><strong>Neovim (LazyVim / snacks.nvim)</strong> — <code>&lt;leader&gt;gg</code> to open, <code>&lt;leader&gt;gF</code> for file history</summary>
+
+`Snacks.lazygit()` hardcodes `lazygit`, so use `Snacks.terminal` instead. In `~/.config/nvim/lua/plugins/snacks-lazygitrs.lua`:
+
+```lua
+return {
+  {
+    "folke/snacks.nvim",
+    opts = { lazygit = { configure = false } },
+    keys = {
+      { "<leader>gg", function() Snacks.terminal({ "lazygitrs" }, { cwd = LazyVim.root.git(), win = { style = "lazygit" } }) end, desc = "Lazygitrs" },
+      { "<leader>gF", function() Snacks.terminal({ "lazygitrs", "-f", vim.fn.expand("%:p") }, { cwd = LazyVim.root.git(), win = { style = "lazygit" } }) end, desc = "Lazygitrs file history" },
+    },
+  },
+}
+```
+
+Restart nvim (or `:Lazy reload snacks.nvim`) to pick it up.
+
+For `e` (edit back in nvim) — `~/.config/lazygitrs/config.yml`:
+
+```yaml
+os:
+  editPreset: "nvim"
+```
+
+For `o` (open), leave the default — it uses the OS opener (Finder for folders on macOS).
+
+</details>
 
 <!-- GEN_BENCHMARKS_START -->
 

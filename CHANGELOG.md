@@ -2,6 +2,94 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.0.38] - 2026-09-15
+
+### Bug Fixes
+
+- Size graph rows for deferred merge connectors by @Blankeos
+
+## [0.0.37] - 2026-09-14
+
+### Bug Fixes
+
+- Use localtime_s on Windows for commit dates by @Blankeos
+- Change j/k hint to arrow symbols in popup hint bar by @Blankeos
+- Match lazygit commit and merge glyphs by @Blankeos
+- Refresh diff and show conflict output on failed pop/apply by @Blankeos
+
+### Chores
+
+- Backtrack unreleased v0.0.37/v0.0.38 to v0.0.36 by @Blankeos
+
+### Documentation
+
+- Simplify Helix and Neovim integration instructions by @Blankeos
+
+### Features
+
+- Add Ctrl-F grep over diff contents by @Blankeos
+- Render commit refs and tags lazygit-style by @Blankeos
+- Match lazygit commit list row layout with local-time dates and author columns by @Blankeos
+
+### Refactor
+
+- Extract search bar/status bar rendering into helper by @Blankeos
+
+## [0.0.36] - 2026-09-06
+
+### Bug Fixes
+
+- Wrap hunk navigation at ends and guard empty hunk lists by @Blankeos
+
+### Features
+
+- Open selected directories in editor and default program by @Blankeos
+- Fill line background to full panel width in side-by-side diff by @Blankeos
+- Better hunk staging without separators (like zed/vscode) (#31) by @Blankeos in [#31](https://github.com/Blankeos/lazygitrs/pull/31)
+- Better looking stripes (inspired by lumen) by @Blankeos
+- Separator-stacked staged/unstaged diff (#30) by @Blankeos in [#30](https://github.com/Blankeos/lazygitrs/pull/30)
+
+### Refactor
+
+- Split file status indicator into per-char styled spans by @Blankeos
+
+## [0.0.35] - 2026-08-30
+
+### Bug Fixes
+
+- Allow squash/fixup as first rebase action by rebasing onto parent by @Blankeos
+- Commit message dialog hardcoded height crash by @Blankeos
+
+### Chores
+
+- Refuse tagging unless on main by @Blankeos
+
+### Features
+
+- Discard performance #25 (#26) by @Blankeos in [#26](https://github.com/Blankeos/lazygitrs/pull/26)
+
+## [0.0.34] - 2026-08-27
+
+### Bug Fixes
+
+- Cycle list picker selection and deduplicate scroll-after-navigation logic by @Blankeos
+- Theme picker filter and up/down by @Blankeos
+- Reset scroll position when replacing commit summary text by @Blankeos
+- Preserve logical newlines in commit body soft-wrap editor by @Blankeos
+- Replace sed-based GIT_SEQUENCE_EDITOR with temp-file scripts by @Blankeos
+- Make TUI work under Helix `:insert-output` by claiming `/dev/tty` by @Blankeos
+
+### Features
+
+- Generate light-mode themes from OpenCode source data by @Blankeos
+- Apply commit filters at stream time instead of re-fetching after load by @Blankeos
+- Add theme appearance tracking and update generated theme colors by @Blankeos
+- Add startup path filter (-f/--filter) and fix list picker search filtering by @Blankeos
+
+### Doc
+
+- Document how to do editor integrations by @Blankeos
+
 ## [0.0.33] - 2026-08-21
 
 ### Features

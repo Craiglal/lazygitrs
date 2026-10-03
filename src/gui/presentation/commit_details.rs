@@ -4,6 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::text::plain_text;
 use crate::config::Theme;
 use crate::model::commit::{Commit, CommitStat, CommitStatus};
 
@@ -61,9 +62,9 @@ pub fn render_commit_details(
         return;
     }
 
-    let message = full_message.unwrap_or(&commit.name);
-    let co_authors = parse_co_authors(message);
-    let display_message = strip_co_author_trailers(message);
+    let message = plain_text(full_message.unwrap_or(&commit.name));
+    let co_authors = parse_co_authors(&message);
+    let display_message = strip_co_author_trailers(&message);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -72,7 +73,10 @@ pub fn render_commit_details(
     if !compact && !commit.author_email.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("  ✉ ", Style::default().fg(theme.text_dimmed)),
-            Span::styled(commit.author_email.clone(), Style::default().fg(theme.text)),
+            Span::styled(
+                plain_text(&commit.author_email),
+                Style::default().fg(theme.text),
+            ),
         ]));
     }
 
@@ -253,13 +257,13 @@ fn strip_co_author_trailers(message: &str) -> String {
 }
 
 fn header_line<'a>(commit: &'a Commit, theme: &Theme) -> Line<'a> {
-    let initial = commit
-        .author_name
+    let author_name = plain_text(&commit.author_name);
+    let initial = author_name
         .chars()
         .next()
         .map(|c| c.to_ascii_uppercase())
         .unwrap_or('?');
-    let avatar_color = avatar_color_for(&commit.author_email, theme);
+    let avatar_color = avatar_color_for(&plain_text(&commit.author_email), theme);
     let date = format_date(commit.unix_timestamp);
 
     Line::from(vec![
@@ -272,7 +276,7 @@ fn header_line<'a>(commit: &'a Commit, theme: &Theme) -> Line<'a> {
         ),
         Span::raw(" "),
         Span::styled(
-            commit.author_name.clone(),
+            author_name,
             Style::default()
                 .fg(theme.text_strong)
                 .add_modifier(Modifier::BOLD),
@@ -339,19 +343,11 @@ fn stat_line<'a>(stat: &CommitStat, theme: &Theme) -> Line<'a> {
 }
 
 fn format_date(unix_ts: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
     if unix_ts <= 0 {
         return String::new();
     }
-    let dt = UNIX_EPOCH + Duration::from_secs(unix_ts as u64);
-    // Format via chrono-free path: compute Y-m-d H:M locally-ish by converting
-    // seconds since epoch.  We accept UTC display here to avoid pulling in a
-    // tz library — matches the rest of this codebase's date treatment.
-    let secs = dt
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-    let (year, month, day, hour, minute) = civil_from_unix(secs as i64);
+    // Local time like lazygit (`time.Unix().In(now.Location())`), not UTC.
+    let (year, month, day, hour, minute) = local_from_unix(unix_ts);
     let month_name = match month {
         1 => "Jan",
         2 => "Feb",
@@ -368,6 +364,28 @@ fn format_date(unix_ts: i64) -> String {
         _ => "???",
     };
     format!("{} {}, {} {:02}:{:02}", month_name, day, year, hour, minute)
+}
+
+/// Local-time conversion via libc, with UTC fallback.
+fn local_from_unix(secs: i64) -> (i64, u32, u32, u32, u32) {
+    unsafe {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        #[cfg(windows)]
+        let ok = libc::localtime_s(&mut tm, &t) == 0;
+        #[cfg(not(windows))]
+        let ok = !libc::localtime_r(&t, &mut tm).is_null();
+        if !ok {
+            return civil_from_unix(secs);
+        }
+        (
+            tm.tm_year as i64 + 1900,
+            (tm.tm_mon + 1) as u32,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+        )
+    }
 }
 
 /// Very small civil-from-unix converter (UTC).  Matches Howard Hinnant's

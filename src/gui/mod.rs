@@ -10,7 +10,7 @@ pub mod scroll;
 pub mod views;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{self, Stdout, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -42,10 +42,12 @@ use self::modes::diff_mode::DiffModeState;
 use self::modes::patch_building::PatchBuildingState;
 use self::modes::rebase_mode::{EntryStatus, RebaseModeState, RebasePhase};
 use self::popup::{CommandAction, CommandEntry, CommandSection};
-use self::popup::{ListPickerItem, MessageKind, PopupState};
+use self::popup::{
+    ListPickerItem, MessageKind, PopupState, list_picker_clamp_selection_to_matches,
+    list_picker_filtered_display_idx, list_picker_matching_indices, list_picker_next_match,
+    list_picker_prev_match,
+};
 
-/// Compute the display row index for a given item selection,
-/// accounting for category header rows inserted between groups.
 pub(crate) fn diff_block_mode_actionable(has_unstaged_changes: bool, hunk_count: usize) -> bool {
     has_unstaged_changes && hunk_count > 0
 }
@@ -53,22 +55,6 @@ pub(crate) fn diff_block_mode_actionable(has_unstaged_changes: bool, hunk_count:
 pub(crate) fn is_diff_block_mode_toggle(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('B')
         || (key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::SHIFT))
-}
-
-fn list_picker_display_idx(items: &[ListPickerItem], sel: usize) -> usize {
-    let mut di = 0usize;
-    let mut last_cat = String::new();
-    for (ei, item) in items.iter().enumerate() {
-        if !item.category.is_empty() && item.category != last_cat {
-            di += 1; // header row
-            last_cat = item.category.clone();
-        }
-        if ei == sel {
-            return di;
-        }
-        di += 1;
-    }
-    di
 }
 
 /// Compute the visible list height for a list picker popup, given terminal height.
@@ -113,6 +99,7 @@ fn update_ref_picker_search(
                     value: new_search.trim().to_string(),
                     label: new_search.trim().to_string(),
                     category: popup::REF_FREE_ENTRY_CATEGORY.to_string(),
+                    description: None,
                 },
             );
             1
@@ -120,15 +107,14 @@ fn update_ref_picker_search(
             0
         };
 
-        if let Some(idx) = core.items.iter().skip(list_start).position(|i| {
-            i.label.to_lowercase().contains(&new_lower)
-                || i.value.to_lowercase().contains(&new_lower)
-        }) {
-            core.selected = idx + list_start;
+        // The popup renders only matching rows, so pick and scroll within them.
+        let matching = list_picker_matching_indices(&core.items, new_search);
+        if let Some(&idx) = matching.iter().find(|&&i| i >= list_start) {
+            core.selected = idx;
             if list_height == 0 {
                 core.scroll_offset = 0;
             } else {
-                let sdi = list_picker_display_idx(&core.items, core.selected);
+                let sdi = list_picker_filtered_display_idx(&core.items, &matching, core.selected);
                 core.scroll_offset = sdi.saturating_sub(list_height / 2);
             }
         } else {
@@ -152,6 +138,7 @@ mod ref_picker_tests {
                 value: "feature".to_string(),
                 label: "feature".to_string(),
                 category: "Local Branches".to_string(),
+                description: None,
             }],
             selected: 0,
             search_textarea: make_command_palette_search_textarea(),
@@ -196,6 +183,29 @@ mod ref_picker_tests {
     }
 }
 
+/// Keep the selection in view after Up/Down (including wrap last↔first).
+fn list_picker_scroll_after_nav(
+    core: &mut crate::gui::popup::ListPickerCore,
+    matching: &[usize],
+    list_height: usize,
+    moved_down: bool,
+) {
+    let sdi = list_picker_filtered_display_idx(&core.items, matching, core.selected);
+    if moved_down {
+        if matching.first() == Some(&core.selected) {
+            core.scroll_offset = 0;
+        } else if sdi >= core.scroll_offset + list_height {
+            core.scroll_offset = sdi.saturating_sub(list_height - 1);
+        }
+    } else if matching.last() == Some(&core.selected) {
+        core.scroll_offset = sdi.saturating_sub(list_height.saturating_sub(1));
+    } else if matching.first() == Some(&core.selected) {
+        core.scroll_offset = 0;
+    } else if sdi <= core.scroll_offset {
+        core.scroll_offset = sdi.saturating_sub(1);
+    }
+}
+
 /// Shared mouse scroll/click handling for free-entry list pickers (RefPicker, ListPicker).
 fn handle_list_picker_mouse(
     core: &mut crate::gui::popup::ListPickerCore,
@@ -205,22 +215,22 @@ fn handle_list_picker_mouse(
 ) {
     use crossterm::event::{MouseButton, MouseEventKind};
 
-    let total = core.items.len();
+    let search = core.search_textarea.lines().join("");
+    let matching = list_picker_matching_indices(&core.items, &search);
     let h = layout_height as usize;
     let lh = list_picker_visible_height(h);
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            core.selected = core.selected.saturating_sub(1);
-            if core.selected < core.scroll_offset {
-                core.scroll_offset = core.selected;
+            if let Some(prev) = list_picker_prev_match(&matching, core.selected) {
+                core.selected = prev;
             }
+            list_picker_scroll_after_nav(core, &matching, lh, false);
         }
         MouseEventKind::ScrollDown => {
-            core.selected = (core.selected + 1).min(total.saturating_sub(1));
-            let di = list_picker_display_idx(&core.items, core.selected);
-            if di >= core.scroll_offset + lh {
-                core.scroll_offset = di.saturating_sub(lh - 1);
+            if let Some(next) = list_picker_next_match(&matching, core.selected) {
+                core.selected = next;
             }
+            list_picker_scroll_after_nav(core, &matching, lh, true);
         }
         MouseEventKind::Down(MouseButton::Left) => {
             // Click to select an item in the list picker
@@ -241,42 +251,36 @@ fn handle_list_picker_mouse(
                 && mouse.column < x + popup_width
             {
                 let row_in_list = (mouse.row - list_start) as usize;
-                // Map display row to entry index, accounting for category headers
-                let has_categories = core.items.iter().any(|i| !i.category.is_empty());
-                let effective_scroll = core.scroll_offset.min(if has_categories {
-                    // display length includes headers
-                    let display_len =
-                        list_picker_display_idx(&core.items, total.saturating_sub(1)) + 1;
-                    display_len.saturating_sub(list_height)
-                } else {
-                    total.saturating_sub(list_height)
-                });
-                let display_idx = effective_scroll + row_in_list;
-
+                // Build filtered display rows (headers + matching items)
+                let has_categories = matching
+                    .iter()
+                    .any(|&i| core.items.get(i).is_some_and(|it| !it.category.is_empty()));
+                let mut display: Vec<(bool, Option<usize>)> = Vec::new();
                 if has_categories {
-                    // Walk through display rows to find which entry was clicked
-                    let mut di = 0usize;
-                    let mut ei = 0usize;
                     let mut last_cat = String::new();
-                    for item in core.items.iter() {
+                    for &ei in &matching {
+                        let Some(item) = core.items.get(ei) else {
+                            continue;
+                        };
                         if !item.category.is_empty() && item.category != last_cat {
-                            if di == display_idx {
-                                break; // clicked on header
-                            }
-                            di += 1;
+                            display.push((true, None));
                             last_cat = item.category.clone();
                         }
-                        if di == display_idx {
-                            core.selected = ei;
-                            break;
-                        }
-                        di += 1;
-                        ei += 1;
+                        display.push((false, Some(ei)));
                     }
                 } else {
-                    let clicked_idx = effective_scroll + row_in_list;
-                    if clicked_idx < total {
-                        core.selected = clicked_idx;
+                    for &ei in &matching {
+                        display.push((false, Some(ei)));
+                    }
+                }
+                let max_scroll = display.len().saturating_sub(list_height);
+                let effective_scroll = core.scroll_offset.min(max_scroll);
+                let display_idx = effective_scroll + row_in_list;
+                if let Some((is_header, item_idx)) = display.get(display_idx) {
+                    if !*is_header {
+                        if let Some(ei) = item_idx {
+                            core.selected = *ei;
+                        }
                     }
                 }
             }
@@ -285,7 +289,7 @@ fn handle_list_picker_mouse(
     }
 }
 
-pub type Term = Terminal<CrosstermBackend<Stdout>>;
+pub type Term = Terminal<CrosstermBackend<crate::os::tty::TuiOutput>>;
 const COMMIT_DETAILS_DEBOUNCE: Duration = Duration::from_millis(120);
 const MAX_CONCURRENT_DIFF_JOBS: usize = 2;
 const DIFF_PREVIEW_CACHE_ENTRIES: usize = 24;
@@ -706,6 +710,8 @@ enum AiCommitSource {
 
 struct CommitPageResult {
     generation: u64,
+    /// When true, replace the commit list (filter apply). When false, append.
+    replace: bool,
     result: Result<Vec<crate::model::Commit>>,
 }
 
@@ -806,6 +812,8 @@ pub struct Gui {
     /// Async light files refresh (status-only) so Space-spam doesn't freeze.
     files_refresh_rx: Option<mpsc::Receiver<Result<Vec<crate::model::File>>>>,
     files_refresh_in_progress: bool,
+    /// Background `git ls-files` for the path-filter picker (ctrl-s → path).
+    filter_paths_rx: Option<mpsc::Receiver<Result<Vec<String>>>>,
     /// Receiver for silent auto-fetch results. Kept separate from remote_op
     /// so auto-fetch failures don't show error popups or clobber a
     /// user-initiated push/pull.
@@ -966,7 +974,7 @@ fn synthesize_new_file_diff(filename: &str, content: &str) -> String {
     diff
 }
 
-/// Placeholder so the pager shows "Binary file (not viewable)".
+/// Synthetic binary diff so the pager renders its unavailable-preview placeholder.
 fn synthesize_binary_file_diff(filename: &str) -> String {
     format!(
         "diff --git a/{f} b/{f}\n\
@@ -1041,7 +1049,7 @@ impl Gui {
         };
     }
 
-    pub fn new(config: AppConfig, git: GitCommands) -> Result<Self> {
+    pub fn new(config: AppConfig, git: GitCommands, filter_path: Option<PathBuf>) -> Result<Self> {
         let (diff_tx, diff_rx) = mpsc::channel();
         let (diff_scheduler_tx, diff_scheduler_rx) = mpsc::channel();
         let (diff_prefetch_tx, diff_prefetch_rx) = mpsc::channel();
@@ -1092,8 +1100,35 @@ impl Gui {
         model.head_hash = git.head_hash().unwrap_or_default();
         model.head_branch_name = git.current_branch_name().unwrap_or_default();
 
+        // Normalize `-f` to a repo-relative path before kicking off the stream
+        // so the first Commits part is already filtered (lazygit-style).
+        let startup_path_filter = filter_path.and_then(|p| {
+            let raw = p.to_string_lossy().trim().to_string();
+            if raw.is_empty() {
+                return None;
+            }
+            let relative = p
+                .canonicalize()
+                .ok()
+                .and_then(|abs| {
+                    abs.strip_prefix(git.repo_path())
+                        .ok()
+                        .map(|rel| rel.to_string_lossy().to_string())
+                })
+                .filter(|rel| !rel.is_empty())
+                .unwrap_or(raw);
+            Some(relative)
+        });
+        let startup_commit_filter =
+            startup_path_filter
+                .as_ref()
+                .map(|path| crate::git::commit::CommitFilter {
+                    path: Some(path.clone()),
+                    ..Default::default()
+                });
+
         let (initial_load_tx, initial_load_rx) = mpsc::channel();
-        git.load_model_streaming(&initial_load_tx);
+        git.load_model_streaming(&initial_load_tx, startup_commit_filter);
 
         let commit_history = Self::load_commit_history(&config);
 
@@ -1105,6 +1140,11 @@ impl Gui {
             .and_then(|id| crate::config::COLOR_THEMES.iter().position(|t| t.id == id))
             .unwrap_or(0);
 
+        let mut context_mgr = ContextManager::new();
+        if startup_path_filter.is_some() {
+            context_mgr.set_active(ContextId::Commits);
+        }
+
         Ok(Self {
             config: Arc::new(config),
             git,
@@ -1112,7 +1152,7 @@ impl Gui {
             initial_load_rx: Some(initial_load_rx),
             initial_load_received: 0,
             refresh_in_progress: false,
-            context_mgr: ContextManager::new(),
+            context_mgr,
             layout: LayoutState::default(),
             popup: PopupState::None,
             diff_view: {
@@ -1166,6 +1206,7 @@ impl Gui {
             remote_op_tx,
             files_refresh_rx: None,
             files_refresh_in_progress: false,
+            filter_paths_rx: None,
             auto_fetch_rx,
             auto_fetch_tx,
             last_auto_fetch_at: None,
@@ -1183,7 +1224,7 @@ impl Gui {
             search_textarea: None,
             last_refresh_at: Instant::now(),
             commit_branch_filter: Vec::new(),
-            commit_path_filter: None,
+            commit_path_filter: startup_path_filter.clone(),
             commit_author_filter: Vec::new(),
             commit_files_hash: String::new(),
             commit_files_message: String::new(),
@@ -1270,15 +1311,10 @@ impl Gui {
                         }
                         ModelPart::Branches(v) => model.branches = v,
                         ModelPart::Commits(v) => {
-                            // Keep filtered commits visible during streaming refresh;
-                            // after_model_refresh reloads the filtered set when done.
-                            let has_commit_filter = self.commit_path_filter.is_some()
-                                || !self.commit_author_filter.is_empty()
-                                || !self.commit_branch_filter.is_empty();
-                            if !has_commit_filter {
-                                self.commit_history_complete = v.len() < DEFAULT_COMMIT_LIMIT;
-                                model.set_commits(v);
-                            }
+                            // Stream already applies the active filter when one is set
+                            // (`load_model_streaming(commit_filter)`), so always take it.
+                            self.commit_history_complete = v.len() < DEFAULT_COMMIT_LIMIT;
+                            model.set_commits(v);
                         }
                         ModelPart::Stash(v) => model.stash_entries = v,
                         ModelPart::Remotes(v) => model.remotes = v,
@@ -1342,14 +1378,21 @@ impl Gui {
                 // All parts received — done loading.
                 if self.initial_load_received >= MODEL_PART_COUNT {
                     self.initial_load_rx = None;
-                    if self.refresh_in_progress {
-                        self.refresh_in_progress = false;
-                        // Leave needs_refresh alone: if another mutation arrived
-                        // mid-refresh it will re-queue on the next frame.
-                        self.needs_files_refresh = false;
-                        self.needs_diff_refresh = true;
-                        self.last_refresh_at = Instant::now();
-                        // Re-apply selection-dependent views after stream completes.
+                    let was_refresh = self.refresh_in_progress;
+                    self.refresh_in_progress = false;
+                    // Leave needs_refresh alone: if another mutation arrived
+                    // mid-refresh it will re-queue on the next frame.
+                    self.needs_files_refresh = false;
+                    self.needs_diff_refresh = true;
+                    self.last_refresh_at = Instant::now();
+                    // Re-apply filters / selection-dependent views after stream
+                    // completes (initial load and background refresh). Needed so
+                    // startup `-f/--filter` takes effect once commits arrive.
+                    if was_refresh
+                        || self.commit_path_filter.is_some()
+                        || !self.commit_branch_filter.is_empty()
+                        || !self.commit_author_filter.is_empty()
+                    {
                         if let Err(err) = self.after_model_refresh() {
                             self.show_error("Refresh failed", err);
                         }
@@ -1374,6 +1417,7 @@ impl Gui {
 
             // Check for completed incremental commit page loads
             self.receive_commit_page_results();
+            self.receive_filter_paths();
             self.maybe_request_more_commits();
 
             // Check for completed background remote operations
@@ -2263,9 +2307,8 @@ impl Gui {
                     };
 
                     // Split AI message into summary (first line) and body (rest).
-                    // The AI usually emits a hard-wrapped body (~72-char lines); strip those
-                    // wrap-induced breaks so they don't read as user paragraph breaks in the
-                    // soft-wrapped editor.
+                    // Preserve AI newlines as logical lines; BodySoftWrap soft-wraps
+                    // for display only (avoids collapsing `- a\n- b` into one line).
                     let (summary, body) = match message.find('\n') {
                         Some(idx) => {
                             let s = message[..idx].to_string();
@@ -2284,9 +2327,7 @@ impl Gui {
                             ..
                         } = stashed
                         {
-                            summary_textarea.select_all();
-                            summary_textarea.cut();
-                            summary_textarea.insert_str(&summary);
+                            popup::set_commit_summary_text(summary_textarea, &summary);
                             body_state.set_text(body.clone());
                             body_state.render_into(body_textarea, wrap);
                         }
@@ -2353,6 +2394,51 @@ impl Gui {
         }
     }
 
+    fn receive_filter_paths(&mut self) {
+        let result = {
+            let Some(rx) = self.filter_paths_rx.as_ref() else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => None,
+            }
+        };
+        self.filter_paths_rx = None;
+        match result {
+            Some(Ok(paths)) => {
+                let items = paths
+                    .into_iter()
+                    .map(|path| crate::gui::popup::ListPickerItem {
+                        value: path.clone(),
+                        label: path,
+                        category: String::new(),
+                        description: None,
+                    })
+                    .collect();
+                self.show_list_picker(
+                    "Filter by path",
+                    items,
+                    "Path",
+                    Box::new(|gui, path| {
+                        gui.commit_path_filter =
+                            crate::gui::controller::commits::nonempty_for_filter(path);
+                        crate::gui::controller::commits::apply_commit_filters_and_focus(gui)
+                    }),
+                );
+            }
+            Some(Err(e)) => {
+                self.popup = PopupState::Message {
+                    title: "Filter by path".to_string(),
+                    message: format!("Could not list paths: {e}"),
+                    kind: MessageKind::Error,
+                };
+            }
+            None => {}
+        }
+    }
+
     fn receive_commit_page_results(&mut self) {
         while let Ok(result) = self.commit_page_rx.try_recv() {
             if result.generation != self.commit_page_generation {
@@ -2364,28 +2450,75 @@ impl Gui {
                 Ok(commits) => {
                     let page_len = commits.len();
                     let mut model = self.model.lock().unwrap();
-                    let mut seen: HashSet<String> =
-                        model.commits.iter().map(|c| c.hash.clone()).collect();
-                    let new_commits: Vec<_> = commits
-                        .into_iter()
-                        .filter(|c| seen.insert(c.hash.clone()))
-                        .collect();
-                    model.extend_commits(new_commits);
-                    self.commit_history_complete = page_len < DEFAULT_COMMIT_LIMIT;
-                    self.context_mgr.clamp_selections(&model);
+                    if result.replace {
+                        model.set_commits(commits);
+                        drop(model);
+                        self.context_mgr.set_selection_for(ContextId::Commits, 0);
+                        self.range_select_anchor = None;
+                        self.commit_history_complete = page_len < DEFAULT_COMMIT_LIMIT;
+                    } else {
+                        let mut seen: HashSet<String> =
+                            model.commits.iter().map(|c| c.hash.clone()).collect();
+                        let new_commits: Vec<_> = commits
+                            .into_iter()
+                            .filter(|c| seen.insert(c.hash.clone()))
+                            .collect();
+                        model.extend_commits(new_commits);
+                        self.commit_history_complete = page_len < DEFAULT_COMMIT_LIMIT;
+                        self.context_mgr.clamp_selections(&model);
+                    }
                 }
                 Err(e) => {
                     self.commit_history_complete = true;
                     if self.popup == PopupState::None {
                         self.popup = PopupState::Message {
                             title: "Commits".to_string(),
-                            message: format!("Could not load more commits: {}", e),
+                            message: format!("Could not load commits: {}", e),
                             kind: MessageKind::Error,
                         };
                     }
                 }
             }
         }
+    }
+
+    /// Reload first page of commits for current filters (async).
+    /// Used by ctrl-s so we don't block UI or refresh files/branches.
+    pub(crate) fn reload_filtered_commits_async(&mut self) {
+        self.reset_commit_pagination();
+        if let Ok(mut model) = self.model.lock() {
+            model.clear_commits();
+        }
+        self.context_mgr.set_selection_for(ContextId::Commits, 0);
+        self.range_select_anchor = None;
+        self.spawn_commit_page_load(DEFAULT_COMMIT_LIMIT, 0, true);
+    }
+
+    fn spawn_commit_page_load(&mut self, limit: usize, skip: usize, replace: bool) {
+        self.commit_page_loading = true;
+        let generation = self.commit_page_generation;
+        let git = Arc::clone(&self.git);
+        let tx = self.commit_page_tx.clone();
+        let filter = crate::git::commit::CommitFilter {
+            branches: self.commit_branch_filter.clone(),
+            path: self.commit_path_filter.clone(),
+            authors: self.commit_author_filter.clone(),
+        };
+
+        std::thread::spawn(move || {
+            let unpushed = git.unpushed_commit_hashes().unwrap_or_default();
+            let result = git
+                .load_filtered_commits_page(&filter, limit, skip)
+                .map(|mut commits| {
+                    crate::git::GitCommands::apply_unpushed_status(&mut commits, &unpushed);
+                    commits
+                });
+            let _ = tx.send(CommitPageResult {
+                generation,
+                replace,
+                result,
+            });
+        });
     }
 
     fn maybe_request_more_commits(&mut self) {
@@ -2400,6 +2533,9 @@ impl Gui {
             let model = self.model.lock().unwrap();
             model.commits.len()
         };
+        if len == 0 {
+            return;
+        }
         if len < DEFAULT_COMMIT_LIMIT {
             self.commit_history_complete = true;
             return;
@@ -2416,20 +2552,7 @@ impl Gui {
             return;
         }
 
-        self.commit_page_loading = true;
-        let generation = self.commit_page_generation;
-        let git = Arc::clone(&self.git);
-        let tx = self.commit_page_tx.clone();
-        let filter = crate::git::commit::CommitFilter {
-            branches: self.commit_branch_filter.clone(),
-            path: self.commit_path_filter.clone(),
-            authors: self.commit_author_filter.clone(),
-        };
-
-        std::thread::spawn(move || {
-            let result = git.load_filtered_commits_page(&filter, DEFAULT_COMMIT_LIMIT, len);
-            let _ = tx.send(CommitPageResult { generation, result });
-        });
+        self.spawn_commit_page_load(DEFAULT_COMMIT_LIMIT, len, false);
     }
 
     fn reset_commit_pagination(&mut self) {
@@ -3017,48 +3140,101 @@ impl Gui {
                         }
 
                         let path_refs: Vec<&str> = diff_paths.iter().map(String::as_str).collect();
-                        let diff_result = if has_unstaged {
-                            git.diff_file_paths(&path_refs)
-                        } else if has_staged {
-                            git.diff_file_staged_paths(&path_refs)
-                        } else {
-                            Ok(String::new())
-                        };
-
-                        match diff_result {
-                            Ok(diff) if diff.is_empty() && !tracked => {
-                                if git.is_binary_path(&current_path) {
-                                    DiffPayload::Parsed(DiffViewState::parse_diff_output(
-                                        &current_path,
-                                        &synthesize_binary_file_diff(&current_path),
-                                        4,
-                                        exists,
-                                    ))
-                                } else {
-                                    match git.file_content(&current_path) {
-                                        Ok(content) if !content.is_empty() => {
-                                            DiffPayload::Parsed(DiffViewState::parse_content(
-                                                &current_path,
-                                                "",
-                                                &content,
-                                                4,
-                                                exists,
-                                            ))
-                                        }
-                                        _ => DiffPayload::Empty,
+                        // Single HEAD buffer with coherent line numbers;
+                        // hunks are dimmed/tinted staged vs unstaged via
+                        // overlap with the unstaged diff. Falls back to the
+                        // unstaged-only view when HEAD is unavailable
+                        // (e.g. unborn HEAD).
+                        if has_unstaged && has_staged {
+                            let exists = git.repo_path().join(&current_path).exists();
+                            let unstaged = git.diff_file_paths(&path_refs).unwrap_or_default();
+                            match git.diff_paths_vs_head(&path_refs) {
+                                Ok(head) if !head.is_empty() => {
+                                    let parsed = DiffViewState::parse_head_with_staged(
+                                        &name, &head, &unstaged, 4, exists,
+                                    );
+                                    if parsed.lines.is_empty() {
+                                        DiffPayload::Empty
+                                    } else {
+                                        DiffPayload::Parsed(parsed)
                                     }
                                 }
+                                _ => {
+                                    let mut payload = parse_file_diff_payload(
+                                        &git,
+                                        &name,
+                                        &current_path,
+                                        &unstaged,
+                                        exists,
+                                        false,
+                                    );
+                                    if let DiffPayload::Parsed(ref mut parsed) = payload {
+                                        parsed.hunk_staged = vec![false; parsed.hunk_starts.len()];
+                                    }
+                                    payload
+                                }
                             }
-                            Ok(diff) if diff.is_empty() => DiffPayload::Empty,
-                            Ok(diff) => parse_file_diff_payload(
-                                &git,
-                                &name,
-                                &current_path,
-                                &diff,
-                                exists,
-                                has_staged && !has_unstaged,
-                            ),
-                            Err(_) => DiffPayload::Empty,
+                        } else {
+                            let diff_result = if has_unstaged {
+                                git.diff_file_paths(&path_refs)
+                            } else if has_staged {
+                                git.diff_file_staged_paths(&path_refs)
+                            } else {
+                                Ok(String::new())
+                            };
+
+                            let exists = git.repo_path().join(&current_path).exists();
+                            match diff_result {
+                                Ok(diff) if diff.is_empty() && !tracked => {
+                                    // Untracked file: everything is unstaged.
+                                    let parsed = if git.is_binary_path(&current_path) {
+                                        DiffViewState::parse_diff_output(
+                                            &current_path,
+                                            &synthesize_binary_file_diff(&current_path),
+                                            4,
+                                            exists,
+                                        )
+                                    } else {
+                                        match git.file_content(&current_path) {
+                                            Ok(content) if !content.is_empty() => {
+                                                DiffViewState::parse_content(
+                                                    &current_path,
+                                                    "",
+                                                    &content,
+                                                    4,
+                                                    exists,
+                                                )
+                                            }
+                                            _ => return DiffPayload::Empty,
+                                        }
+                                    };
+                                    let mut parsed = parsed;
+                                    parsed.hunk_staged = vec![false; parsed.hunk_starts.len()];
+                                    DiffPayload::Parsed(parsed)
+                                }
+                                Ok(diff) if diff.is_empty() => DiffPayload::Empty,
+                                Ok(diff) => {
+                                    // Single-side view: classify every hunk
+                                    // so the title counts + dimming + menu
+                                    // stay correct even at 0-staged or
+                                    // all-staged.
+                                    let staged_only = has_staged && !has_unstaged;
+                                    let mut payload = parse_file_diff_payload(
+                                        &git,
+                                        &name,
+                                        &current_path,
+                                        &diff,
+                                        exists,
+                                        staged_only,
+                                    );
+                                    if let DiffPayload::Parsed(ref mut parsed) = payload {
+                                        parsed.hunk_staged =
+                                            vec![staged_only; parsed.hunk_starts.len()];
+                                    }
+                                    payload
+                                }
+                                Err(_) => DiffPayload::Empty,
+                            }
                         }
                     });
                 } else if self.show_file_tree {
@@ -3091,8 +3267,16 @@ impl Gui {
                                     Some(p) => vec![p],
                                     None => Vec::new(),
                                 };
+                                // Directory hover: single HEAD buffer for all
+                                // tracked files under the directory, with
+                                // hunks classified staged/unstaged via
+                                // overlap with the unstaged diff. Untracked
+                                // children only exist unstaged. Hunk actions
+                                // stay Cancel-only here (no single file).
                                 let mut combined_diff =
                                     git.diff_paths_vs_head(&paths).unwrap_or_default();
+                                let mut unstaged_combined =
+                                    git.diff_file_paths(&paths).unwrap_or_default();
                                 for path in &untracked {
                                     if gen_counter.load(Ordering::Relaxed) != generation {
                                         return DiffPayload::Empty;
@@ -3110,17 +3294,35 @@ impl Gui {
                                         combined_diff.push('\n');
                                     }
                                     combined_diff.push_str(&synth);
+                                    // Mirror the synthesized section so the
+                                    // untracked file classifies as unstaged.
+                                    if !unstaged_combined.is_empty() {
+                                        unstaged_combined.push('\n');
+                                    }
+                                    unstaged_combined.push_str(&synth);
                                 }
 
-                                if combined_diff.is_empty() {
+                                if combined_diff.trim().is_empty() {
                                     DiffPayload::Empty
                                 } else {
-                                    DiffPayload::Parsed(DiffViewState::parse_diff_output(
-                                        &dir_name,
+                                    use crate::pager::side_by_side::{
+                                        DiffViewState as DVS, head_block_staged_flags,
+                                    };
+                                    let mut parsed =
+                                        DVS::parse_diff_output(&dir_name, &combined_diff, 4, true);
+                                    parsed.hunk_staged = head_block_staged_flags(
                                         &combined_diff,
+                                        &unstaged_combined,
                                         4,
-                                        true,
-                                    ))
+                                    );
+                                    if parsed.hunk_staged.len() != parsed.hunk_starts.len() {
+                                        parsed.hunk_staged = vec![false; parsed.hunk_starts.len()];
+                                    }
+                                    if parsed.lines.is_empty() {
+                                        DiffPayload::Empty
+                                    } else {
+                                        DiffPayload::Parsed(parsed)
+                                    }
                                 }
                             });
                         } else {
@@ -3401,6 +3603,20 @@ impl Gui {
         }
 
         // When diff panel is focused, handle diff-specific keys
+        // Ctrl-F stays in the same Files/CommitFiles context: grep dialog
+        // over hunk contents (Enter jumps to the file in the current list).
+        if controller::diff_grep::is_diff_grep_key(key)
+            && !self.diff_view.search_active
+            && matches!(
+                self.context_mgr.active(),
+                crate::gui::context::ContextId::Files
+                    | crate::gui::context::ContextId::CommitFiles
+                    | crate::gui::context::ContextId::StashFiles
+                    | crate::gui::context::ContextId::BranchCommitFiles
+            )
+        {
+            return controller::diff_grep::open_diff_grep_picker(self);
+        }
         if self.diff_focused {
             return self.handle_diff_focused_key(key);
         }
@@ -3816,7 +4032,7 @@ impl Gui {
                             .map(|(line_idx, _, panel)| (line_idx, panel))
                             .unwrap_or_else(|| {
                                 (
-                                    self.diff_view.scroll_offset + (top_row - pl.inner_y) as usize,
+                                    self.diff_view.fallback_line_idx_for_row(top_row, &pl),
                                     sel_ref.panel,
                                 )
                             })
@@ -3892,7 +4108,12 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Char('r') => {
-                    if let Some(hunk_idx) = self.diff_view.selected_revert_hunk {
+                    // Like the hunk menu, revert only applies to unstaged hunks.
+                    if let Some(hunk_idx) = self
+                        .diff_view
+                        .selected_revert_hunk
+                        .filter(|&idx| !self.diff_view.is_staged_hunk(idx))
+                    {
                         if let Err(err) = self.revert_selected_file_hunk(hunk_idx) {
                             self.popup = PopupState::Message {
                                 title: "Revert block failed".to_string(),
@@ -3905,13 +4126,7 @@ impl Gui {
                 }
                 KeyCode::Char('s') => {
                     if let Some(hunk_idx) = self.diff_view.selected_revert_hunk {
-                        if let Err(err) = self.stage_selected_file_hunk(hunk_idx) {
-                            self.popup = PopupState::Message {
-                                title: "Stage block failed".to_string(),
-                                message: format!("{}", err),
-                                kind: MessageKind::Error,
-                            };
-                        }
+                        self.toggle_stage_selected_file_hunk(hunk_idx);
                     }
                     return Ok(());
                 }
@@ -4851,12 +5066,9 @@ impl Gui {
                                         body_state: &mut popup::BodySoftWrap,
                                         msg: &str| {
                             let (summary, body) = split_commit_message(msg);
-                            let mut new_summary = popup::make_commit_summary_textarea();
-                            new_summary.insert_str(&summary);
-                            *summary_textarea = new_summary;
+                            popup::set_commit_summary_text(summary_textarea, &summary);
                             *body_textarea = popup::make_commit_body_textarea();
-                            // History entries were committed with hard wraps — undo them so
-                            // they don't read as paragraph breaks in the soft-wrapped editor.
+                            // Preserve history newlines; soft-wrap is display-only.
                             body_state.set_text(popup::unwrap_commit_body(&body));
                             body_state.render_into(body_textarea, wrap_width);
                         };
@@ -4914,16 +5126,19 @@ impl Gui {
                                 textarea_input(summary_textarea, key);
                             }
                             popup::CommitInputFocus::Body => {
-                                // Body is driven by body_state (the unwrapped source of truth);
-                                // body_textarea is just a soft-wrapped projection of it. Translate
-                                // each key into a body_state edit, then re-render.
-                                let mut handled = true;
+                                // Body is driven by body_state; body_textarea is a soft-wrapped
+                                // projection. Content edits rebuild the projection; pure cursor
+                                // moves only Jump so the viewport is preserved (Up only scrolls
+                                // when the cursor is already on the first visible row).
+                                let mut content_changed = false;
+                                let mut cursor_moved = false;
                                 let alt = key.modifiers.contains(KeyModifiers::ALT);
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                                 let cmd = has_command_modifier(key.modifiers);
                                 match key.code {
                                     KeyCode::Char(c) if !ctrl && !alt && !cmd => {
                                         body_state.insert_char(c);
+                                        content_changed = true;
                                     }
                                     // Cmd+Backspace / Ctrl+U: delete to start of visual line.
                                     // Most macOS terminals (Zed, WezTerm, …) intercept Cmd and
@@ -4931,46 +5146,96 @@ impl Gui {
                                     // the only one that works everywhere.
                                     KeyCode::Backspace if cmd => {
                                         body_state.delete_to_visual_line_start(wrap_width);
+                                        content_changed = true;
                                     }
                                     KeyCode::Char('u') if ctrl => {
                                         body_state.delete_to_visual_line_start(wrap_width);
+                                        content_changed = true;
                                     }
                                     // Opt+Backspace / Ctrl+W: delete previous word.
-                                    KeyCode::Backspace if alt => body_state.delete_word_left(),
-                                    KeyCode::Char('w') if ctrl => body_state.delete_word_left(),
-                                    KeyCode::Backspace => body_state.backspace(),
-                                    KeyCode::Delete => body_state.delete(),
+                                    KeyCode::Backspace if alt => {
+                                        body_state.delete_word_left();
+                                        content_changed = true;
+                                    }
+                                    KeyCode::Char('w') if ctrl => {
+                                        body_state.delete_word_left();
+                                        content_changed = true;
+                                    }
+                                    KeyCode::Backspace => {
+                                        body_state.backspace();
+                                        content_changed = true;
+                                    }
+                                    KeyCode::Delete => {
+                                        body_state.delete();
+                                        content_changed = true;
+                                    }
                                     // Cmd+Left/Right and Ctrl+A/E: jump to start/end of visual
                                     // row. Same reason as Cmd+Backspace — Ctrl is the portable
                                     // binding.
                                     KeyCode::Left if cmd => {
-                                        body_state.move_visual_line_start(wrap_width)
+                                        body_state.move_visual_line_start(wrap_width);
+                                        cursor_moved = true;
                                     }
                                     KeyCode::Right if cmd => {
-                                        body_state.move_visual_line_end(wrap_width)
+                                        body_state.move_visual_line_end(wrap_width);
+                                        cursor_moved = true;
                                     }
                                     KeyCode::Char('a') if ctrl => {
-                                        body_state.move_visual_line_start(wrap_width)
+                                        body_state.move_visual_line_start(wrap_width);
+                                        cursor_moved = true;
                                     }
                                     KeyCode::Char('e') if ctrl => {
-                                        body_state.move_visual_line_end(wrap_width)
+                                        body_state.move_visual_line_end(wrap_width);
+                                        cursor_moved = true;
                                     }
                                     // Opt+Left/Right: jump by word (matches the new-branch input
                                     // and the rest of the readline-style world).
-                                    KeyCode::Left if alt => body_state.move_word_left(),
-                                    KeyCode::Right if alt => body_state.move_word_right(),
-                                    KeyCode::Char('b') if alt => body_state.move_word_left(),
-                                    KeyCode::Char('f') if alt => body_state.move_word_right(),
-                                    KeyCode::Left => body_state.move_left(),
-                                    KeyCode::Right => body_state.move_right(),
-                                    KeyCode::Up => body_state.move_visual_up(wrap_width),
-                                    KeyCode::Down => body_state.move_visual_down(wrap_width),
-                                    KeyCode::Home => body_state.move_home(),
-                                    KeyCode::End => body_state.move_end(),
-                                    _ => handled = false,
+                                    KeyCode::Left if alt => {
+                                        body_state.move_word_left();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Right if alt => {
+                                        body_state.move_word_right();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Char('b') if alt => {
+                                        body_state.move_word_left();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Char('f') if alt => {
+                                        body_state.move_word_right();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Left => {
+                                        body_state.move_left();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Right => {
+                                        body_state.move_right();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Up => {
+                                        body_state.move_visual_up(wrap_width);
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Down => {
+                                        body_state.move_visual_down(wrap_width);
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::Home => {
+                                        body_state.move_home();
+                                        cursor_moved = true;
+                                    }
+                                    KeyCode::End => {
+                                        body_state.move_end();
+                                        cursor_moved = true;
+                                    }
+                                    _ => {}
                                 }
-                                if handled {
+                                if content_changed {
                                     body_state.render_into(body_textarea, wrap_width);
+                                } else if cursor_moved {
+                                    body_state.apply_cursor_into(body_textarea, wrap_width);
                                 }
                             }
                         }
@@ -5109,16 +5374,17 @@ impl Gui {
 
     fn handle_command_palette_key(&mut self, key: KeyEvent) -> Result<()> {
         // Helper: compute display index for a given entry selection
-        fn find_display_idx(sections: &[CommandSection], sel: usize, search_lower: &str) -> usize {
-            let has_search = !search_lower.is_empty();
+        fn find_display_idx(sections: &[CommandSection], sel: usize, search: &str) -> usize {
+            use crate::gui::popup::{command_palette_entry_matches, list_picker_search_tokens};
+            let tokens = list_picker_search_tokens(search);
+            let has_search = !tokens.is_empty();
             let mut ei = 0usize;
             let mut di = 0usize;
             for section in sections {
                 let mut section_has_visible = false;
                 for entry in &section.entries {
                     let matches = !has_search
-                        || entry.key.to_lowercase().contains(search_lower)
-                        || entry.description.to_lowercase().contains(search_lower);
+                        || command_palette_entry_matches(&entry.key, &entry.description, &tokens);
                     if matches {
                         if !section_has_visible {
                             section_has_visible = true;
@@ -5135,8 +5401,10 @@ impl Gui {
             di
         }
 
-        fn count_visible(sections: &[CommandSection], search_lower: &str) -> usize {
-            let has_search = !search_lower.is_empty();
+        fn count_visible(sections: &[CommandSection], search: &str) -> usize {
+            use crate::gui::popup::{command_palette_entry_matches, list_picker_search_tokens};
+            let tokens = list_picker_search_tokens(search);
+            let has_search = !tokens.is_empty();
             sections
                 .iter()
                 .map(|s| {
@@ -5144,8 +5412,7 @@ impl Gui {
                         s.entries
                             .iter()
                             .filter(|e| {
-                                e.key.to_lowercase().contains(search_lower)
-                                    || e.description.to_lowercase().contains(search_lower)
+                                command_palette_entry_matches(&e.key, &e.description, &tokens)
                             })
                             .count()
                     } else {
@@ -5167,6 +5434,7 @@ impl Gui {
             use crossterm::event::KeyModifiers;
             let search = search_textarea.lines().join("");
             let search_lower = search.to_lowercase();
+            // `search_lower` kept for scroll math below; filtering uses tokens.
 
             // Estimate list viewport height from terminal
             let popup_height = (self.layout.height as usize).saturating_sub(4).min(50);
@@ -5180,13 +5448,20 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    let has_search = !search_lower.is_empty();
+                    use crate::gui::popup::{
+                        command_palette_entry_matches, list_picker_search_tokens,
+                    };
+                    let tokens = list_picker_search_tokens(&search);
+                    let has_search = !tokens.is_empty();
                     let mut ei = 0usize;
                     'outer: for section in sections.iter() {
                         for entry in &section.entries {
                             let vis = !has_search
-                                || entry.key.to_lowercase().contains(&search_lower)
-                                || entry.description.to_lowercase().contains(&search_lower);
+                                || command_palette_entry_matches(
+                                    &entry.key,
+                                    &entry.description,
+                                    &tokens,
+                                );
                             if vis {
                                 if ei == *selected {
                                     selected_action = Some(entry.action.clone());
@@ -5256,7 +5531,7 @@ impl Gui {
         } = &mut self.popup
         {
             let search = core.search_textarea.lines().join("");
-            let total = core.items.len();
+            let matching = list_picker_matching_indices(&core.items, &search);
 
             let h = self.layout.height as usize;
             let list_height = list_picker_visible_height(h);
@@ -5284,24 +5559,16 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Down => {
-                    if total > 0 {
-                        core.selected = (core.selected + 1).min(total.saturating_sub(1));
+                    if let Some(next) = list_picker_next_match(&matching, core.selected) {
+                        core.selected = next;
                     }
-                    let sdi = list_picker_display_idx(&core.items, core.selected);
-                    if sdi >= core.scroll_offset + list_height {
-                        core.scroll_offset = sdi.saturating_sub(list_height - 1);
-                    }
+                    list_picker_scroll_after_nav(core, &matching, list_height, true);
                 }
                 KeyCode::Up => {
-                    core.selected = core.selected.saturating_sub(1);
-                    if core.selected == 0 {
-                        core.scroll_offset = 0;
-                    } else {
-                        let sdi = list_picker_display_idx(&core.items, core.selected);
-                        if sdi <= core.scroll_offset {
-                            core.scroll_offset = sdi.saturating_sub(1);
-                        }
+                    if let Some(prev) = list_picker_prev_match(&matching, core.selected) {
+                        core.selected = prev;
                     }
+                    list_picker_scroll_after_nav(core, &matching, list_height, false);
                 }
                 _ => {
                     textarea_input(&mut core.search_textarea, key);
@@ -5327,7 +5594,7 @@ impl Gui {
         } = &mut self.popup
         {
             let search = core.search_textarea.lines().join("");
-            let total = core.items.len();
+            let matching = list_picker_matching_indices(&core.items, &search);
             let free_cat = free_entry_category.clone();
 
             let h = self.layout.height as usize;
@@ -5339,6 +5606,12 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Enter => {
+                    // Empty free-entry category (e.g. diff-grep) confirms real
+                    // matches only: zero matches = no-op instead of jumping to
+                    // a stale selection.
+                    if free_cat.is_empty() && !matching.contains(&core.selected) {
+                        return Ok(());
+                    }
                     let Some(value) = list_picker_confirm_value(core) else {
                         return Ok(());
                     };
@@ -5355,33 +5628,37 @@ impl Gui {
                     return Ok(());
                 }
                 KeyCode::Down => {
-                    if total > 0 {
-                        core.selected = (core.selected + 1).min(total.saturating_sub(1));
+                    if let Some(next) = list_picker_next_match(&matching, core.selected) {
+                        core.selected = next;
                     }
-                    let sdi = list_picker_display_idx(&core.items, core.selected);
-                    if sdi >= core.scroll_offset + list_height {
-                        core.scroll_offset = sdi.saturating_sub(list_height - 1);
-                    }
+                    list_picker_scroll_after_nav(core, &matching, list_height, true);
                 }
                 KeyCode::Up => {
-                    core.selected = core.selected.saturating_sub(1);
-                    if core.selected == 0 {
-                        core.scroll_offset = 0;
-                    } else {
-                        let sdi = list_picker_display_idx(&core.items, core.selected);
-                        if sdi <= core.scroll_offset {
-                            core.scroll_offset = sdi.saturating_sub(1);
-                        }
+                    if let Some(prev) = list_picker_prev_match(&matching, core.selected) {
+                        core.selected = prev;
                     }
+                    list_picker_scroll_after_nav(core, &matching, list_height, false);
                 }
                 _ => {
                     textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
                         sync_list_picker_prefer_free_entry(core, &free_cat);
+                        let matching = list_picker_matching_indices(&core.items, &new_search);
+                        if let Some(sel) =
+                            list_picker_clamp_selection_to_matches(&matching, core.selected)
+                        {
+                            core.selected = sel;
+                        }
                         if !new_search.is_empty() {
-                            let sdi = list_picker_display_idx(&core.items, core.selected);
+                            let sdi = list_picker_filtered_display_idx(
+                                &core.items,
+                                &matching,
+                                core.selected,
+                            );
                             core.scroll_offset = sdi.saturating_sub(list_height / 2);
+                        } else {
+                            core.scroll_offset = 0;
                         }
                     }
                 }
@@ -5423,8 +5700,8 @@ impl Gui {
             original_theme_index,
         } = &mut self.popup
         {
-            let total = core.items.len();
             let search = core.search_textarea.lines().join("");
+            let matching = list_picker_matching_indices(&core.items, &search);
 
             let h = self.layout.height as usize;
             let list_height = list_picker_visible_height(h);
@@ -5447,49 +5724,37 @@ impl Gui {
                     return;
                 }
                 KeyCode::Down => {
-                    if total > 0 {
-                        core.selected = (core.selected + 1) % total;
+                    if let Some(next) = list_picker_next_match(&matching, core.selected) {
+                        core.selected = next;
                     }
                     self.current_theme_index = core.selected;
-                    if core.selected >= core.scroll_offset + list_height {
-                        core.scroll_offset = core.selected.saturating_sub(list_height - 1);
-                    }
-                    if core.selected == 0 {
-                        core.scroll_offset = 0;
-                    }
+                    list_picker_scroll_after_nav(core, &matching, list_height, true);
                 }
                 KeyCode::Up => {
-                    if total > 0 {
-                        core.selected = if core.selected == 0 {
-                            total - 1
-                        } else {
-                            core.selected - 1
-                        };
+                    if let Some(prev) = list_picker_prev_match(&matching, core.selected) {
+                        core.selected = prev;
                     }
                     self.current_theme_index = core.selected;
-                    if core.selected < core.scroll_offset {
-                        core.scroll_offset = core.selected;
-                    }
-                    if core.selected == total - 1 {
-                        core.scroll_offset = total.saturating_sub(list_height);
-                    }
+                    list_picker_scroll_after_nav(core, &matching, list_height, false);
                 }
                 _ => {
-                    // Search/filter — jump to matching theme
+                    // Search/filter — keep selection within matching themes
                     textarea_input(&mut core.search_textarea, key);
                     let new_search = core.search_textarea.lines().join("");
                     if new_search != search {
-                        let new_lower = new_search.to_lowercase();
-                        if !new_lower.is_empty() {
-                            if let Some(idx) = core
-                                .items
-                                .iter()
-                                .position(|i| i.label.to_lowercase().contains(&new_lower))
+                        let matching = list_picker_matching_indices(&core.items, &new_search);
+                        if !new_search.trim().is_empty() {
+                            if let Some(sel) =
+                                list_picker_clamp_selection_to_matches(&matching, core.selected)
                             {
-                                core.selected = idx;
-                                self.current_theme_index = idx;
-                                // Center the match in the viewport
-                                core.scroll_offset = idx.saturating_sub(list_height / 2);
+                                core.selected = sel;
+                                self.current_theme_index = sel;
+                                let sdi = list_picker_filtered_display_idx(
+                                    &core.items,
+                                    &matching,
+                                    core.selected,
+                                );
+                                core.scroll_offset = sdi.saturating_sub(list_height / 2);
                             }
                         } else {
                             core.selected = *original_theme_index;
@@ -5515,6 +5780,7 @@ impl Gui {
                 value: ct.id.to_string(),
                 label: ct.name.to_string(),
                 category: String::new(),
+                description: Some(ct.appearance.as_str().to_string()),
             })
             .collect();
 
@@ -5598,6 +5864,7 @@ impl Gui {
                 value: branch.name.clone(),
                 label: branch.name.clone(),
                 category: "Branches".to_string(),
+                description: None,
             });
         }
 
@@ -5608,6 +5875,7 @@ impl Gui {
                     value: full_name.clone(),
                     label: full_name,
                     category: "Remote Branches".to_string(),
+                    description: None,
                 });
             }
         }
@@ -5617,14 +5885,20 @@ impl Gui {
                 value: tag.name.clone(),
                 label: tag.name.clone(),
                 category: "Tags".to_string(),
+                description: None,
             });
         }
 
         for commit in model.commits.iter().skip(1) {
             items.push(ListPickerItem {
                 value: commit.hash.clone(),
-                label: format!("{} {}", commit.short_hash(), commit.name),
+                label: format!(
+                    "{} {}",
+                    commit.short_hash(),
+                    presentation::text::plain_text(&commit.name)
+                ),
                 category: "Commits".to_string(),
+                description: None,
             });
         }
 
@@ -5771,6 +6045,7 @@ impl Gui {
                         kb.universal.undo_revert_block.clone(),
                         "Undo last revert (session)".into(),
                     ),
+                    CommandEntry::keybinding("<c-f>".into(), "Grep diff contents".into()),
                 ],
             },
             ContextId::Worktrees => CommandSection {
@@ -5827,16 +6102,29 @@ impl Gui {
             },
             ContextId::BranchCommits | ContextId::BranchCommitFiles => CommandSection {
                 title: "Branch Commits".into(),
-                entries: vec![
-                    CommandEntry::keybinding("<enter>".into(), "View commit files".into()),
-                    CommandEntry::keybinding("<esc>".into(), "Back to branches".into()),
-                    CommandEntry::keybinding(
-                        kb.universal.toggle_diff_view_layout.clone(),
-                        "Toggle unified / side-by-side view".into(),
-                    ),
-                    CommandEntry::keybinding(kb.universal.edit.clone(), "Open in editor".into()),
-                    CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
-                ],
+                entries: {
+                    let mut entries = vec![
+                        CommandEntry::keybinding("<enter>".into(), "View commit files".into()),
+                        CommandEntry::keybinding("<esc>".into(), "Back to branches".into()),
+                        CommandEntry::keybinding(
+                            kb.universal.toggle_diff_view_layout.clone(),
+                            "Toggle unified / side-by-side view".into(),
+                        ),
+                        CommandEntry::keybinding(
+                            kb.universal.edit.clone(),
+                            "Open in editor".into(),
+                        ),
+                        CommandEntry::keybinding(".".into(), "Toggle commit details panel".into()),
+                    ];
+                    // Grep only applies to the files list, not the commits list.
+                    if active == ContextId::BranchCommitFiles {
+                        entries.push(CommandEntry::keybinding(
+                            "<c-f>".into(),
+                            "Grep diff contents".into(),
+                        ));
+                    }
+                    entries
+                },
             },
             ContextId::Commits => {
                 let mut entries = vec![
@@ -5931,6 +6219,7 @@ impl Gui {
                 entries: vec![
                     CommandEntry::keybinding("<enter>".into(), "Toggle dir / Focus diff".into()),
                     CommandEntry::keybinding("<esc>".into(), "Back to commits".into()),
+                    CommandEntry::keybinding("<c-f>".into(), "Grep diff contents".into()),
                     CommandEntry::keybinding(kb.universal.edit.clone(), "Edit file".into()),
                     CommandEntry::keybinding(kb.universal.open_file.clone(), "Open file".into()),
                     CommandEntry::keybinding(
@@ -5989,6 +6278,7 @@ impl Gui {
                 entries: vec![
                     CommandEntry::keybinding("<enter>".into(), "Toggle dir / Focus diff".into()),
                     CommandEntry::keybinding("<esc>".into(), "Back to stash".into()),
+                    CommandEntry::keybinding("<c-f>".into(), "Grep diff contents".into()),
                     CommandEntry::keybinding(
                         kb.universal.toggle_diff_view_layout.clone(),
                         "Toggle unified / side-by-side view".into(),
@@ -6066,66 +6356,84 @@ impl Gui {
     }
 
     fn show_diff_command_palette(&mut self) {
+        use crate::gui::context::ContextId;
+        let grep_supported = self.diff_mode.active
+            || matches!(
+                self.context_mgr.active(),
+                ContextId::Files
+                    | ContextId::CommitFiles
+                    | ContextId::StashFiles
+                    | ContextId::BranchCommitFiles
+            );
+        let mut entries = vec![
+            CommandEntry::keybinding("j/k".into(), "Scroll down / up".into()),
+            CommandEntry::keybinding("h/l".into(), "Scroll left / right".into()),
+            CommandEntry::keybinding(
+                "{/}".into(),
+                "Cycle prev / next hunk (selects revert block in Files)".into(),
+            ),
+            CommandEntry::keybinding("[".into(), "Toggle old-only view".into()),
+            CommandEntry::keybinding("]".into(), "Toggle new-only view".into()),
+            CommandEntry::keybinding(
+                self.config
+                    .user_config
+                    .keybinding
+                    .universal
+                    .toggle_diff_view_layout
+                    .clone(),
+                "Toggle unified / side-by-side view".into(),
+            ),
+            CommandEntry::keybinding("z".into(), "Toggle line wrap".into()),
+            CommandEntry::keybinding("g/G".into(), "Go to top / bottom".into()),
+            CommandEntry::keybinding("PgUp/PgDn".into(), "Page up / down".into()),
+            CommandEntry::keybinding("/".into(), "Search in diff".into()),
+            CommandEntry::keybinding("n/N".into(), "Next / previous search match".into()),
+        ];
+        if grep_supported {
+            entries.push(CommandEntry::keybinding(
+                "<c-f>".into(),
+                "Grep diff contents".into(),
+            ));
+        }
+        entries.extend([
+            CommandEntry::keybinding(
+                "<enter>".into(),
+                "Open hunk menu on selected block (Files)".into(),
+            ),
+            CommandEntry::keybinding(
+                "click 󰧛".into(),
+                "Click revert icon to revert that block".into(),
+            ),
+            CommandEntry::keybinding(
+                "u".into(),
+                if self.diff_view.revert_undo_stack.is_empty() {
+                    "Undo last revert (nothing to undo)".into()
+                } else {
+                    format!(
+                        "Undo last revert ({}/{})",
+                        self.diff_view.revert_undo_stack.len(),
+                        self.diff_view.revert_undo_high_water,
+                    )
+                },
+            ),
+            CommandEntry::keybinding("e".into(), "Edit file at line".into()),
+            CommandEntry::keybinding("o".into(), "Open file in default program".into()),
+            CommandEntry::keybinding("y".into(), "Copy selected text".into()),
+            CommandEntry::keybinding("q".into(), "Quit".into()),
+            CommandEntry::keybinding("+/_".into(), "Enlarge / shrink panel".into()),
+            CommandEntry::keybinding(";".into(), "Toggle command log".into()),
+            CommandEntry::keybinding("1-5".into(), "Jump to sidebar panel".into()),
+            CommandEntry::keybinding("esc".into(), "Return to sidebar".into()),
+            CommandEntry::keybinding("?".into(), "Show command palette".into()),
+            CommandEntry::action(
+                "".into(),
+                "Color theme...".into(),
+                CommandAction::OpenThemePicker,
+            ),
+        ]);
         let diff_section = CommandSection {
             title: "Diff Viewer".into(),
-            entries: vec![
-                CommandEntry::keybinding("j/k".into(), "Scroll down / up".into()),
-                CommandEntry::keybinding("h/l".into(), "Scroll left / right".into()),
-                CommandEntry::keybinding(
-                    "{/}".into(),
-                    "Cycle prev / next hunk (selects revert block in Files)".into(),
-                ),
-                CommandEntry::keybinding("[".into(), "Toggle old-only view".into()),
-                CommandEntry::keybinding("]".into(), "Toggle new-only view".into()),
-                CommandEntry::keybinding(
-                    self.config
-                        .user_config
-                        .keybinding
-                        .universal
-                        .toggle_diff_view_layout
-                        .clone(),
-                    "Toggle unified / side-by-side view".into(),
-                ),
-                CommandEntry::keybinding("z".into(), "Toggle line wrap".into()),
-                CommandEntry::keybinding("g/G".into(), "Go to top / bottom".into()),
-                CommandEntry::keybinding("PgUp/PgDn".into(), "Page up / down".into()),
-                CommandEntry::keybinding("/".into(), "Search in diff".into()),
-                CommandEntry::keybinding("n/N".into(), "Next / previous search match".into()),
-                CommandEntry::keybinding(
-                    "<enter>".into(),
-                    "Open hunk menu on selected block (Files)".into(),
-                ),
-                CommandEntry::keybinding(
-                    "click 󰧛".into(),
-                    "Click revert icon to revert that block".into(),
-                ),
-                CommandEntry::keybinding(
-                    "u".into(),
-                    if self.diff_view.revert_undo_stack.is_empty() {
-                        "Undo last revert (nothing to undo)".into()
-                    } else {
-                        format!(
-                            "Undo last revert ({}/{})",
-                            self.diff_view.revert_undo_stack.len(),
-                            self.diff_view.revert_undo_high_water,
-                        )
-                    },
-                ),
-                CommandEntry::keybinding("e".into(), "Edit file at line".into()),
-                CommandEntry::keybinding("o".into(), "Open file in default program".into()),
-                CommandEntry::keybinding("y".into(), "Copy selected text".into()),
-                CommandEntry::keybinding("q".into(), "Quit".into()),
-                CommandEntry::keybinding("+/_".into(), "Enlarge / shrink panel".into()),
-                CommandEntry::keybinding(";".into(), "Toggle command log".into()),
-                CommandEntry::keybinding("1-5".into(), "Jump to sidebar panel".into()),
-                CommandEntry::keybinding("esc".into(), "Return to sidebar".into()),
-                CommandEntry::keybinding("?".into(), "Show command palette".into()),
-                CommandEntry::action(
-                    "".into(),
-                    "Color theme...".into(),
-                    CommandAction::OpenThemePicker,
-                ),
-            ],
+            entries,
         };
 
         self.popup = PopupState::CommandPalette {
@@ -6462,11 +6770,8 @@ impl Gui {
                                         }
                                         None => (text.clone(), String::new()),
                                     };
-                                    summary_textarea.select_all();
-                                    summary_textarea.cut();
-                                    summary_textarea.insert_str(&summary);
-                                    // Clipboard usually holds an existing commit message that
-                                    // was hard-wrapped — unwrap before loading.
+                                    popup::set_commit_summary_text(summary_textarea, &summary);
+                                    // Preserve pasted newlines; soft-wrap is display-only.
                                     body_state.set_text(popup::unwrap_commit_body(&body));
                                     let wrap = gui.commit_body_wrap_width();
                                     body_state.render_into(body_textarea, wrap);
@@ -6494,8 +6799,7 @@ impl Gui {
                         ..
                     } = editor
                     {
-                        summary_textarea.select_all();
-                        summary_textarea.cut();
+                        popup::set_commit_summary_text(summary_textarea, "");
                         body_state.set_text(String::new());
                         let wrap = gui.commit_body_wrap_width();
                         body_state.render_into(body_textarea, wrap);
@@ -7172,57 +7476,14 @@ impl Gui {
             return;
         }
 
-        // ThemePicker popup intercepts mouse scroll and click
-        if let PopupState::ThemePicker { core, .. } = &mut self.popup {
-            let total = core.items.len();
-            let h = self.layout.height as usize;
-            let lh = list_picker_visible_height(h);
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    core.selected = core.selected.saturating_sub(1);
-                    self.current_theme_index = core.selected;
-                    if core.selected < core.scroll_offset {
-                        core.scroll_offset = core.selected;
-                    }
-                }
-                MouseEventKind::ScrollDown => {
-                    core.selected = (core.selected + 1).min(total.saturating_sub(1));
-                    self.current_theme_index = core.selected;
-                    if core.selected >= core.scroll_offset + lh {
-                        core.scroll_offset = core.selected.saturating_sub(lh - 1);
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // Click to select a theme
-                    let area =
-                        ratatui::layout::Rect::new(0, 0, self.layout.width, self.layout.height);
-                    let popup_width = (area.width * 60 / 100).min(60).max(30);
-                    let max_popup = (area.height * 60 / 100).max(10);
-                    let popup_height = max_popup.min(area.height.saturating_sub(4));
-                    let x = (area.width.saturating_sub(popup_width)) / 2;
-                    let y = (area.height.saturating_sub(popup_height)) / 2;
-                    let inner_y = y + 1;
-                    let list_start = inner_y + 2;
-                    let inner_height = popup_height.saturating_sub(2);
-                    let list_height = inner_height.saturating_sub(3) as usize;
-
-                    if mouse.row >= list_start
-                        && mouse.row < list_start + list_height as u16
-                        && mouse.column >= x
-                        && mouse.column < x + popup_width
-                    {
-                        let row_in_list = (mouse.row - list_start) as usize;
-                        let effective_scroll =
-                            core.scroll_offset.min(total.saturating_sub(list_height));
-                        let clicked_idx = effective_scroll + row_in_list;
-                        if clicked_idx < total {
-                            core.selected = clicked_idx;
-                            self.current_theme_index = clicked_idx;
-                        }
-                    }
-                }
-                _ => {}
-            }
+        // ThemePicker popup intercepts mouse scroll and click (respects search filter)
+        if matches!(self.popup, PopupState::ThemePicker { .. }) {
+            let (w, h) = (self.layout.width, self.layout.height);
+            let PopupState::ThemePicker { core, .. } = &mut self.popup else {
+                unreachable!();
+            };
+            handle_list_picker_mouse(core, mouse, w, h);
+            self.current_theme_index = core.selected;
             return;
         }
 
@@ -7310,6 +7571,13 @@ impl Gui {
 
                 if in_main && !self.diff_view.is_empty() && !full_sidebar {
                     if self.try_handle_revert_block_click(main_panel, pl, mouse.column, mouse.row) {
+                        self.diff_focused = true;
+                        return;
+                    }
+                    // Clicks on the pinned sticky file header don't start a
+                    // text selection — there is no content to select there.
+                    if self.diff_view.is_sticky_row(mouse.row, &pl) {
+                        self.diff_view.selection = None;
                         self.diff_focused = true;
                         return;
                     }
@@ -7621,6 +7889,11 @@ impl Gui {
                 if rect_contains(diff_rect, col, row) && !self.diff_view.is_empty() {
                     let pl = DiffPanelLayout::compute(diff_rect, &self.diff_view);
                     if self.try_handle_revert_block_click(diff_rect, pl, col, row) {
+                        self.diff_mode.focus = DiffModeFocus::DiffExploration;
+                        return;
+                    }
+                    if self.diff_view.is_sticky_row(row, &pl) {
+                        self.diff_view.selection = None;
                         self.diff_mode.focus = DiffModeFocus::DiffExploration;
                         return;
                     }
@@ -8092,13 +8365,7 @@ impl Gui {
             return false;
         };
         self.diff_view.selected_revert_hunk = Some(hunk_idx);
-        if let Err(err) = self.revert_selected_file_hunk(hunk_idx) {
-            self.popup = PopupState::Message {
-                title: "Revert block failed".to_string(),
-                message: format!("{}", err),
-                kind: MessageKind::Error,
-            };
-        }
+        self.show_hunk_context_menu(hunk_idx);
         true
     }
 
@@ -8106,35 +8373,41 @@ impl Gui {
     /// or hovered revert hunk). Cancel is focused first so an accidental
     /// Enter doesn't revert anything.
     fn show_hunk_context_menu(&mut self, hunk_idx: usize) {
-        let items = vec![
-            popup::MenuItem {
-                label: "Cancel".to_string(),
-                description: String::new(),
-                key: None,
-                // No-op: execute_menu_action already drops the menu popup
-                // before invoking the action, so returning Ok leaves the
-                // menu closed. Esc also closes the menu via the universal
-                // menu Esc handler.
-                action: Some(Box::new(|_gui| Ok(()))),
-            },
-            popup::MenuItem {
+        // Directory hovers have no single file to act on — Cancel only.
+        let has_file = self.selected_file_index().is_some();
+        // The Files pane shows unstaged + staged hunks in one buffer. Offer
+        // the action matching the hunk the menu was opened on so the index
+        // can't be applied to the wrong side of the index.
+        let hunk_is_staged = has_file && self.diff_view.is_staged_hunk(hunk_idx);
+        let mut items = vec![popup::MenuItem {
+            label: "Cancel".to_string(),
+            description: String::new(),
+            key: None,
+            // No-op: execute_menu_action already drops the menu popup
+            // before invoking the action, so returning Ok leaves the
+            // menu closed. Esc also closes the menu via the universal
+            // menu Esc handler.
+            action: Some(Box::new(|_gui| Ok(()))),
+        }];
+        if has_file && !hunk_is_staged {
+            items.push(popup::MenuItem {
                 label: "Stage hunk".to_string(),
-                description: "Apply this change block to the index".to_string(),
+                description: String::new(),
                 key: Some("s".to_string()),
                 action: Some(Box::new(move |gui| {
                     if let Err(err) = gui.stage_selected_file_hunk(hunk_idx) {
                         gui.popup = PopupState::Message {
-                            title: "Stage block failed".to_string(),
+                            title: "Stage hunk failed".to_string(),
                             message: format!("{}", err),
                             kind: MessageKind::Error,
                         };
                     }
                     Ok(())
                 })),
-            },
-            popup::MenuItem {
+            });
+            items.push(popup::MenuItem {
                 label: "Revert hunk".to_string(),
-                description: "Remove this change block from the worktree".to_string(),
+                description: String::new(),
                 key: Some("r".to_string()),
                 action: Some(Box::new(move |gui| {
                     if let Err(err) = gui.revert_selected_file_hunk(hunk_idx) {
@@ -8146,8 +8419,25 @@ impl Gui {
                     }
                     Ok(())
                 })),
-            },
-        ];
+            });
+        }
+        if hunk_is_staged {
+            items.push(popup::MenuItem {
+                label: "Unstage hunk".to_string(),
+                description: String::new(),
+                key: Some("s".to_string()),
+                action: Some(Box::new(move |gui| {
+                    if let Err(err) = gui.unstage_selected_file_hunk(hunk_idx) {
+                        gui.popup = PopupState::Message {
+                            title: "Unstage hunk failed".to_string(),
+                            message: format!("{}", err),
+                            kind: MessageKind::Error,
+                        };
+                    }
+                    Ok(())
+                })),
+            });
+        }
 
         self.popup = PopupState::Menu {
             title: "Hunk".to_string(),
@@ -8191,45 +8481,146 @@ impl Gui {
         }
     }
 
+    /// Block mode's `s`: stage an unstaged hunk, or unstage a staged one —
+    /// the same choice the hunk menu offers for that hunk.
+    fn toggle_stage_selected_file_hunk(&mut self, hunk_idx: usize) {
+        let staged = self.diff_view.is_staged_hunk(hunk_idx);
+        let result = if staged {
+            self.unstage_selected_file_hunk(hunk_idx)
+        } else {
+            self.stage_selected_file_hunk(hunk_idx)
+        };
+        if let Err(err) = result {
+            self.popup = PopupState::Message {
+                title: if staged {
+                    "Unstage block failed"
+                } else {
+                    "Stage block failed"
+                }
+                .to_string(),
+                message: format!("{}", err),
+                kind: MessageKind::Error,
+            };
+        }
+    }
+
+    /// Match the viewed HEAD block against the blocks of a freshly fetched
+    /// per-side diff, returning their slice ranges for patch building.
+    /// Matching runs on the side both diffs share (worktree for unstaged,
+    /// HEAD for staged) so staged edits elsewhere in the file can't shift
+    /// the mapping. Sorted deepest-first so sequential applies don't shift
+    /// the line numbers of pending ones.
+    fn matching_side_blocks(
+        &self,
+        hunk_idx: usize,
+        side_diff: &str,
+        new_side: bool,
+    ) -> Vec<(Option<(usize, usize)>, Option<(usize, usize)>)> {
+        use crate::pager::side_by_side::DiffViewState as DVS;
+        let view_spans = DVS::block_spans(&self.diff_view.lines, &self.diff_view.hunk_line_offsets);
+        let Some(view) = view_spans.get(hunk_idx) else {
+            return Vec::new();
+        };
+        let mut matched: Vec<(usize, Option<(usize, usize)>, Option<(usize, usize)>)> =
+            DVS::block_spans_for_diff(side_diff, 4)
+                .into_iter()
+                .filter(|s| view.overlaps(s, new_side))
+                .map(|s| {
+                    let anchor = s.old.map(|(lo, _)| lo).unwrap_or(s.old_point);
+                    (anchor, s.old, s.new)
+                })
+                .collect();
+        matched.sort_by(|a, b| b.0.cmp(&a.0));
+        matched
+            .into_iter()
+            .map(|(_, old, new)| (old, new))
+            .collect()
+    }
+
     fn stage_selected_file_hunk(&mut self, hunk_idx: usize) -> Result<()> {
         let Some(file_idx) = self.selected_file_index() else {
             return Ok(());
         };
-
         let model = self.model.lock().unwrap();
-        let Some(file) = model.files.get(file_idx) else {
+        let Some(file) = model.files.get(file_idx).cloned() else {
             return Ok(());
         };
-
-        if !file.has_unstaged_changes {
-            self.popup = PopupState::Message {
-                title: "Stage block".to_string(),
-                message: "Block staging is available only for unstaged changes.".to_string(),
-                kind: MessageKind::Info,
-            };
-            return Ok(());
-        }
-
-        let file_name = file.name.clone();
         drop(model);
 
-        let Some((want_old, want_new)) = self.diff_view.visual_block_line_ranges(hunk_idx) else {
-            return Ok(());
-        };
-        if want_old.is_none() && want_new.is_none() {
+        let path_refs: Vec<String> = file.diff_paths().into_iter().map(str::to_string).collect();
+        let refs: Vec<&str> = path_refs.iter().map(String::as_str).collect();
+        let diff = self.git.diff_file_paths(&refs)?;
+        if diff.is_empty() {
+            // Untracked / synthesized diffs have no unified diff to slice —
+            // fall back to staging the whole file.
+            if !file.tracked {
+                self.git.stage_file(file.current_path())?;
+                self.needs_files_refresh = true;
+                self.needs_diff_refresh = true;
+            }
             return Ok(());
         }
 
-        let diff = self.git.diff_file(&file_name)?;
+        // The view may be a HEAD buffer, so map the hunk onto the unstaged
+        // diff's blocks via the shared worktree side.
+        let targets = self.matching_side_blocks(hunk_idx, &diff, true);
+        if targets.is_empty() {
+            self.popup = PopupState::Message {
+                title: "Stage hunk".to_string(),
+                message: "That hunk moved — the diff was refreshed.".to_string(),
+                kind: MessageKind::Info,
+            };
+            self.needs_diff_refresh = true;
+            return Ok(());
+        }
+        for (want_old, want_new) in targets {
+            if want_old.is_none() && want_new.is_none() {
+                continue;
+            }
+            self.git
+                .stage_visual_block(file.current_path(), &diff, want_old, want_new)?;
+        }
+        self.needs_files_refresh = true;
+        self.needs_diff_refresh = true;
+        Ok(())
+    }
+
+    fn unstage_selected_file_hunk(&mut self, hunk_idx: usize) -> Result<()> {
+        let Some(file_idx) = self.selected_file_index() else {
+            return Ok(());
+        };
+        let model = self.model.lock().unwrap();
+        let Some(file) = model.files.get(file_idx).cloned() else {
+            return Ok(());
+        };
+        drop(model);
+
+        let path_refs: Vec<String> = file.diff_paths().into_iter().map(str::to_string).collect();
+        let refs: Vec<&str> = path_refs.iter().map(String::as_str).collect();
+        let diff = self.git.diff_file_staged_paths(&refs)?;
         if diff.is_empty() {
             return Ok(());
         }
 
-        self.git
-            .stage_visual_block_to_index(&file_name, &diff, want_old, want_new)?;
-
-        self.diff_view.mark_hunk_staged_for_feedback(hunk_idx);
-        self.diff_view.selection = None;
+        // The view may be a HEAD buffer, so map the hunk onto the staged
+        // diff's blocks via the shared HEAD side.
+        let targets = self.matching_side_blocks(hunk_idx, &diff, false);
+        if targets.is_empty() {
+            self.popup = PopupState::Message {
+                title: "Unstage hunk".to_string(),
+                message: "That hunk moved — the diff was refreshed.".to_string(),
+                kind: MessageKind::Info,
+            };
+            self.needs_diff_refresh = true;
+            return Ok(());
+        }
+        for (want_old, want_new) in targets {
+            if want_old.is_none() && want_new.is_none() {
+                continue;
+            }
+            self.git
+                .unstage_visual_block(file.current_path(), &diff, want_old, want_new)?;
+        }
         self.needs_files_refresh = true;
         self.needs_diff_refresh = true;
         Ok(())
@@ -8257,15 +8648,21 @@ impl Gui {
         let file_name = file.name.clone();
         drop(model);
 
-        let Some((want_old, want_new)) = self.diff_view.visual_block_line_ranges(hunk_idx) else {
-            return Ok(());
-        };
-        if want_old.is_none() && want_new.is_none() {
+        let diff = self.git.diff_file(&file_name)?;
+        if diff.is_empty() {
             return Ok(());
         }
 
-        let diff = self.git.diff_file(&file_name)?;
-        if diff.is_empty() {
+        // The view may be a HEAD buffer, so map the hunk onto the unstaged
+        // diff's blocks via the shared worktree side.
+        let targets = self.matching_side_blocks(hunk_idx, &diff, true);
+        if targets.is_empty() {
+            self.popup = PopupState::Message {
+                title: "Revert block".to_string(),
+                message: "That hunk moved — the diff was refreshed.".to_string(),
+                kind: MessageKind::Info,
+            };
+            self.needs_diff_refresh = true;
             return Ok(());
         }
 
@@ -8275,8 +8672,13 @@ impl Gui {
         let abs_path = self.git.repo_path().join(&file_name);
         let pre_bytes = std::fs::read(&abs_path).ok();
 
-        self.git
-            .revert_visual_block_in_worktree(&file_name, &diff, want_old, want_new)?;
+        for (want_old, want_new) in targets {
+            if want_old.is_none() && want_new.is_none() {
+                continue;
+            }
+            self.git
+                .revert_visual_block_in_worktree(&file_name, &diff, want_old, want_new)?;
+        }
 
         if let Some(bytes) = pre_bytes {
             let stack = &mut self.diff_view.revert_undo_stack;
@@ -8406,9 +8808,21 @@ impl Gui {
         self.reset_commit_pagination();
         self.diff_preview_cache.retain_immutable();
         let git = Arc::clone(&self.git);
+        let commit_filter = self.commit_filter_for_load();
         std::thread::spawn(move || {
-            git.load_model_streaming(&tx);
+            git.load_model_streaming(&tx, commit_filter);
         });
+    }
+
+    fn commit_filter_for_load(&self) -> Option<crate::git::commit::CommitFilter> {
+        let has = self.commit_path_filter.is_some()
+            || !self.commit_author_filter.is_empty()
+            || !self.commit_branch_filter.is_empty();
+        has.then(|| crate::git::commit::CommitFilter {
+            branches: self.commit_branch_filter.clone(),
+            path: self.commit_path_filter.clone(),
+            authors: self.commit_author_filter.clone(),
+        })
     }
 
     fn refresh(&mut self) -> Result<()> {
@@ -8425,25 +8839,9 @@ impl Gui {
     /// Re-apply selection-dependent views after the model was reloaded
     /// (blocking `refresh` or background streaming refresh).
     fn after_model_refresh(&mut self) -> Result<()> {
+        // Commits arrive already filtered via load_model_streaming(commit_filter)
+        // or reload_filtered_commits_async — don't re-fetch here.
         let mut model = self.model.lock().unwrap();
-
-        // Re-apply commit filters after refresh replaces the model.
-        if !self.commit_branch_filter.is_empty()
-            || self.commit_path_filter.is_some()
-            || !self.commit_author_filter.is_empty()
-        {
-            let filter = crate::git::commit::CommitFilter {
-                branches: self.commit_branch_filter.clone(),
-                path: self.commit_path_filter.clone(),
-                authors: self.commit_author_filter.clone(),
-            };
-            if let Ok(filtered) =
-                self.git
-                    .load_filtered_commits_page(&filter, DEFAULT_COMMIT_LIMIT, 0)
-            {
-                model.set_commits(filtered);
-            }
-        }
         self.commit_history_complete = model.commits.len() < DEFAULT_COMMIT_LIMIT;
 
         // Rebuild file tree inline to avoid borrow issues
@@ -8955,7 +9353,7 @@ impl Command for EnableMouseCaptureWithoutHover {
     }
 
     #[cfg(windows)]
-    fn execute_winapi(&self) -> io::Result<()> {
+    fn execute_winapi(&self) -> std::io::Result<()> {
         Command::execute_winapi(&crossterm::event::EnableMouseCapture)
     }
 
@@ -9132,6 +9530,7 @@ mod terminal_mouse_tests {
                 old_segments: None,
                 new_segments: None,
                 file_header: None,
+                preview_placeholder: None,
                 section_index: 0,
             });
             cache.insert(format!("key-{index}"), view);
@@ -9178,6 +9577,7 @@ mod terminal_mouse_tests {
                 old_segments: None,
                 new_segments: None,
                 file_header: None,
+                preview_placeholder: None,
                 section_index: 0,
             });
             cache.insert(key.to_string(), view);
@@ -9226,22 +9626,35 @@ mod terminal_mouse_tests {
 /// re-entry after suspension cannot disagree with the original setup.
 pub(crate) fn enter_terminal_modes(keyboard_enhanced: Option<bool>) -> Result<bool> {
     terminal::enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    // Prefer /dev/tty when stdout is piped (Helix `:insert-output`, etc.).
+    let mut out =
+        crate::os::tty::open_tui_output().context("Failed to open terminal output for TUI")?;
     execute!(
-        stdout,
+        out,
         EnterAlternateScreen,
         EnableMouseCaptureWithoutHover,
         crossterm::event::EnableFocusChange,
         crossterm::event::EnableBracketedPaste,
         cursor::Hide
     )?;
+    // Helix leaves progressive kitty keyboard enhancement enabled across
+    // `:insert-output` and keeps a `/dev/tty` EventStream open. Probing races
+    // that reader (blank hang); instead pop leftover stacks and push our flags
+    // so CSI-u keys parse as KeyEvents.
+    let nested = crate::os::tty::nested_tty_launch();
+    if nested {
+        for _ in 0..4 {
+            let _ = execute!(out, crossterm::event::PopKeyboardEnhancementFlags);
+        }
+    }
     let enhanced = match keyboard_enhanced {
         Some(value) => value,
+        None if nested => true,
         None => crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false),
     };
     if enhanced {
         execute!(
-            stdout,
+            out,
             crossterm::event::PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         )?;
     }
@@ -9250,7 +9663,9 @@ pub(crate) fn enter_terminal_modes(keyboard_enhanced: Option<bool>) -> Result<bo
 
 fn setup_terminal() -> Result<(Term, bool)> {
     let keyboard_enhanced = enter_terminal_modes(None)?;
-    let backend = CrosstermBackend::new(io::stdout());
+    let out =
+        crate::os::tty::open_tui_output().context("Failed to open terminal output for TUI")?;
+    let backend = CrosstermBackend::new(out);
     let terminal = Terminal::new(backend)?;
     Ok((terminal, keyboard_enhanced))
 }
@@ -9261,6 +9676,37 @@ fn setup_terminal() -> Result<(Term, bool)> {
 /// process-wide mutex that the input thread holds for the duration of its
 /// blocking read, so any drain from this thread would silently no-op.
 pub(crate) fn restore_terminal(terminal: &mut Term, keyboard_enhanced: bool) -> Result<()> {
+    // Helix `:insert-output` keeps its own alt-screen / raw mode / mouse / focus
+    // / bracketed-paste / kitty stack across the child. If we tear those down
+    // here, Helix resumes drawing into a world that no longer exists and the
+    // user is left staring at the primary-screen `hx` launch line with a dead
+    // TUI. Nested exit must only undo *our* transient state and hand the tty
+    // foreground back.
+    let nested = crate::os::tty::nested_tty_launch();
+    if nested {
+        // Hide our cursor leftovers, pop the kitty flags we pushed, then put
+        // Helix's progressive flags back (DISAMBIGUATE | REPORT_ALTERNATE_KEYS).
+        execute!(terminal.backend_mut(), cursor::Show)?;
+        if keyboard_enhanced {
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PopKeyboardEnhancementFlags
+            )?;
+            execute!(
+                terminal.backend_mut(),
+                crossterm::event::PushKeyboardEnhancementFlags(
+                    crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
+            )?;
+        }
+        terminal.backend_mut().flush()?;
+        crate::os::tty::restore_foreground_tty();
+        return Ok(());
+    }
+
+    // Standalone / non-nested: full teardown.
+    crate::os::tty::restore_foreground_tty();
     if keyboard_enhanced {
         execute!(
             terminal.backend_mut(),

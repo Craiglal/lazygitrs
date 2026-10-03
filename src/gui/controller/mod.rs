@@ -5,6 +5,7 @@ pub mod commit_files;
 pub mod commits;
 pub mod conflict_mode;
 pub mod custom_commands;
+pub mod diff_grep;
 pub mod diff_mode;
 pub mod files;
 pub mod input_normalization;

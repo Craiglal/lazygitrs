@@ -7,13 +7,15 @@ ref-pull:
 ref-clone:
     bun scripts/fetch-references.ts clone
 
-preview:
+dpreview:
     ./target/debug/lazygitrs
 
 # as
-rpreview:
+preview:
     ./target/release/lazygitrs
 
+# Release: bump versions, create a release commit, and push a git tag.
+# Must be run from an up-to-date main — the script will refuse other branches.
 tag: tag_and_release
 tag_and_release:
     sh tag_and_release.sh

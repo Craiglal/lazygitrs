@@ -98,7 +98,7 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState
     let block = &state.blocks[state.selected];
     let cache = state
         .diff_cache
-        .as_ref()
+        .as_mut()
         .expect("conflict diff cache should be populated for selected block");
 
     let top = Layout::default()
@@ -138,11 +138,11 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState
     render_embedded_diff_panel(
         frame,
         triptych[0],
-        &cache.ours,
+        &mut cache.ours,
         theme,
         block.choice == Some(ResolveChoice::Ours),
     );
-    if let Some(result) = cache.result.as_ref() {
+    if let Some(result) = cache.result.as_mut() {
         render_embedded_diff_panel(frame, triptych[1], result, theme, true);
     } else {
         render_text_panel(
@@ -160,7 +160,7 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState
     render_embedded_diff_panel(
         frame,
         triptych[2],
-        &cache.theirs,
+        &mut cache.theirs,
         theme,
         block.choice == Some(ResolveChoice::Theirs),
     );
@@ -186,7 +186,7 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState
     render_embedded_diff_panel(
         frame,
         lower[1],
-        &cache.both,
+        &mut cache.both,
         theme,
         block.choice == Some(ResolveChoice::Both),
     );
@@ -195,7 +195,7 @@ fn render_three_way(frame: &mut Frame, area: Rect, state: &mut ConflictModeState
 fn render_embedded_diff_panel(
     frame: &mut Frame,
     area: Rect,
-    state: &DiffViewState,
+    state: &mut DiffViewState,
     theme: &Theme,
     highlighted: bool,
 ) {

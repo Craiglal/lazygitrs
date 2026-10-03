@@ -101,8 +101,10 @@ impl GitCommands {
         Ok(())
     }
 
-    /// Stage only the lines of a single visual change block into the index.
-    pub fn stage_visual_block_to_index(
+    /// Stage only the lines of a single visual change block by applying a
+    /// sub-patch sliced from the unstaged (`git diff`) `unified_diff` to the
+    /// index (`git apply --cached`).
+    pub fn stage_visual_block(
         &self,
         file_path: &str,
         unified_diff: &str,
@@ -115,6 +117,25 @@ impl GitCommands {
             .stdin(patch)
             .run_expecting_success()
             .with_context(|| format!("failed to stage hunk in {}", file_path))?;
+        Ok(())
+    }
+
+    /// Unstage only the lines of a single visual change block by
+    /// reverse-applying a sub-patch sliced from the staged
+    /// (`git diff --cached`) `unified_diff` to the index.
+    pub fn unstage_visual_block(
+        &self,
+        file_path: &str,
+        unified_diff: &str,
+        want_old: Option<(usize, usize)>,
+        want_new: Option<(usize, usize)>,
+    ) -> Result<()> {
+        let patch = build_visual_block_patch(file_path, unified_diff, want_old, want_new)?;
+        self.git()
+            .args(&["apply", "--cached", "--reverse", "--unidiff-zero", "-"])
+            .stdin(patch)
+            .run_expecting_success()
+            .with_context(|| format!("failed to unstage hunk in {}", file_path))?;
         Ok(())
     }
 }
@@ -353,7 +374,7 @@ mod tests {
 
         let diff = repo.git.diff_file("file.txt").unwrap();
         repo.git
-            .stage_visual_block_to_index("file.txt", &diff, Some((2, 2)), Some((2, 2)))
+            .stage_visual_block("file.txt", &diff, Some((2, 2)), Some((2, 2)))
             .unwrap();
 
         let staged = run_git(&repo.root, &["diff", "--cached", "--", "file.txt"]);
